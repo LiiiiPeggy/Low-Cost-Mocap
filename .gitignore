@@ -19,3 +19,12 @@ upstream/
 # ---- 运行产物 ----
 ir_*.png
 *.log
+captures/
+_saved_raw/
+_snap.png
+_s0.bin
+_c*.bin
+
+# ---- 前端 ----
+node_modules/
+dist/

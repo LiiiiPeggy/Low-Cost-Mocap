@@ -9,7 +9,10 @@ import time
 import numpy as np
 import cv2 as cv
 from KalmanFilter import KalmanFilter
-from pseyepy import Camera
+try:
+    from pseyepy import Camera
+except ImportError:  # Windows 上没有 PS3 Eye 驱动；相机预览另有 camera_manager 实现
+    Camera = None
 from Singleton import Singleton
 
 
@@ -21,6 +24,10 @@ class Cameras:
         f = open(filename)
         self.camera_params = json.load(f)
 
+        if Camera is None:
+            raise RuntimeError(
+                "pseyepy 未安装：原项目的 PS3 Eye 采集链路在本机不可用。"
+                "Windows 双 USB 红外相机请使用 /api/cameras 预览接口（camera_manager）。")
         self.cameras = Camera(fps=90, resolution=Camera.RES_SMALL, gain=10, exposure=100)
         self.num_cameras = len(self.cameras.exposure)
         print(self.num_cameras)

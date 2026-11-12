@@ -1,0 +1,370 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>双路红外相机预览 · Low-Cost-Mocap</title>
+<style>
+  :root {
+    --bg: #ffffff; --panel: #ffffff; --line: #e3e7ec; --fg: #1f2328;
+    --dim: #6b7280; --ok: #16a34a; --warn: #d97706; --err: #dc2626; --accent: #2563eb;
+    --view: #10131a;   /* 画面区底色：深色，衬托灰度红外图 */
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 14px/1.5 -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+  }
+  header {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 14px 20px; border-bottom: 1px solid var(--line); background: #fff;
+    box-shadow: 0 1px 3px rgba(16, 24, 40, .04);
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 600; letter-spacing: .3px; }
+  header .meta { color: var(--dim); font-size: 12px; }
+  .spacer { flex: 1; }
+  button {
+    background: #fff; color: var(--fg); border: 1px solid var(--line);
+    padding: 7px 14px; border-radius: 7px; cursor: pointer; font-size: 13px;
+    transition: border-color .15s, color .15s, background .15s;
+  }
+  button:hover:not(:disabled) { border-color: var(--accent); color: var(--accent); }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button.primary:hover:not(:disabled) { background: #1d4ed8; border-color: #1d4ed8; color: #fff; }
+  button.danger { background: #fff; border-color: #f3c2c2; color: var(--err); }
+  button.danger:hover:not(:disabled) { background: #fef2f2; border-color: var(--err); color: var(--err); }
+  main { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; padding: 16px 20px 28px; }
+  @media (max-width: 900px) { main { grid-template-columns: 1fr; } }
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+    overflow: hidden; box-shadow: 0 1px 2px rgba(16, 24, 40, .05);
+  }
+  .panel .head {
+    display: flex; align-items: baseline; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--line); background: #fbfcfd;
+  }
+  .panel .head b { font-size: 14px; }
+  .panel .head .tag {
+    font-size: 11px; color: var(--dim); border: 1px solid var(--line);
+    border-radius: 4px; padding: 1px 5px; background: #fff;
+  }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: #c3c9d4; display: inline-block; }
+  .dot.ok { background: var(--ok); box-shadow: 0 0 0 3px rgba(22, 163, 74, .16); }
+  .dot.warn { background: var(--warn); box-shadow: 0 0 0 3px rgba(217, 119, 6, .14); }
+  .dot.err { background: var(--err); box-shadow: 0 0 0 3px rgba(220, 38, 38, .14); }
+  .view {
+    position: relative; background: var(--view); aspect-ratio: 16 / 9;
+    display: flex; align-items: center; justify-content: center;
+  }
+  .view img { width: 100%; height: 100%; object-fit: contain; display: block; }
+  .view .hint {
+    position: absolute; inset: 0; display: flex; align-items: center;
+    justify-content: center; color: #9aa3b2; font-size: 13px; text-align: center;
+    padding: 0 16px; white-space: pre-wrap;
+  }
+  .stats {
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px;
+    padding: 10px 14px; border-top: 1px solid var(--line); font-size: 12px;
+    background: #fff;
+  }
+  .stats div span { display: block; color: var(--dim); font-size: 11px; }
+  .stats div b { font-weight: 600; font-variant-numeric: tabular-nums; color: var(--fg); }
+  .err-msg { padding: 0 14px 10px; color: var(--err); font-size: 12px; word-break: break-all; background: #fff; }
+  .err-msg:empty { padding: 0; }
+  #log {
+    margin: 0 20px 24px; padding: 10px 14px; background: #fff; border: 1px solid var(--line);
+    border-radius: 10px; color: #4b5563; font: 12px/1.7 ui-monospace, Consolas, monospace;
+    white-space: pre-wrap; max-height: 150px; overflow: auto;
+  }
+</style>
+</head>
+<body>
+<header>
+  <h1>双路红外相机预览</h1>
+  <span class="meta" id="summary">连接中…</span>
+  <span class="meta" id="build"></span>
+  <span class="spacer"></span>
+  <button id="btn-start" class="primary">启动采集</button>
+  <button id="btn-stop" class="danger">停止采集</button>
+  <button id="btn-save">保存原始灰度</button>
+</header>
+
+<main id="panels"></main>
+<div id="log">等待操作…</div>
+
+<script>
+const CAMERAS = [0, 1];
+let running = false;
+let timer = null;
+
+const el = (id) => document.getElementById(id);
+const panelsEl = el('panels');
+const logEl = el('log');
+const summaryEl = el('summary');
+
+// 每路相机的显示状态
+const mode = {};       // index -> 'mjpeg' | 'poll'
+const seen = {};       // index -> 是否已收到过至少一帧
+const pollTimer = {};  // index -> setInterval id
+const pollUrl = {};    // index -> 当前 objectURL
+
+function log(msg) {
+  const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
+  logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+}
+
+function buildPanels() {
+  panelsEl.innerHTML = CAMERAS.map(i => `
+    <section class="panel" data-cam="${i}">
+      <div class="head">
+        <span class="dot" id="dot-${i}"></span>
+        <b>相机 ${i}</b>
+        <span class="meta" id="fmt-${i}">—</span>
+        <span class="spacer"></span>
+        <span class="tag" id="mode-${i}">—</span>
+      </div>
+      <div class="view">
+        <span class="hint" id="hint-${i}">等待采集…</span>
+        <img id="img-${i}" alt="camera ${i}" style="display:none" />
+      </div>
+      <div class="stats">
+        <div><span>分辨率</span><b id="res-${i}">—</b></div>
+        <div><span>实际 FPS</span><b id="fps-${i}">—</b></div>
+        <div><span>帧号</span><b id="seq-${i}">—</b></div>
+        <div><span>滞后</span><b id="lag-${i}">—</b></div>
+      </div>
+      <div class="err-msg" id="err-${i}"></div>
+    </section>`).join('');
+}
+buildPanels();
+
+// 默认同源；若页面被外层代理/iframe 包裹导致相对路径打不到后端，自动直连 3002
+let API_BASE = '';
+const DIRECT_BASE = 'http://127.0.0.1:3002';
+const apiUrl = (p) => API_BASE + p;
+
+async function _getJson(path, opts) {
+  const r = await fetch(apiUrl(path), opts);
+  const txt = await r.text();
+  let data = {};
+  try { data = JSON.parse(txt); } catch (e) { data = { error: txt }; }
+  if (!r.ok) throw new Error(data.error || ('HTTP ' + r.status));
+  return data;
+}
+
+async function api(path, opts) {
+  try {
+    return await _getJson(path, opts);
+  } catch (e) {
+    if (API_BASE === '' && location.port !== '3002') {
+      API_BASE = DIRECT_BASE;
+      log('同源接口不可达，改用 ' + DIRECT_BASE);
+      return await _getJson(path, opts);
+    }
+    throw e;
+  }
+}
+
+// ---------- 显示通道：优先 MJPEG，不通则降级为快照轮询 ----------
+function stopChannel(i, hintText) {
+  if (pollTimer[i]) { clearInterval(pollTimer[i]); delete pollTimer[i]; }
+  if (pollUrl[i]) { URL.revokeObjectURL(pollUrl[i]); delete pollUrl[i]; }
+  const img = el(`img-${i}`);
+  if (img) {
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute('src');
+    img.style.display = 'none';
+  }
+  delete mode[i];
+  seen[i] = false;
+  const tag = el(`mode-${i}`);
+  if (tag) tag.textContent = '—';
+  const hint = el(`hint-${i}`);
+  if (hint) {
+    hint.style.display = 'flex';
+    hint.textContent = hintText || '已停止';
+  }
+}
+
+function startPoll(i) {
+  if (mode[i] === 'poll') return;
+  const img = el(`img-${i}`);
+  if (mode[i] === 'mjpeg') {          // 从 MJPEG 切过来：先断开长连接
+    img.onload = null;
+    img.onerror = null;
+    img.removeAttribute('src');
+  }
+  mode[i] = 'poll';
+  const tag = el(`mode-${i}`);
+  if (tag) tag.textContent = '快照轮询';
+
+  let inflight = false;
+  const tick = async () => {
+    if (inflight) return;             // 上一帧没回来就跳过，避免请求堆积
+    inflight = true;
+    try {
+      const r = await fetch(apiUrl(`/api/camera/${i}/snapshot?t=${Date.now()}`), { cache: 'no-store' });
+      if (r.ok) {
+        const blob = await r.blob();
+        const url = URL.createObjectURL(blob);
+        const old = pollUrl[i];
+        img.src = url;
+        pollUrl[i] = url;
+        // 延迟释放，避免当前显示的帧被立刻回收
+        if (old) setTimeout(() => URL.revokeObjectURL(old), 800);
+        img.style.display = 'block';
+        const hint = el(`hint-${i}`);
+        if (hint) hint.style.display = 'none';
+        seen[i] = true;
+      }
+    } catch (e) { /* 网络抖动，下一轮再试 */ }
+    finally { inflight = false; }
+  };
+  pollTimer[i] = setInterval(tick, 110);   // ≈9 fps
+  tick();
+}
+
+function startMjpeg(i) {
+  if (mode[i]) return;
+  mode[i] = 'mjpeg';
+  const img = el(`img-${i}`);
+  const hint = el(`hint-${i}`);
+  const tag = el(`mode-${i}`);
+  if (tag) tag.textContent = 'MJPEG';
+  img.style.display = 'block';
+  if (hint) hint.style.display = 'none';
+  img.onload = () => { seen[i] = true; };          // multipart 首帧到达
+  img.onerror = () => {
+    if (mode[i] === 'mjpeg') {
+      log(`相机 ${i}：MJPEG 流不可用，改用快照轮询`);
+      startPoll(i);
+    }
+  };
+  img.src = apiUrl(`/api/camera/${i}/stream?k=${Date.now()}`);
+
+  // 某些内嵌浏览器不报错也不渲染 multipart，超时后自动降级
+  setTimeout(() => {
+    if (mode[i] === 'mjpeg' && !seen[i]) {
+      log(`相机 ${i}：3.5s 未收到 MJPEG 帧，改用快照轮询`);
+      startPoll(i);
+    }
+  }, 3500);
+}
+
+// ---------- 状态轮询：由它决定每路挂不挂流 ----------
+async function refresh() {
+  try {
+    const st = await api('/api/cameras');
+    const now = Date.now() / 1000;
+    const live = st.cameras.filter(c => c.state === 'streaming').length;
+    const want = (st.defaults && st.defaults.indices ? st.defaults.indices : CAMERAS).length;
+    summaryEl.textContent = `在线 ${live}/${st.count} 路 · ${new Date(st.server_time * 1000).toLocaleTimeString('zh-CN', { hour12: false })}`;
+
+    st.cameras.forEach(c => {
+      const i = c.index;
+      if (!el(`img-${i}`)) return;   // 面板里没有这一路（索引不在 CAMERAS），忽略
+      const dot = el(`dot-${i}`);
+      if (dot) dot.className = 'dot ' + (c.state === 'streaming' ? 'ok' : (c.state === 'error' ? 'err' : 'warn'));
+      const fmt = el(`fmt-${i}`);
+      if (fmt) fmt.textContent = c.format || c.state;
+      const err = el(`err-${i}`);
+      if (err) err.textContent = c.error || '';
+
+      const f = c.frame;
+      if (f) {
+        el(`res-${i}`).textContent = `${f.width}×${f.height}`;
+        el(`seq-${i}`).textContent = f.seq;
+        el(`lag-${i}`).textContent = `${Math.max(0, (now - f.host_timestamp) * 1000).toFixed(0)} ms`;
+      }
+      el(`fps-${i}`).textContent = c.fps ? c.fps.toFixed(1) : '0';
+
+      // 关键：只要相机在推流，就自动把画面挂上去（不再依赖点击按钮）
+      if (c.state === 'streaming') {
+        if (!mode[i]) startMjpeg(i);
+      } else if (mode[i]) {
+        stopChannel(i, c.state === 'error' ? '采集异常，见下方错误信息'
+                        : (c.state === 'reconnecting' ? '断线重连中…' : '已停止'));
+      } else {
+        const hint = el(`hint-${i}`);
+        if (hint) {
+          hint.style.display = 'flex';
+          hint.textContent = c.state === 'error' ? '采集异常'
+                            : (c.state === 'opening' ? '正在打开设备…'
+                            : (c.state === 'stopped' ? '已停止' : '等待采集…'));
+        }
+      }
+    });
+
+    // 后端没有报上来的相机（未启动）
+    const reported = new Set(st.cameras.map(c => c.index));
+    CAMERAS.forEach(i => {
+      if (!reported.has(i)) {
+        const dot = el(`dot-${i}`); if (dot) dot.className = 'dot';
+        const fmt = el(`fmt-${i}`); if (fmt) fmt.textContent = '未启动';
+        const hint = el(`hint-${i}`);
+        if (hint) { hint.style.display = 'flex'; hint.textContent = '这台相机未启动'; }
+      }
+    });
+
+    const states = st.cameras.map(c => c.state);
+    running = states.includes('streaming') || states.includes('opening') || states.includes('reconnecting');
+    el('btn-start').disabled = running;
+    el('btn-stop').disabled = !running;
+  } catch (e) {
+    summaryEl.textContent = '后端未连接：' + e.message;
+    CAMERAS.forEach(i => stopChannel(i, '后端未连接\n' + e.message));
+  }
+}
+
+// ---------- 操作 ----------
+el('btn-start').onclick = async () => {
+  try {
+    log('启动相机 ' + CAMERAS.join(', ') + ' …');
+    await api('/api/cameras/start', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ indices: CAMERAS })
+    });
+    await refresh();
+  } catch (e) { log('启动失败：' + e.message); }
+};
+
+el('btn-stop').onclick = async () => {
+  try {
+    log('停止采集…');
+    CAMERAS.forEach(i => stopChannel(i, '已停止'));
+    await api('/api/cameras/stop', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    await refresh();
+  } catch (e) { log('停止失败：' + e.message); }
+};
+
+el('btn-save').onclick = async () => {
+  try {
+    const res = await api('/api/cameras/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    if (!res.count) { log('没有可保存的帧（相机未启动？）'); return; }
+    res.saved.forEach(s => log(`已保存 cam ${s.index} → ${s.path}  帧号=${s.seq}  mf_ts=${s.mf_timestamp}`));
+  } catch (e) { log('保存失败：' + e.message); }
+};
+
+// 页面关闭/刷新时断开长连接，后端线程不受影响
+window.addEventListener('beforeunload', () => {
+  CAMERAS.forEach(i => stopChannel(i));
+});
+
+refresh();
+timer = setInterval(refresh, 1000);
+
+// 版本标记：用来确认浏览器拿到的是最新版页面
+(function markBuild() {
+  const b = el('build');
+  if (!b) return;
+  b.textContent = 'v3 · 白底';
+})();
+</script>
+</body>
+</html>

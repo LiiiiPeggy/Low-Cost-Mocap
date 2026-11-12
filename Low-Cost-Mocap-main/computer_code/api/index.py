@@ -10,15 +10,34 @@ from scipy import linalg
 from flask_socketio import SocketIO
 import copy
 import time
-import serial
 import threading
-from ruckig import InputParameter, OutputParameter, Result, Ruckig
 from flask_cors import CORS
 import json
 
+# --- 无人机硬件链路（串口 + Ruckig）按需加载 --------------------------------
+# Windows 上只做双相机预览时通常没有 pyserial / ruckig，缺失时不应拦住相机功能。
+try:
+    import serial
+except ImportError:
+    serial = None
+
+try:
+    from ruckig import InputParameter, OutputParameter, Result, Ruckig
+    _RUCKIG_AVAILABLE = True
+except ImportError:
+    InputParameter = OutputParameter = Result = Ruckig = None
+    _RUCKIG_AVAILABLE = False
+
 serialLock = threading.Lock()
 
-ser = serial.Serial("/dev/cu.usbserial-02X2K2GE", 1000000, write_timeout=1, )
+SERIAL_PORT = "/dev/cu.usbserial-02X2K2GE"
+ser = None
+if serial is not None:
+    try:
+        ser = serial.Serial(SERIAL_PORT, 1000000, write_timeout=1)
+    except Exception as _exc:  # 端口不存在 / 被占用
+        print("[警告] 串口 %s 打不开（%s），无人机控制接口不可用，相机预览不受影响"
+              % (SERIAL_PORT, _exc))
 
 app = Flask(__name__)
 CORS(app, supports_credentials=True)
@@ -62,6 +81,8 @@ def camera_stream():
 
 @app.route("/api/trajectory-planning", methods=["POST"])
 def trajectory_planning_api():
+    if not _RUCKIG_AVAILABLE:
+        return json.dumps({"error": "ruckig 未安装，轨迹规划接口不可用"}), 503
     data = json.loads(request.data)
 
     waypoint_groups = [] # grouped by continuious movement (no stopping)
@@ -114,7 +135,7 @@ def plan_trajectory(start_pos, end_pos, waypoints, max_vel, max_accel, max_jerk,
 @socketio.on("arm-drone")
 def arm_drone(data):
     global cameras_init
-    if not cameras_init:
+    if not cameras_init or ser is None:
         return
     
     Cameras.instance().drone_armed = data["droneArmed"]
@@ -129,6 +150,8 @@ def arm_drone(data):
 
 @socketio.on("set-drone-pid")
 def arm_drone(data):
+    if ser is None:
+        return
     serial_data = {
         "pid": [float(x) for x in data["dronePID"]],
     }
@@ -138,6 +161,8 @@ def arm_drone(data):
 
 @socketio.on("set-drone-setpoint")
 def arm_drone(data):
+    if ser is None:
+        return
     serial_data = {
         "setpoint": [float(x) for x in data["droneSetpoint"]],
     }
@@ -147,6 +172,8 @@ def arm_drone(data):
 
 @socketio.on("set-drone-trim")
 def arm_drone(data):
+    if ser is None:
+        return
     serial_data = {
         "trim": [int(x) for x in data["droneTrim"]],
     }
@@ -323,5 +350,23 @@ def live_mocap(data):
         cameras.stop_trangulating_points()
 
 
+# --- 红外相机预览蓝图（Windows 双相机 MJPEG）--------------------------------
+# 与 api/preview_server.py 共用同一套路由：/api/cameras、/api/camera/<i>/stream ...
+try:
+    from camera_preview import register as register_camera_preview
+    register_camera_preview(app)
+    print("[相机] 预览接口已挂载：/api/cameras、/api/camera/<index>/stream")
+except Exception as _exc:  # 相机模块导入失败不应影响原有功能
+    print("[警告] 相机预览模块加载失败：%s" % _exc)
+
+
 if __name__ == '__main__':
-    socketio.run(app, port=3001, debug=True)
+    from camera_manager import manager as camera_manager
+
+    # 注意：不能用 reloader，否则子进程会重复打开同一台相机（0xC00D3704）。
+    try:
+        # flask_socketio 内部已按 threaded=True 启动，不能重复传该参数
+        socketio.run(app, port=3001, debug=False, use_reloader=False,
+                     allow_unsafe_werkzeug=True)
+    finally:
+        camera_manager().shutdown()

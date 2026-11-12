@@ -14,6 +14,7 @@ import { socket } from './shared/styles/scripts/socket';
 import { matrix, mean, multiply, rotationMatrix } from 'mathjs';
 import Objects from './components/Objects';
 import Chart from './components/chart';
+import CameraPreview from './components/CameraPreview';
 import TrajectoryPlanningSetpoints from './components/TrajectoryPlanningSetpoints';
 
 const TRAJECTORY_PLANNING_TIMESTEP = 0.05
@@ -377,6 +378,13 @@ export default function App() {
                 <img src={cameraStreamRunning ? "http://localhost:3001/api/camera-stream" : ""} />
               </Col>
             </Row>
+          </Card>
+        </Col>
+      </Row>
+      <Row className='pt-3'>
+        <Col>
+          <Card className='shadow-sm p-3'>
+            <CameraPreview />
           </Card>
         </Col>
       </Row>
