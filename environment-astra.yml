@@ -1,0 +1,53 @@
+# Low-Cost-Mocap 后端 conda 环境 —— Orbbec Astra Pro SM 适配版
+# 用法（Anaconda Prompt）：conda env create -f environment-astra.yml
+#
+# 与 environment.yml（复现原仓库 / PS3 Eye 版）的区别：
+#   1) 去掉 pseyepy（PS3 Eye 专用驱动，Astra 用不了）
+#   2) 去掉「源码编译 OpenCV + opencv_contrib」的硬性要求：源码只调用了
+#      cv2.sfm 的 3 个函数，均可由常规 OpenCV 的 calib3d + numpy 等价实现，
+#      详见 docs/astra-pro-sm-adaptation.md。因此本环境可由 conda + pip 一次装齐。
+#   3) 相机 SDK 因协议/平台而异，见下方说明；pip 段那一行仅适用于 Windows x64。
+#
+# 本文件只解决 Python 依赖。硬件侧仍需：关闭结构光激光散斑投射器、目标上
+# 3 个主动发光 IR LED 标记（波长需匹配窄带滤光片）、重新标定 4 台相机内参。
+# 相机侧 IR 环形补光灯【不需要另买】：作者 Discussion #36 明确其只用于
+# 被动逆反射球方案，主动 LED 标记不需要；关散斑后应固定手动曝光，而非加灯。
+
+name: low-cost-mocap-astra
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - flask
+  - flask-cors
+  - pyserial
+  - pip:
+      - opencv-python>=4.10        # 常规版即可，只需 calib3d；不要装 opencv-contrib-python
+      - flask-socketio
+      - ruckig>=0.19
+      - pyorbbecsdk==1.3.2         # 仅 Windows x64 + Python 3.8/3.9/3.11 有预编译 wheel
+
+# ── 说明与边界 ──────────────────────────────────────────────────────────
+# 1) python=3.11 是建议值，非仓库要求。选它是因为 pyorbbecsdk 1.3.2 在 PyPI
+#    提供的 Windows wheel 只有 cp38 / cp39 / cp311；本机 base 为 Python 3.14。
+# 2) 只装 opencv-python，不装 opencv-contrib-python，也不装 conda 版 opencv，
+#    避免多份 cv2 冲突。cv2.sfm 不需要了，但 helpers.py / index.py 里的 3 处
+#    调用必须改写，否则运行时报 AttributeError。
+# 3) pyorbbecsdk==1.3.2 属于 Orbbec SDK v1.x，面向 OpenNI 协议老设备。
+#    Astra Pro SM 属于该协议；Orbbec SDK v2（PyPI 名 pyorbbecsdk2）明确不再
+#    支持传统 OpenNI 设备，且已公布的固件升级名单中没有 Astra Pro 系列。
+#    - Windows x64 / Python 3.11：本行可直接 pip 安装（约 68 MB wheel）。
+#    - Linux x64 与 ARM64（含 RK3588）：PyPI 无对应 wheel，请删除本行，改走
+#      ① OpenNI2（Astra 系列原生，社区有 Windows/Linux/ARM64 实测）；
+#      ② Orbbec SDK v1 源码编译 + pybind11；
+#      ③ ROS2 astra_camera / orbbec_camera 驱动发布 /camera/ir/image_raw，
+#         后端订阅 topic（用户现有 ROS2 栈，改动最小）。
+#    是否识别得到 Astra Pro SM 需以 SDK 枚举到的设备名为准，尚未验证。
+# 4) 前端不走 conda：README 要求 computer_code/ 下 yarn install / yarn run dev，
+#    需 npm 与 yarn；可 conda install -c conda-forge nodejs 后 npm install -g yarn。
+# 5) 固件依赖（ESP32 的 ArduinoJson / PID / sbus.h）走 Arduino，与 conda 无关；
+#    部署到机器狗时整段 SBUS/PID 链路不用编译。

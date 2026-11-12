@@ -1,0 +1,21 @@
+# ---- Python / Windows ----
+__pycache__/
+*.py[cod]
+.venv/
+Thumbs.db
+desktop.ini
+
+# ---- 厂商 SDK（267MB，本工程不编译、不链接、运行时也不需要）----
+# ir_camera.py 只用系统自带的 Media Foundation（mfplat.dll / mf.dll / mfreadwrite.dll），
+# 该目录仅作参考资料，若日后需要再单独拉取。
+image_driver/camera windows sdk/
+
+# ---- 原始项目克隆（嵌套 git 仓库，提交会变成失效的 submodule 链接）----
+upstream/
+
+# ---- WorkBuddy 项目数据 ----
+.workbuddy/
+
+# ---- 运行产物 ----
+ir_*.png
+*.log

@@ -1,0 +1,42 @@
+# Low-Cost-Mocap 后端 conda 环境 —— 原仓库 / PS3 Eye 复现版
+# 用法（在 Anaconda Prompt 中）：conda env create -f environment.yml
+# 若改用 Orbbec Astra Pro SM 相机，请用 environment-astra.yml（无需 pseyepy、无需编译 OpenCV），
+# 改动清单见 docs/astra-pro-sm-adaptation.md。
+# 本文件只覆盖可由 conda / PyPI 安装的依赖；pseyepy 与 cv2.sfm 必须另行源码编译，见末尾说明。
+name: low-cost-mocap
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - pip
+  - numpy
+  - scipy
+  - cython
+  - libusb
+  - flask
+  - flask-cors
+  - pyserial
+  - pip:
+      - flask-socketio
+      - ruckig>=0.19
+
+# 说明与边界
+# 1) Python 3.11 是建议值：仓库 README 与源码未声明 Python 版本；本机 base 为 3.14，
+#    对 pseyepy（老 Cython/C 扩展）和需自行编译的 OpenCV 风险较高。若编译失败，
+#    可尝试 numpy<2、cython<3 组合（经验性建议，非仓库要求）。
+# 2) 故意不装 opencv / opencv-python / opencv-contrib-python：
+#    这些预编译包都不含 cv2.sfm，且会与自行编译的 OpenCV 冲突。
+#    源码调用了 cv.sfm.essentialFromFundamental、motionFromEssential、
+#    fundamentalFromProjections，必须编译 opencv + opencv_contrib，
+#    依赖 Ceres、Glog、Gflags、Eigen，再把编译产物装进本环境。
+#    README 给出的文档：https://docs.opencv.org/4.x/db/db8/tutorial_sfm_installation.html
+#    替代：README 标注「完全未经测试」的 no-cv-sfm 分支移除了该依赖。
+# 3) pseyepy 既不在 PyPI 也不在 conda-forge，只能从源码装：
+#    git clone https://github.com/bensondaled/pseyepy
+#    cd pseyepy && pip install .
+#    其 README 的 Windows 说明要求 Python 3.8+ 与 Visual Studio 2022 Build Tools，
+#    并自带预编译 libusb DLL；Linux 需 libusb 头文件（本文件已含 conda-forge libusb）。
+# 4) 前端依赖不走 conda：README 要求在 computer_code/ 下执行 yarn install / yarn run dev，
+#    需 npm 与 yarn；可 conda install -c conda-forge nodejs 后 npm install -g yarn。
+# 5) 固件依赖（ESP32 的 ArduinoJson / PID / sbus.h）在 Arduino 侧安装，与 conda 无关。
