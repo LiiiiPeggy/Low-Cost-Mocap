@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import camera_preview  # noqa: E402
 from camera_manager import manager  # noqa: E402
+from sync import sync_service  # noqa: E402
 
 
 def build_app() -> Flask:
@@ -58,11 +59,15 @@ def main(argv=None) -> int:
     app = build_app()
     m = manager()
 
+    # 帧同步配对线程常驻（空转开销可忽略），相机启动后立即开始配对
+    sync_service()
+
     if not args.no_autostart:
         indices = args.indices or camera_preview._parse_indices(None)
         try:
             m.start(indices, width=args.width, height=args.height,
                     fps=args.fps, pixel_format=args.format)
+            sync_service().reset_pointers()
             print("已启动相机：%s  %dx%d@%g  %s"
                   % (indices, args.width, args.height, args.fps, args.format))
         except Exception as exc:

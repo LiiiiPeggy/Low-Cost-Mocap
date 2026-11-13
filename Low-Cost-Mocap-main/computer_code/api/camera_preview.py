@@ -22,6 +22,8 @@ from datetime import datetime
 from flask import Blueprint, Response, jsonify, request, send_from_directory
 
 from camera_manager import manager
+from sync import sync_service
+from sync import DEFAULT_OUT_DIR as SYNC_OUT_DIR
 
 bp = Blueprint("camera_preview", __name__)
 
@@ -87,6 +89,11 @@ def cameras_start():
         return jsonify({"error": str(exc)}), 409
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+    # 新会话：清空配对指针与统计（相机 seq 从 1 重新计数）
+    try:
+        sync_service().reset_pointers()
+    except Exception:
+        pass
     return jsonify(st)
 
 
@@ -184,6 +191,47 @@ def _mjpeg_generator(index: int):
                b"Content-Type: image/jpeg\r\n"
                b"Content-Length: " + str(len(data)).encode() + b"\r\n"
                b"X-Seq: " + str(frame.seq).encode() + b"\r\n\r\n" + data + b"\r\n")
+
+
+# ---------------------------------------------------------------------------
+# 帧同步（软件级，基于主机单调时间戳）
+# ---------------------------------------------------------------------------
+@bp.get("/api/sync/status")
+def sync_status():
+    """配对统计：Δt 的均值/P95/最大、配对率、丢弃数、缓存深度。"""
+    try:
+        return jsonify(sync_service().status())
+    except Exception as exc:
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+
+
+@bp.post("/api/sync/config")
+def sync_config():
+    """运行时调整最大允许时间差（毫秒）。"""
+    body = request.get_json(silent=True) or {}
+    if "max_dt_ms" not in body:
+        return jsonify({"error": "缺少 max_dt_ms"}), 400
+    try:
+        v = sync_service().set_max_dt(float(body["max_dt_ms"]))
+    except (TypeError, ValueError):
+        return jsonify({"error": "max_dt_ms 必须是数字"}), 400
+    return jsonify({"max_dt_ms": v, "status": sync_service().status()})
+
+
+@bp.post("/api/sync/save")
+def sync_save():
+    """保存最近若干对同步帧：两张原始灰度 PNG + 每对时间戳 JSON + manifest。"""
+    body = request.get_json(silent=True) or {}
+    count = int(body.get("count", 8))
+    out_dir = body.get("out_dir")
+    if not out_dir:
+        out_dir = os.path.join(SYNC_OUT_DIR,
+                               "sync_%s" % datetime.now().strftime("%Y%m%d_%H%M%S"))
+    try:
+        res = sync_service().save_pairs(out_dir, count)
+    except Exception as exc:
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+    return jsonify(res)
 
 
 # ---------------------------------------------------------------------------

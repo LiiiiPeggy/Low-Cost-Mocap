@@ -8,6 +8,8 @@
   一个线程，open() / grab() / close() 全部在该线程内完成**，主线程只读缓存。
 * 只保留**最新一帧**（latest-frame cache）：读端永远拿到最新数据，网页卡顿或
   刷新都不会造成延迟累积。
+* 另外维护一份**定长历史缓存**（默认 45 帧，约 1.5s@30fps）供帧同步配对使用；
+  两份缓存共享同一份 ndarray，不额外占内存（见 ``_publish``）。
 * 一个 worker 只打开一次设备；多个浏览器请求同一个 MJPEG 源时只是多读几份
   缓存 + 复用同一份已编码 JPEG，不会重复打开摄像头。
 
@@ -28,6 +30,7 @@ import sys
 import threading
 import time
 import traceback
+from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -55,6 +58,10 @@ except ImportError as exc:  # pragma: no cover
 
 
 MF_TICK_SECONDS = 1e-7  # Media Foundation 时间单位是 100ns
+
+# 历史缓存深度：45 帧 ≈ 1.5s@30fps。1280x720 uint8 单帧 0.92MB，
+# 两路合计约 83MB；内存紧张可用 MOCAP_SYNC_BUFFER=30 调小。
+DEFAULT_HISTORY = int(os.environ.get("MOCAP_SYNC_BUFFER", "45"))
 
 
 @dataclass
@@ -91,7 +98,7 @@ class CameraWorker:
     def __init__(self, index: int, width: int = 1280, height: int = 720,
                  fps: float = 30.0, pixel_format: str = "NV12",
                  name: str | None = None, reconnect: bool = True,
-                 jpeg_quality: int = 80):
+                 jpeg_quality: int = 80, history_len: int = DEFAULT_HISTORY):
         self.index = int(index)
         self.requested = {
             "width": int(width), "height": int(height),
@@ -100,6 +107,10 @@ class CameraWorker:
         self.name_filter = name
         self.reconnect = reconnect
         self.jpeg_quality = int(jpeg_quality)
+        # 供帧同步使用；为 0 时不保留历史（省内存）
+        self.history_len = max(0, int(history_len))
+        self._history: deque[Frame] = deque(maxlen=self.history_len or None) \
+            if self.history_len else deque()
 
         self._cond = threading.Condition()
         self._frame: Frame | None = None
@@ -213,10 +224,18 @@ class CameraWorker:
     def _publish(self, gray: np.ndarray, mf_ts: int) -> None:
         now_wall = time.time()
         now_mono = time.perf_counter()
+        # NV12/YUY2 的 Y 平面是跨步视图（[:, ::2]），会连带持有整块 1.38MB 的
+        # NV12 buffer。转成连续数组后：缓存 45 帧只占 45*0.92MB，
+        # 且 cv2 编码/写盘不用再做隐式转换（对已连续的 MJPG 则是零拷贝）。
+        if not gray.flags.c_contiguous:
+            gray = np.ascontiguousarray(gray)
+        frame = Frame(gray=gray, seq=self._seq + 1, mf_ts=int(mf_ts),
+                      host_ts=now_wall, mono_ts=now_mono)
         with self._cond:
             self._seq += 1
-            self._frame = Frame(gray=gray, seq=self._seq, mf_ts=int(mf_ts),
-                                host_ts=now_wall, mono_ts=now_mono)
+            self._frame = frame
+            if self.history_len:
+                self._history.append(frame)   # 与 latest 共享同一个 ndarray
             self._cond.notify_all()
 
         self._frames_total += 1
@@ -241,6 +260,27 @@ class CameraWorker:
         if frame is None or frame.seq <= after_seq:
             return None
         return frame
+
+    def history_after(self, after_seq: int) -> list[Frame]:
+        """返回历史缓存中 seq > after_seq 的帧（按时间升序，最老在前）。
+
+        供帧同步配对使用。在锁内复制一份列表，避免调用方遍历时 deque 被
+        采集线程改动（deque 迭代期间被修改会抛 RuntimeError）。
+        """
+        if not self.history_len:
+            return []
+        with self._cond:
+            return [f for f in self._history if f.seq > after_seq]
+
+    @property
+    def buffered(self) -> int:
+        """当前历史缓存里有多少帧。"""
+        with self._cond:
+            return len(self._history)
+
+    @property
+    def frames_total(self) -> int:
+        return self._frames_total
 
     def jpeg(self) -> bytes | None:
         """把最新帧编码成 JPEG，同一帧只编码一次（多浏览器共享）。"""
@@ -270,6 +310,7 @@ class CameraWorker:
             "requested": dict(self.requested),
             "fps": round(self._fps, 1),
             "frames_total": self._frames_total,
+            "buffered": self.buffered,
             "frame": frame.meta() if frame else None,
             "opened_at": self._opened_at,
         }
@@ -291,10 +332,12 @@ class CameraManager:
         return self._shutdown.is_set()
 
     def start(self, indices, width=1280, height=720, fps=30.0,
-              pixel_format="NV12", names=None) -> dict:
+              pixel_format="NV12", names=None, history_len=None) -> dict:
         indices = [int(i) for i in indices]
         if len(set(indices)) != len(indices):
             raise ValueError("设备索引重复：%s" % indices)
+
+        hist = DEFAULT_HISTORY if history_len is None else int(history_len)
 
         self._shutdown.clear()
         with self._lock:
@@ -312,6 +355,7 @@ class CameraManager:
                     pixel_format=pixel_format,
                     name=(names or {}).get(str(idx)) or (names or {}).get(idx),
                     jpeg_quality=self._jpeg_quality,
+                    history_len=hist,
                 )
                 self._workers[idx] = worker
                 worker.start()

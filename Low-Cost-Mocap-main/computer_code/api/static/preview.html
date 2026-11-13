@@ -77,6 +77,25 @@
     border-radius: 10px; color: #4b5563; font: 12px/1.7 ui-monospace, Consolas, monospace;
     white-space: pre-wrap; max-height: 150px; overflow: auto;
   }
+  /* ---- 帧同步状态条 ---- */
+  #syncbar {
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 9px 20px; background: #f8fafc; border-bottom: 1px solid var(--line);
+    font-size: 12.5px; color: var(--dim);
+  }
+  #syncbar > b { color: var(--fg); font-size: 13px; }
+  #syncbar b { color: var(--fg); font-variant-numeric: tabular-nums; }
+  #syncbar .note { color: #98a1b0; font-size: 11px; }
+  #syncbar label { display: inline-flex; align-items: center; gap: 5px; }
+  #syncbar input[type="number"] {
+    width: 58px; padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px;
+    font-size: 12px; color: var(--fg); background: #fff; font-variant-numeric: tabular-nums;
+  }
+  #syncbar button { padding: 4px 10px; font-size: 12px; border-radius: 6px; }
+  #syncbar .pill {
+    font-size: 11px; padding: 1px 6px; border-radius: 999px;
+    background: #eef2f7; color: #51607a; border: 1px solid #e3e9f1;
+  }
 </style>
 </head>
 <body>
@@ -89,6 +108,21 @@
   <button id="btn-stop" class="danger">停止采集</button>
   <button id="btn-save">保存原始灰度</button>
 </header>
+
+<section id="syncbar">
+  <b>帧同步</b>
+  <span class="pill">软件级 · 主机单调时钟</span>
+  <label>阈值 <input id="maxdt" type="number" min="1" max="200" step="1" value="20"> ms</label>
+  <span>配对率 <b id="s-rate">—</b></span>
+  <span>|Δt| 均值 <b id="s-mean">—</b></span>
+  <span>P95 <b id="s-p95">—</b></span>
+  <span>最大 <b id="s-max">—</b></span>
+  <span>丢弃 <b id="s-drop">—</b></span>
+  <span>缓存 <b id="s-buf">—</b></span>
+  <span class="spacer"></span>
+  <span class="note">Δt 为帧交付时刻差，非曝光中心时刻</span>
+  <button id="btn-sync-save">保存同步对</button>
+</section>
 
 <main id="panels"></main>
 <div id="log">等待操作…</div>
@@ -253,6 +287,31 @@ function startMjpeg(i) {
   }, 3500);
 }
 
+// ---------- 帧同步状态 ----------
+function fmtNum(v, unit, digits) {
+  if (v === null || v === undefined || !isFinite(v)) return '—';
+  return v.toFixed(digits === undefined ? 1 : digits) + (unit || '');
+}
+
+async function refreshSync() {
+  try {
+    const s = await api('/api/sync/status');
+    el('s-rate').textContent = s.pair_rate === null ? '—'
+      : (s.pair_rate * 100).toFixed(0) + '%';
+    el('s-mean').textContent = fmtNum(s.dt_ms.mean, ' ms');
+    el('s-p95').textContent = fmtNum(s.dt_ms.p95, ' ms');
+    el('s-max').textContent = fmtNum(s.dt_ms.max, ' ms');
+    el('s-drop').textContent = `${s.dropped.a} / ${s.dropped.b}`;
+    el('s-buf').textContent = `${s.buffered.a} / ${s.buffered.b}`;
+    // 用户正在输入时不要覆盖输入框
+    if (document.activeElement !== el('maxdt')) el('maxdt').value = s.max_dt_ms;
+  } catch (e) {
+    ['s-rate', 's-mean', 's-p95', 's-max'].forEach(id => { el(id).textContent = '—'; });
+    el('s-drop').textContent = '—';
+    el('s-buf').textContent = '—';
+  }
+}
+
 // ---------- 状态轮询：由它决定每路挂不挂流 ----------
 async function refresh() {
   try {
@@ -316,6 +375,7 @@ async function refresh() {
     summaryEl.textContent = '后端未连接：' + e.message;
     CAMERAS.forEach(i => stopChannel(i, '后端未连接\n' + e.message));
   }
+  await refreshSync();
 }
 
 // ---------- 操作 ----------
@@ -351,6 +411,37 @@ el('btn-save').onclick = async () => {
   } catch (e) { log('保存失败：' + e.message); }
 };
 
+// 修改同步阈值（运行时生效：配对是流式的，只影响之后的新帧对）
+el('maxdt').onchange = async () => {
+  const v = parseFloat(el('maxdt').value);
+  if (!isFinite(v)) { log('阈值必须是数字'); return; }
+  try {
+    const r = await api('/api/sync/config', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ max_dt_ms: v })
+    });
+    log(`同步阈值已改为 ${r.max_dt_ms} ms（统计窗口内的旧数据不会被改写）`);
+    refreshSync();
+  } catch (e) { log('修改阈值失败：' + e.message); }
+};
+
+// 保存最近若干对同步帧（原始灰度 PNG + 每对时间戳 JSON + manifest）
+el('btn-sync-save').onclick = async () => {
+  try {
+    const res = await api('/api/sync/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count: 8 })
+    });
+    if (!res.count) {
+      log('保存同步对失败：' + (res.message || '还没有配对成功的帧'));
+      return;
+    }
+    log(`已保存 ${res.count} 对同步帧 → ${res.out_dir}`);
+    res.saved.forEach(s => log(
+      `   pair#${s.pair_seq}  Δt=${s.dt_ms} ms   A seq=${s.a.seq}  B seq=${s.b.seq}`));
+  } catch (e) { log('保存同步对失败：' + e.message); }
+};
+
 // 页面关闭/刷新时断开长连接，后端线程不受影响
 window.addEventListener('beforeunload', () => {
   CAMERAS.forEach(i => stopChannel(i));
@@ -363,7 +454,7 @@ timer = setInterval(refresh, 1000);
 (function markBuild() {
   const b = el('build');
   if (!b) return;
-  b.textContent = 'v3 · 白底';
+  b.textContent = 'v4 · 白底 + 帧同步';
 })();
 </script>
 </body>

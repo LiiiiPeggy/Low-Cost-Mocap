@@ -53,6 +53,17 @@ interface SavedFrame {
   host_time_iso: string;
 }
 
+/** 软件级帧同步统计（api/sync.py）。Δt 为主机单调时钟下的交付时刻差，非曝光差。 */
+interface SyncStats {
+  pairs_total: number;
+  pair_rate: number | null;
+  max_dt_ms: number;
+  dt_ms: { mean: number | null; p95: number | null; max: number | null };
+  dropped: { a: number; b: number };
+  buffered: { a: number; b: number };
+  last_dt_ms: number | null;
+}
+
 const ACTIVE_STATES = ['opening', 'streaming', 'reconnecting'];
 
 function stateColor(state: string): string {
@@ -74,12 +85,21 @@ function stateText(state: string): string {
   return map[state] ?? state;
 }
 
+function pctText(v: number | null): string {
+  return v === null ? '—' : `${(v * 100).toFixed(0)}%`;
+}
+
+function msText(v: number | null): string {
+  return v === null ? '—' : `${v.toFixed(1)} ms`;
+}
+
 export default function CameraPreview() {
   const [status, setStatus] = useState<CameraStatus[]>([]);
   const [running, setRunning] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [saved, setSaved] = useState<SavedFrame[]>([]);
   const [busy, setBusy] = useState(false);
+  const [sync, setSync] = useState<SyncStats | null>(null);
   // 每次启动/重连时递增，用来强制 <img> 重新建立 MJPEG 连接
   const [streamKey, setStreamKey] = useState(0);
   const [now, setNow] = useState(() => Date.now() / 1000);
@@ -96,6 +116,13 @@ export default function CameraPreview() {
       setNow(Date.now() / 1000);
     } catch (e) {
       setError(`后端未连接：${(e as Error).message}（请先启动 api/preview_server.py）`);
+    }
+    // 同步统计是附加信息，失败不影响主状态刷新
+    try {
+      const r = await fetch(`${API_BASE}/api/sync/status`, { cache: 'no-store' });
+      if (r.ok) setSync(await r.json());
+    } catch {
+      /* 同步接口不可用（旧后端）时静默忽略 */
     }
   }, []);
 
@@ -200,6 +227,19 @@ export default function CameraPreview() {
 
       {error && (
         <div className="mb-2" style={{ fontSize: 13, color: '#c0392b' }}>{error}</div>
+      )}
+
+      {sync && (
+        <div className="mb-2" style={{ fontSize: 12, color: '#495057' }}>
+          <b>Frame sync</b>{' '}
+          <span style={{ color: '#8b93a7' }}>software · host monotonic clock</span>
+          {'　'}配对率 {pctText(sync.pair_rate)}
+          {'　|Δt| 均值 '}{msText(sync.dt_ms.mean)}
+          {'　P95 '}{msText(sync.dt_ms.p95)}
+          {'　最大 '}{msText(sync.dt_ms.max)}
+          {'　丢弃 '}{sync.dropped.a}/{sync.dropped.b}
+          {'　阈值 '}{sync.max_dt_ms} ms
+        </div>
       )}
 
       <Row className="g-3">

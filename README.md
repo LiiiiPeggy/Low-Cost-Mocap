@@ -46,11 +46,12 @@ python ir_camera.py --no-display --frames 120   # 无窗口压测
 
 ```
 ir_camera.py                 ← 单相机取帧（未改动）
-  └── api/camera_manager.py  ← 每相机一个线程；latest-frame 缓存；MF/主机双时间戳
-        ├── api/camera_preview.py   ← Flask 蓝图：/api/cameras、MJPEG、save
+  └── api/camera_manager.py  ← 每相机一个线程；latest 缓存 + 定长历史缓存；三时间戳
+        ├── api/camera_preview.py   ← Flask 蓝图：/api/cameras、MJPEG、save、sync
         │     ├── api/preview_server.py   独立入口（3002，无需 serial/ruckig）
         │     └── api/index.py            原后端（3001）注册同一份蓝图
-        └── src/components/CameraPreview.tsx ← 挂在 App.tsx 的一个新卡片里
+        └── api/sync.py             ← 帧同步：主机单调时间戳最近邻配对 + 统计 + 保存成对原图
+              └── src/components/CameraPreview.tsx ← 挂在 App.tsx 的一个新卡片里
 ```
 
 关键设计：
@@ -62,6 +63,8 @@ ir_camera.py                 ← 单相机取帧（未改动）
 - **索引唯一**：重复 `start` 同一设备返回 `409`。
 - **时间戳并存**：`mf_timestamp`（Media Foundation 流时间，100 ns 单位）+ `host_timestamp`
   （`time.time()`）+ `monotonic_timestamp`，供后续软件同步使用。
+- **历史缓存与最新帧共享同一个 ndarray**：入缓存时把 NV12 的跨步 Y 平面（`[:, ::2]`）
+  转成连续数组，45 帧只占 45×0.92 MB，且不会连带持有整块 1.38 MB 的 NV12 buffer。
 
 ### 启动后端（二选一）
 
@@ -104,6 +107,42 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 | GET | `/api/camera/<i>/stream` | MJPEG 实时流（`multipart/x-mixed-replace`） |
 | GET | `/api/camera/<i>/snapshot?raw=1` | 单帧；`raw=1` 返回 8bit 原始灰度 PNG |
 | POST | `/api/cameras/save` | 保存各路最新帧为原始灰度 PNG，返回路径 + 时间戳 |
+| GET | `/api/sync/status` | 同步统计：Δt 均值 / P95 / 最大、配对率、丢弃数、缓存深度 |
+| POST | `/api/sync/config` | `{"max_dt_ms":20}` 运行时改配对阈值（1–500 ms） |
+| POST | `/api/sync/save` | `{"count":8}` 保存最近 N 对：两张原始灰度 PNG + 每对 JSON + `manifest.json` |
+
+### 帧同步（软件级，非硬件同步）
+
+`api/sync.py` 每 10 ms 扫一次两路历史缓存，按**主机单调时间戳**做流式最近邻配对。
+
+**必须知道的边界**（否则会用错数据集）：
+
+- 配对**只**用 `time.perf_counter()`（同一进程、同一时钟）。Wall clock 不参与，避免系统对时跳变。
+- `mf_timestamp` 是**每台相机自己**的 MF 流时间轴，起点由驱动/会话决定，**跨设备不能直接相减**，
+  因此完全不参与配对，只作溯源信息随图保存。实测反例：某一对帧两路 `mf_timestamp` 只差
+  **0.135 ms**，而主机时间差是 **15.95 ms**。
+- 时间戳记录的是**帧交付给用户态**的时刻（`ReadSample` 返回），**不是曝光中心**：
+  `交付时刻 = 曝光中心 + 曝光时长 + 读出 + USB 传输 + 驱动缓冲`，这个差值随曝光/帧率/负载变化，
+  **不是常数偏移**，无法用固定量补偿。
+- 结论：**软件级近似同步**。30 fps 下帧周期 33.3 ms，仅时间量化就有 ±16.7 ms（半帧）量级。
+  可用于静止标定板、低速运动；**不能**用于快速运动目标的亚毫秒三角化。要更高精度需要硬件
+  触发（共享时钟）或 LED 检测标定偏差 —— 均未实现。
+
+配对规则：两路各有一个按 `seq` 单调推进的"已消费"指针 → **帧不重复使用、配对时间单调不减**；
+比较各自最老的未消费帧，`|Δt| ≤ max_dt` 则配对，否则丢弃更老的那一帧（流式最近邻）。
+一路停流超过 0.5 s 时，另一路积压帧按丢弃计，避免配对率虚高。
+
+配置（环境变量，也可在网页上实时改，改后只影响之后的新帧）：
+
+| 变量 | 默认 | 说明 |
+|---|---|---|
+| `MOCAP_SYNC_MAX_DT_MS` | `20` | 最大允许时间差（ms） |
+| `MOCAP_SYNC_BUFFER` | `45` | 每路历史缓存帧数（≈1.5 s@30fps，双路约 83 MB） |
+| `MOCAP_SYNC_WINDOW` | `300` | 统计窗口（对数） |
+| `MOCAP_SYNC_RECENT` | `16` | 内存里保留可保存的最近对数 |
+
+网页顶部同步条实时显示：配对率、`|Δt|` 均值 / P95 / 最大、丢弃数、缓存深度，并可一键「保存同步对」。
+保存目录默认 `captures/sync/sync_<时间戳>/`。
 
 ### 实测结果（Windows 11 + lowcost_mocap，两台 LRCP G720P）
 
@@ -118,6 +157,22 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 | 保存原始帧 | 1280×720 **uint8 单通道** PNG（无拉伸、无伪彩色） |
 | 原后端 `api/index.py` | 缺 `pyserial` / `ruckig` 时可启动，`/api/cameras` 正常，`socket.io` 握手正常 |
 
+**帧同步实测（阈值 20 ms，60 s 连续运行）**
+
+| 项目 | 结果 |
+|---|---|
+| 配对数速率 | **30.01 对/秒**（相机 30 fps，理论上限即 30） |
+| 配对率 / 丢弃 | **100%**，丢弃 **0 / 0** |
+| `\|Δt\|` 均值 | **0.2 – 1.6 ms**（随相位摆动） |
+| `\|Δt\|` P95 / 最大 | 0.5 – 16.1 ms / **16.9 ms** |
+| 相位漂移 | Δt 在 **0 – 16.7 ms** 之间往复（两相机独立时钟，半帧内的正常摆动） |
+| 阈值 10 ms 对照实验 | 区间配对率降到 **71–82%**，每 5 s 丢 25–30 帧；恢复 20 ms 立刻回到 100% |
+| 保存同步对 | 6 对 → 12 张 1280×720 uint8 PNG + 6 个 JSON + manifest（4.3 MB） |
+| 停止 → 重启 | `pairs` 清零后 8 s 内重新累积 240 对（30/s），seq 归零自愈正常 |
+
+> 注意：30.01 对/秒 与 100% 配对率说明**配对算法没有丢帧**，不代表**曝光同步**。
+> 真实曝光时间差 = 报告 Δt + 两路交付延迟之差，这个差值未知且非常数。
+
 > 单相机原有功能未受影响：`python ir_camera.py` 的桌面窗口、`--formats`、`--snapshot` 均保持原样。
 
 ### 尚未验证
@@ -125,6 +180,11 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 - **React 前端未能在本机构建/运行**：该机器没有 `node_modules`，且 npm registry 不可达
   （`registry.npmjs.org`、`registry.npmmirror.com` 均连接失败）。`CameraPreview.tsx` 与 Vite 代理
   只是按现有代码风格写好，**没有在浏览器里跑过**，请在有网环境 `npm install && npm run dev` 后自查。
+  同步状态显示同样只在 Flask 自带的 `/preview` 页上验证过。
+- **帧同步只做了 60 s 连续验证**：小时级长跑时两路相位可能周期性穿越阈值（实测 60 s 内 Δt 已在
+  0–16.7 ms 往复摆动），长跑时建议盯 `dropped` 是否持续增长。
+- **四相机未实现**：`SyncService` 是"A/B 两路"的一对配对器，本身无全局耦合，扩展到四路需要为
+  每对（0-1、0-2、0-3…）各建实例并汇总统计，调度层尚未实现。
 - 双相机同时拔插的热插拔恢复只做了断线重连逻辑（1 s 起指数退避），未做真实拔插实验。
 - 未实现红外 LED 检测、相机标定、三角化、Go2 控制（按要求暂不做）。
 

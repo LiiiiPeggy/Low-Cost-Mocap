@@ -356,6 +356,10 @@ try:
     from camera_preview import register as register_camera_preview
     register_camera_preview(app)
     print("[相机] 预览接口已挂载：/api/cameras、/api/camera/<index>/stream")
+    # 帧同步配对线程（软件级，基于主机单调时间戳）；空转开销可忽略
+    from sync import sync_service
+    sync_service()
+    print("[相机] 帧同步已启动：/api/sync/status、/api/sync/save")
 except Exception as _exc:  # 相机模块导入失败不应影响原有功能
     print("[警告] 相机预览模块加载失败：%s" % _exc)
 
