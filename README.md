@@ -13,7 +13,10 @@
 | `Low-Cost-Mocap-main/computer_code/api/camera_manager.py` | **双/多相机并发采集**（每相机一线程，latest-frame 缓存 + 时间戳） |
 | `Low-Cost-Mocap-main/computer_code/api/camera_preview.py` | Flask 蓝图：状态 / MJPEG 推流 / 原始帧保存 |
 | `Low-Cost-Mocap-main/computer_code/api/preview_server.py` | 只含相机功能的最小服务（无需 serial / ruckig） |
+| `Low-Cost-Mocap-main/computer_code/api/calibration/` | **双相机内参 / 外参标定**（OpenCV `calibrateCamera` / `stereoCalibrate`） |
+| `Low-Cost-Mocap-main/computer_code/api/calib_cli.py` | 标定命令行：采集 / 重检测 / 求解 / 验证 / 保存 |
 | `Low-Cost-Mocap-main/computer_code/src/components/CameraPreview.tsx` | React 双路预览面板 |
+| `docs/calibration.md` | **标定使用说明、坐标约定、精度指标、局限** |
 | `docs/` | 调研笔记：方案总结、Astra Pro 适配、配图 |
 | `image_driver/` | 相机厂商资料（说明书 PDF、AmCap 工具、DirectShow SDK 文档） |
 | `Notes.md` | 物料清单 |
@@ -144,6 +147,87 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 网页顶部同步条实时显示：配对率、`|Δt|` 均值 / P95 / 最大、丢弃数、缓存深度，并可一键「保存同步对」。
 保存目录默认 `captures/sync/sync_<时间戳>/`。
 
+### 双相机内参 / 外参标定（固定棋盘格 + 世界系）
+
+完整说明见 **[docs/calibration.md](docs/calibration.md)**。求解全部使用 OpenCV 成熟接口
+（`findChessboardCornersSB`、`calibrateCamera`、`solvePnP` + `solvePnPRefineLM`、
+`undistortPoints`、`triangulatePoints`），未手写标定算法，未引入 `cv2.sfm`，
+也不需要 `opencv-contrib-python`。外参按 EasyMocap 的固定棋盘格思路：**板当世界基准，
+每台相机各自 solvePnP**，`stereoCalibrate` 仅留作交叉校验。
+
+**现场配置**：12×9 方格 → **11×8 内角点**，单格 **30 mm**，1280×720。
+
+**世界系**：原点 = 图案中心；X 沿 12 格长边；Y 沿 9 格短边；Z 向上（右手，`Z = X × Y`）。
+88 个角点，`index = row*11 + col`，行优先，`x∈[-0.150,0.150]`、`y∈[-0.105,0.105]` m。
+板面高于地面时填「板面高」，地面即 `Z = -surface_height_m`。
+
+**上手**
+
+```bat
+conda activate lowcost_mocap
+cd Low-Cost-Mocap-main\computer_code
+python api\preview_server.py --indices 0 1
+:: 浏览器打开 http://127.0.0.1:3002/preview → 右上角「标定面板」
+```
+
+面板内：新建会话（11×8 / 30mm）→ 板移动采 30–40 张内参图 → 板固定到中心地面
+采外参图（各 5–10 张）→「解外参 solvePnP」→ 勾「世界轴叠加」确认 X 轴沿长边
+（反了就勾「全局翻转 180°」）→ 板挪到 3 个不同位置/高度采同步帧对 → 独立验证 → 保存。
+
+**命令行**（`intrinsic / extrinsic / validate-rig / save` 不需要相机在线）
+
+```bat
+python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
+python api\calib_cli.py capture-single --camera 0 --count 30
+python api\calib_cli.py capture-single --camera 0 --count 6 --phase extrinsic
+python api\calib_cli.py extrinsic --session captures\calibration\<会话> [--flip180]
+python api\calib_cli.py validate-rig --session captures\calibration\<会话>
+python api\calib_cli.py save --session captures\calibration\<会话> --validate
+```
+
+**关键约定**
+
+- 图像坐标 = **原始 1280×720 灰度图**像素坐标，未 `rot90`、未 `make_square`、未裁剪/缩放/去畸变。
+- 物点单位 **米**。`X_cam = R_wc @ X_world + t_wc`；`X_cam1 = R_10 @ X_cam0 + T_10`，
+  `||T||` = 基线（米）。
+- **矩形板有 D2 四重对称**：4 种角点对应在几何上完全等价（重投影误差逐位相同），
+  本模块只用「相机在图案正面一侧」筛掉镜像解，剩下的 180° 必须人工看世界轴确认，
+  且**必须两台一起翻**（单侧翻会让基线从 2032mm 跳到 1635mm）。
+- 结果写 `api/calibration/calibration.json`（schema v2，含每相机 world↔cam、相机位置、
+  离地高度、相对位姿、自洽性、帧间抖动、独立验证）。旧 `camera-params.json` **未改动**。
+- 下游取参数：`calibration.service.load_calibration()` + `stereo_matrices(data, scaled_size=...)`，
+  或 `GET /api/calib/matrices?size=640x360`。
+
+**接口**
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/api/calib/status` | 会话、样本计数（按 phase）、内外参状态、相机位姿摘要 |
+| POST | `/api/calib/session` | 新建 / 打开会话（含板面高） |
+| POST | `/api/calib/capture/single` | 采内参图（判重 + 质量门限） |
+| POST | `/api/calib/capture/extrinsic` | 采外参图（固定板，不判重） |
+| POST | `/api/calib/capture/stereo` | 采验证帧对（双路同时检测） |
+| GET | `/api/calib/live?camera=0` | 实时检测叠加（JPEG） |
+| GET | `/api/calib/extrinsic/overlay?camera=0&flip180=0` | 世界原点 + XYZ 轴叠加 |
+| POST | `/api/calib/intrinsic` | 内参标定 |
+| POST | `/api/calib/solve/extrinsic` | 外参标定（solvePnP） |
+| POST | `/api/calib/validate/rig` | 独立验证（多位置/高度） |
+| POST | `/api/calib/stereo` | stereoCalibrate 交叉校验 |
+| POST | `/api/calib/save` | 写 `calibration.json` |
+| GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取矩阵 |
+
+**自检（无相机可跑）**
+
+```bat
+cd Low-Cost-Mocap-main\computer_code\api && python -m calibration.selftest
+```
+
+用已知 `K/D/R/T` 按真实畸变模型逐像素反向渲染虚拟棋盘格（11×8 / 30mm），再走正式代码求解。
+最近一次：**56/56 通过**。合成数据（相机距板心 ~1.8m、基线真值 2032.78mm）下：
+内参 fx 误差 0.13%、solvePnP 重投影 0.096/0.085 px、基线 2031.89mm（误差 0.89mm）、
+三角化自洽 max 0.56mm、验证集网格间距误差 max 0.001mm。
+这只是求解链路验证，**不是实机精度**。
+
 ### 实测结果（Windows 11 + lowcost_mocap，两台 LRCP G720P）
 
 | 项目 | 结果 |
@@ -186,7 +270,16 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 - **四相机未实现**：`SyncService` 是"A/B 两路"的一对配对器，本身无全局耦合，扩展到四路需要为
   每对（0-1、0-2、0-3…）各建实例并汇总统计，调度层尚未实现。
 - 双相机同时拔插的热插拔恢复只做了断线重连逻辑（1 s 起指数退避），未做真实拔插实验。
-- 未实现红外 LED 检测、相机标定、三角化、Go2 控制（按要求暂不做）。
+- **标定功能只用合成数据验证过，尚未接入真实相机实拍**：本次没有在实机上采过标定图，
+  所以仓库里**不含任何实拍标定结果**，`api/calibration/calibration.json` 不存在属正常。
+  真实 RMS、基线、畸变系数必须自己采数据跑出来。
+- 合成数据下画面**四角的畸变外推**误差约 1.6 px（补采四角后从 20 px 降到这里），
+  实机需按 `radius_coverage.ratio` 自查是否覆盖足够。
+- 标定 UI 只在 Flask 自带 `/preview` 页验证过；React 侧未加标定面板，也未构建。
+- **整体 180° 只能人工确认**：矩形板的 D2 四重对称在几何上不可分辨（详见
+  `docs/calibration.md` 第 6 节）。若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
+- 未实现红外 LED 检测、三角化三维定位（LED 位置解算）、Go2 控制
+  （标定与世界系已建立，见上文）。
 
 ## 注意
 

@@ -363,6 +363,14 @@ try:
 except Exception as _exc:  # 相机模块导入失败不应影响原有功能
     print("[警告] 相机预览模块加载失败：%s" % _exc)
 
+# --- 标定蓝图（内参 / 双目外参）--------------------------------------------
+try:
+    from calibration.routes import register as register_calibration
+    register_calibration(app)
+    print("[标定] 接口已挂载：/api/calib/*（页面：/preview#calib）")
+except Exception as _exc:
+    print("[警告] 标定模块加载失败：%s" % _exc)
+
 
 if __name__ == '__main__':
     from camera_manager import manager as camera_manager

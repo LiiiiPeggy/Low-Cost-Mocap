@@ -23,6 +23,7 @@ from flask_cors import CORS
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import camera_preview  # noqa: E402
+import calibration.routes as calibration_routes  # noqa: E402
 from camera_manager import manager  # noqa: E402
 from sync import sync_service  # noqa: E402
 
@@ -31,11 +32,13 @@ def build_app() -> Flask:
     app = Flask(__name__, static_folder=None)
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     camera_preview.register(app)
+    calibration_routes.register(app)   # /api/calib/*
 
     @app.get("/")
     def index():
         return ('<meta charset="utf-8"><h3>IR camera preview server</h3>'
                 '<p>预览页面：<a href="/preview">/preview</a>　'
+                '标定页面：<a href="/calibration">/calibration</a>　'
                 '状态接口：<a href="/api/cameras">/api/cameras</a></p>')
 
     return app

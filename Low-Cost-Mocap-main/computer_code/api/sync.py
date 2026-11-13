@@ -332,6 +332,12 @@ class SyncService:
         }
 
     # -- 保存 -------------------------------------------------------------
+    def recent_pairs(self, count: int = 1) -> list[PairRecord]:
+        """取最近若干对配对结果（供标定模块取帧用，只读，不改指针）。"""
+        count = max(1, int(count))
+        with self._lock:
+            return list(self._recent)[-count:]
+
     def save_pairs(self, out_dir: str | None = None, count: int = 8) -> dict:
         """保存最近若干对同步帧：原图 PNG（未拉伸/未伪彩色）+ 时间戳 JSON。"""
         out_dir = out_dir or DEFAULT_OUT_DIR
