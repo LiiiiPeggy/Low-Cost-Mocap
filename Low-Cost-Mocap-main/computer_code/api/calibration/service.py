@@ -66,7 +66,6 @@ class CalibrationService:
         self._stereo: dict | None = None
         self._extrinsic: dict | None = None
         self._validation: dict | None = None
-        self._stereo_validation: dict | None = None
         self._result_path: str | None = None
 
     # ------------------------------------------------------------------
@@ -100,16 +99,61 @@ class CalibrationService:
             # 切换会话时清掉上一轮求解结果，避免张冠李戴
             self._intrinsics, self._stereo, self._validation = {}, None, None
             self._extrinsic = None
+        # 如果这个目录里已有求解结果（再次打开旧会话），直接恢复
+        self._restore_results(sess)
         return self.status()
 
     def reload_session(self, root: str) -> dict:
-        """离线重算：直接载入已采集的会话目录。"""
+        """载入会话目录，并恢复该目录里已保存的求解结果（如果有）。"""
         sess = Session.load(root)
         with self._lock:
             self._session = sess
             self._intrinsics, self._stereo, self._validation = {}, None, None
             self._extrinsic = None
+        self._restore_results(sess)
         return self.status()
+
+    def _restore_results(self, sess: Session) -> None:
+        """把会话目录里的 result_*.json 读回内存，避免"重载后结果丢失"。"""
+        def _load(name):
+            path = os.path.join(sess.root, name)
+            if not os.path.isfile(path):
+                return None
+            try:
+                with open(path, encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (OSError, ValueError):
+                return None
+
+        data = _load("result_intrinsic.json")
+        if data:
+            with self._lock:
+                self._intrinsics = dict(data.get("intrinsics") or {})
+        ext = _load("result_extrinsic.json")
+        if ext:
+            with self._lock:
+                self._extrinsic = ext
+        val = _load("result_validation.json")
+        if val:
+            with self._lock:
+                self._validation = val
+        stereo = _load("result_stereo.json")
+        if stereo:
+            with self._lock:
+                self._stereo = stereo
+
+    def _invalidate(self, phase: str) -> None:
+        """新增样本后，作废依赖它的求解结果，避免把旧结果当新结果保存。"""
+        with self._lock:
+            if phase == "intrinsic":
+                self._intrinsics = {}
+                self._extrinsic = None
+                self._validation = None
+            elif phase == "extrinsic":
+                self._extrinsic = None
+                self._validation = None
+            else:
+                self._validation = None
 
     def close_session(self) -> dict:
         with self._lock:
@@ -142,13 +186,28 @@ class CalibrationService:
             raise RuntimeError("还没有打开标定会话，请先 POST /api/calib/session")
         return self._session
 
-    def _fresh_frame(self, camera: int):
+    def _fresh_frame(self, camera: int, after_seq: int | None = None,
+                     timeout: float = 1.5):
+        """取一帧新的原始灰度图。
+
+        给了 ``after_seq`` 就等 **seq 更新** 的帧（``CameraWorker.wait_frame``），
+        这样连点两次「采集」也不会把同一帧当成两次独立观测；超时直接报错，
+        而不是悄悄复用旧帧。
+        """
         worker = manager().worker(camera)
         if worker is None:
             raise RuntimeError("相机 %d 未启动，无法采集（本模块不会自己打开设备）" % camera)
         if worker.state != "streaming":
             raise RuntimeError("相机 %d 当前状态是 %s，不是 streaming" % (camera, worker.state))
-        frame = worker.latest()
+
+        if after_seq is None:
+            frame = worker.latest()
+        else:
+            frame = worker.wait_frame(after_seq, timeout=timeout)
+            if frame is None:
+                raise RuntimeError(
+                    "相机 %d 在 %.1f s 内没有新帧（上一张 seq=%d），"
+                    "请等采集刷新后再按" % (camera, timeout, after_seq))
         if frame is None:
             raise RuntimeError("相机 %d 还没有出帧" % camera)
         age = time.perf_counter() - frame.mono_ts
@@ -157,13 +216,37 @@ class CalibrationService:
                                % (camera, age * 1000))
         return frame, age
 
+    @staticmethod
+    def _last_seq(sess: Session, camera: int, phase: str) -> int | None:
+        """该相机在该阶段已存样本里的最大 seq；没有则 None。"""
+        last = None
+        for s in sess.samples:
+            if s.kind != "single" or s.phase != phase:
+                continue
+            meta = s.images.get(str(camera)) or {}
+            if meta.get("seq") is not None:
+                last = int(meta["seq"])
+        return last
+
+    @staticmethod
+    def _last_pair_key(sess: Session, phase: str):
+        """最近一条同步帧对的 (seq_a, seq_b)，用于判断是否真的换了新帧对。"""
+        for s in reversed(sess.samples):
+            if s.kind != "stereo" or s.phase != phase:
+                continue
+            try:
+                return int(s.images["0"]["seq"]), int(s.images["1"]["seq"])
+            except (KeyError, TypeError, ValueError):
+                return None
+        return None
+
     def capture_single(self, camera: int, *, force: bool = False,
                        phase: str = "intrinsic") -> dict:
         sess = self._require_session()
         spec = sess.spec
         camera = int(camera)
 
-        frame, age = self._fresh_frame(camera)
+        frame, age = self._fresh_frame(camera, after_seq=self._last_seq(sess, camera, phase))
         gray = frame.gray
         det = board_mod.detect(gray, spec)
         overlay = board_mod.draw_overlay(gray, det, spec, label_step=4)
@@ -206,6 +289,7 @@ class CalibrationService:
         sample = sess.add_single(camera, gray, det, meta, overlay=overlay,
                                  status=status, reason=reason,
                                  signature=meta.get("signature", {}), phase=phase)
+        self._invalidate(phase)
 
         return {
             "ok": status == "valid",
@@ -231,11 +315,22 @@ class CalibrationService:
         ca, cb = int(cams[0]), int(cams[1])
 
         svc = sync_service()
-        recents = svc.recent_pairs(1)
-        if not recents:
-            raise RuntimeError("还没有配对成功的帧对：确认两台相机都在 streaming，"
-                               "且 /api/sync/status 的 pairs_total 在增长")
-        rec = recents[0]
+        last_key = self._last_pair_key(sess, "validation")
+        deadline = time.perf_counter() + 1.5
+        while True:
+            recents = svc.recent_pairs(1)
+            if not recents:
+                raise RuntimeError("还没有配对成功的帧对：确认两台相机都在 streaming，"
+                                   "且 /api/sync/status 的 pairs_total 在增长")
+            rec = recents[0]
+            if force or last_key != (rec.frame_a.seq, rec.frame_b.seq):
+                break
+            if time.perf_counter() > deadline:
+                raise RuntimeError(
+                    "最近一对同步帧（seq=%d/%d）已经采过，1.5 s 内没有新帧对，"
+                    "请稍后再按" % (rec.frame_a.seq, rec.frame_b.seq))
+            time.sleep(0.05)
+
         age = time.perf_counter() - rec.created_mono
         if age > MAX_PAIR_AGE_S:
             raise RuntimeError("最近一对同步帧已过期 %.0f ms，请重新触发（相机是否停流？）"
@@ -281,6 +376,7 @@ class CalibrationService:
             pair_meta, {ca: fa.gray, cb: fb.gray}, {ca: deta, cb: detb},
             dt_ms=rec.dt_ms, overlay=overlay, status=status, reason=reason,
             signature=signature)
+        self._invalidate("validation")
 
         return {
             "ok": status == "valid",
@@ -305,7 +401,8 @@ class CalibrationService:
         """外参阶段：棋盘格固定在中央地面，按一次存一张（不做姿态判重）。"""
         return self.capture_single(camera, force=True, phase="extrinsic")
 
-    def solve_extrinsic(self, *, flip180: bool = False, exclude=()) -> dict:
+    def solve_extrinsic(self, *, flip180: bool = False, flip_cam=None,
+                        orientation_confirmed: bool = False, exclude=()) -> dict:
         sess = self._require_session()
         cams = sess.cameras
         if len(cams) < 2:
@@ -324,13 +421,13 @@ class CalibrationService:
                     % (cam, len(samples), ext_mod.MIN_FRAMES, ext_mod.RECOMMENDED_FRAMES))
             frames[cam] = [s.corners(cam) for s in samples]
             ids[cam] = [s.id for s in samples]
-
         rig = ext_mod.solve_rig(frames, sess.spec,
                                 intr_mod.K_from(self._intrinsics[ca]),
                                 intr_mod.D_from(self._intrinsics[ca]),
                                 intr_mod.K_from(self._intrinsics[cb]),
                                 intr_mod.D_from(self._intrinsics[cb]),
-                                flip180=flip180)
+                                flip180=flip180, flip_cam=flip_cam,
+                                orientation_confirmed=orientation_confirmed)
         rig["created"] = _now_iso()
         rig["camera_pair"] = [int(cams[0]), int(cams[1])]
         rig["frames"] = {str(k): v for k, v in ids.items()}
@@ -516,89 +613,6 @@ class CalibrationService:
         return res
 
     # ------------------------------------------------------------------
-    # 独立验证（留出集 / 已知尺寸）
-    # ------------------------------------------------------------------
-    def validate(self, *, exclude=(), holdout: float = 0.3,
-                 auto_flip: bool = None, expected_mm: float | None = None,
-                 corner_pair: tuple[int, int] | None = None) -> dict:
-        """独立验证：把帧对按比例切成训练/验证，分别评估。
-
-        ``holdout`` 为验证集比例（0 表示全部用于训练，即"自洽评估"）。
-        默认的已知尺寸检查用板面角点间距；``expected_mm`` + ``corner_pair``
-        可以换成你自己量的任意两点间物理距离。
-        """
-        sess = self._require_session()
-        spec = sess.spec
-        pairs = sess.stereo_samples(exclude=exclude)
-        if len(pairs) < 6:
-            raise ValueError("有效帧对只有 %d 对，做留出验证至少需要 6 对"
-                             "（建议 15 对以上）" % len(pairs))
-
-        expected_pairs = None
-        if expected_mm is not None and corner_pair is not None:
-            i, j = int(corner_pair[0]), int(corner_pair[1])
-            expected_pairs = [{"i": i, "j": j, "expected_mm": float(expected_mm),
-                               "label": "自定义 %d-%d" % (i, j)}]
-
-        pairs_sorted = sorted(pairs, key=lambda s: s.id)
-        if holdout and holdout > 0:
-            k = max(1, int(round(1.0 / holdout)))
-            val = [s for idx, s in enumerate(pairs_sorted) if idx % k == k - 1]
-            train = [s for s in pairs_sorted if s not in val]
-            if len(train) < stereo_mod.MIN_PAIRS or not val:
-                raise ValueError("样本太少，无法按 %.0f%% 切分训练/验证集" % (100 * holdout))
-        else:
-            train, val = pairs_sorted, []
-
-        cams = sess.cameras
-        ca, cb = str(int(cams[0])), str(int(cams[1]))
-        if ca not in self._intrinsics or cb not in self._intrinsics:
-            raise ValueError("缺少内参结果，请先做内参标定")
-
-        res = stereo_mod.calibrate(
-            train, spec, tuple(sess.image_size),
-            self._intrinsics[ca], self._intrinsics[cb],
-            auto_flip=True if auto_flip is None else auto_flip)
-        R = np.asarray(res["R_10"], np.float64)
-        T = np.asarray(res["T_10"], np.float64)
-        F = np.asarray(res["F"], np.float64)
-
-        on_train = stereo_mod.evaluate(train, spec, tuple(sess.image_size),
-                                       self._intrinsics[ca], self._intrinsics[cb],
-                                       R, T, F, flip_b=res["flip_b"],
-                                       expected_pairs=expected_pairs)
-        on_val = (stereo_mod.evaluate(val, spec, tuple(sess.image_size),
-                                      self._intrinsics[ca], self._intrinsics[cb],
-                                      R, T, F, flip_b=res["flip_b"],
-                                      expected_pairs=expected_pairs) if val else None)
-
-        out = {
-            "created": _now_iso(),
-            "split": {"train": len(train), "validation": len(val),
-                      "strategy": "按样本编号排序后每 1/holdout 个留一个作验证集"
-                                  if val else "未切分（全部用于训练，指标为自洽评估）"},
-            "train_ids": [s.id for s in train],
-            "validation_ids": [s.id for s in val],
-            "flip_b": res["flip_b"],
-            "baseline_m": res["baseline_m"],
-            "fit": {"rms_px": res["rms_px"],
-                    "epipolar": res["epipolar"], "triangulation": res["triangulation"]},
-            "on_train": on_train,
-            "on_validation": on_val,
-            "interpretation": [
-                "on_validation 才是独立精度参考；on_train 必然偏乐观",
-                "已知尺寸误差反映三角化的米制尺度是否可信，与重投影 RMS 不是一回事",
-                "即使全部指标很好，也只说明该距离段的静止目标几何一致，"
-                "不能据此宣称动捕达到毫米级",
-            ],
-        }
-
-        # 用留出集结果作为最终验证结论；没有留出集时退化为自洽评估
-        self._stereo_validation = out
-        sess.save_result("result_stereo_validation.json", out)
-        return out
-
-    # ------------------------------------------------------------------
     # 结果保存 / 加载
     # ------------------------------------------------------------------
     def build_result(self) -> dict:
@@ -645,7 +659,9 @@ class CalibrationService:
                 "method": rig["method"],
                 "camera_pair": rig.get("camera_pair", [int(c) for c in cams]),
                 "world_frame": spec.world_frame(),
-                "flip180_global": rig["flip180"],
+                "flip_cam": rig.get("flip_cam"),
+                "orientation_confirmed": bool(rig.get("orientation_confirmed")),
+                "orientation_ok": bool(rig.get("orientation_ok")),
                 "cameras": cams_out,
                 # 相对位姿：X_cam1 = R_10 @ X_cam0 + T_10
                 "convention": "X_cam1 = R_10 @ X_cam0 + T_10",
@@ -717,13 +733,19 @@ class CalibrationService:
         sess.save_result("calibration.json", result)
         self._result_path = path
         ext = result["extrinsics"] or {}
+        # 两台相机**各自**的重投影 RMS 取大者；与"三角化自洽残差（毫米）"不是一回事
         rms = None
         if ext.get("cameras"):
             vals = [c.get("reprojection_rms_px") for c in ext["cameras"].values()]
-            rms = round(max(v for v in vals if v is not None), 4) if any(vals) else None
+            vals = [v for v in vals if v is not None]
+            rms = round(max(vals), 4) if vals else None
         return {"path": path,
                 "baseline_m": ext.get("baseline_m"),
-                "stereo_rms_px": rms,
+                "max_reprojection_rms_px": rms,
+                "consistency_max_mm": (round(ext.get("consistency", {})
+                                             .get("max_m", 0.0) * 1000, 4)
+                                       if ext.get("consistency") else None),
+                "orientation_confirmed": ext.get("orientation_confirmed"),
                 "method": ext.get("method"),
                 "session_copy": os.path.join(sess.root, "calibration.json")}
 
@@ -761,7 +783,9 @@ class CalibrationService:
             rig = self._extrinsic
             out["extrinsic"] = {
                 "method": rig["method"],
-                "flip180_global": rig["flip180"],
+                "flip_cam": rig.get("flip_cam"),
+                "orientation_confirmed": bool(rig.get("orientation_confirmed")),
+                "orientation_ok": bool(rig.get("orientation_ok")),
                 "baseline_m": rig["relative"]["baseline_m"],
                 "relative_rotation_deg": rig["relative"]["rotation_angle_deg"],
                 "consistency_max_mm": round(rig["consistency"]["max_m"] * 1000, 4),

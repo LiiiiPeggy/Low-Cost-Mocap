@@ -17,18 +17,20 @@
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
+import shutil
+import subprocess
 import sys
 import tempfile
+import time
 
 import cv2
 import numpy as np
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _API = os.path.dirname(_HERE)
-if _API not in sys.path:
-    sys.path.insert(0, _API)
 if _API not in sys.path:
     sys.path.insert(0, _API)
 
@@ -50,7 +52,8 @@ TRUE_T10 = np.array([-0.152, 0.004, 0.007], np.float64)   # 基线 152mm
 RESULT = []
 
 
-def check(name: str, ok: bool, detail: str = "") -> bool:
+def check(name: str, ok: bool, detail="") -> bool:
+    detail = "" if detail == "" else str(detail)
     RESULT.append((name, bool(ok), detail))
     print(("  [PASS] " if ok else "  [FAIL] ") + name + ((" —— " + detail) if detail else ""))
     return ok
@@ -566,6 +569,10 @@ def test_pnp(spec: B.BoardSpec, size: tuple[int, int], intr0: dict, intr1: dict,
         zs = [p["centre_world_m"][2] for p in val["per_placement"]]
         check("验证覆盖了不同高度", len(set(round(z, 2) for z in zs)) >= 2,
               "centre_z = %s m" % [round(z, 3) for z in zs])
+        check("验证结果标出每个位置的对应关系是否可疑",
+              all("suspect_correspondence" in p for p in val["per_placement"])
+              and not any(p["suspect_correspondence"] for p in val["per_placement"]),
+              [p["suspect_correspondence"] for p in val["per_placement"]])
         # 板框尺寸检查（已知 300mm × 210mm 内角点跨度）
         bsc = val["per_placement"][0]["board_size_check_mm"]
         check("板面跨距与理论值一致 < 2mm",
@@ -577,11 +584,255 @@ def test_pnp(spec: B.BoardSpec, size: tuple[int, int], intr0: dict, intr1: dict,
 
 
 # ---------------------------------------------------------------------------
-# 用例 5：会话落盘 / 读回 / 结果 JSON / 坐标变换
+# 用例 6：代表帧对应 / 采集去重 / 结果失效与恢复 / CLI 保存
+# ---------------------------------------------------------------------------
+def _two_camera_poses():
+    C0 = np.array([-1.05, -0.85, 1.20])
+    C1 = np.array([0.98, -0.78, 1.28])
+    target = np.array([0.0, 0.0, 0.02])
+    R0, t0 = look_at(C0, target)
+    R1, t1 = look_at(C1, target)
+    return C0, C1, (R0, t0), (R1, t1)
+
+
+def test_frame_pairing(spec: B.BoardSpec, size, tex, off) -> None:
+    """代表位姿与一致性检查必须来自**同一帧**（曾经错配成首帧）。"""
+    print("\n[6] 外参代表帧与角点对应")
+    C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
+    img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
+    img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
+    d0, d1 = B.detect(img0, spec), B.detect(img1, spec)
+    if not (d0.ok and d1.ok):
+        check("代表帧用例：检测", False, "检测失败")
+        return
+
+    # 人为把 cam0 的第 0 帧角点推偏，使"最好的帧"是第 1 帧
+    bad = (d0.corners.reshape(-1, 2) + np.array([16.0, -13.0])).reshape(-1, 1, 2)
+    frames0 = [bad.astype(np.float32), d0.corners, d0.corners]
+    frames1 = [d1.corners, d1.corners, d1.corners]
+
+    rig = E.solve_rig({0: frames0, 1: frames1}, spec, TRUE_K, TRUE_D, TRUE_K, TRUE_D)
+    used = rig["stability"]["0"]["used_frame_index"]
+    check("代表位姿取重投影最好的那一帧", used == 1, "used_frame_index=%s" % used)
+    check("一致性检查使用同一帧角点（不被首帧带偏）",
+          rig["consistency"]["max_m"] < 0.003,
+          "max=%.2fmm（若错用首帧会明显变大）" % (rig["consistency"]["max_m"] * 1000))
+
+    # IPPE 候选：必须标出物理合理性，且选中解满足相机在板面上方
+    p = E.solve_pose(d0.corners, spec, TRUE_K, TRUE_D)
+    cands = p["ippe_candidates"]
+    check("IPPE 候选带物理合理性标记",
+          len(cands) >= 1 and all("plausible" in c for c in cands),
+          "%d 个候选" % len(cands))
+    check("选中解满足相机在板面上方且角点全在前方",
+          p["height_above_pattern_m"] > 0 and p["points_in_front"] >= 0.99,
+          "Z=%.3f  in_front=%.3f" % (p["height_above_pattern_m"], p["points_in_front"]))
+    check("自动格点对应不按重投影误差挑选（保留歧义提示）",
+          p["orientation_ambiguous"] is True,
+          "alternatives=%s" % (p["correspondence_alternatives"],))
+
+
+def _build_session(root: str, spec: B.BoardSpec, size, tex, off, *, n_intr=6):
+    """造一个可离线求解的完整会话（内参/外参/验证三类样本）。"""
+    shutil.rmtree(root, ignore_errors=True)
+    sess = Session.create(root, spec, [0, 1], size, "NV12", "自检")
+    for cam in (0, 1):
+        k = 0
+        guard = 0
+        while k < n_intr and guard < n_intr * 6:
+            guard += 1
+            R_b, t_b = pose_with_centered_board(
+                spec, RNG.uniform(0.62, 1.0), RNG.uniform(-0.4, 0.4),
+                RNG.uniform(-0.3, 0.3), RNG.uniform(-0.42, 0.42),
+                RNG.uniform(-0.16, 0.16), RNG.uniform(-0.08, 0.08))
+            img = render(spec, R_b, t_b, TRUE_K, TRUE_D, size, tex, off)
+            det = B.detect(img, spec)
+            if not det.ok:
+                continue
+            sess.add_single(cam, img, det, {"seq": k},
+                            signature=B.pose_signature(det, spec), phase="intrinsic")
+            k += 1
+
+    _, _, (R0, t0), (R1, t1) = _two_camera_poses()
+    for cam, (R, t) in ((0, (R0, t0)), (1, (R1, t1))):
+        img = render(spec, R, t, TRUE_K, TRUE_D, size, tex, off)
+        det = B.detect(img, spec)
+        for k in range(4):
+            sess.add_single(cam, img, det, {"seq": 50 + k},
+                            signature=B.pose_signature(det, spec), phase="extrinsic")
+
+    for off_w in ((0.0, 0.0, 0.0), (0.32, 0.10, 0.22)):
+        a = render(spec, R0, R0 @ np.array(off_w) + t0, TRUE_K, TRUE_D, size, tex, off)
+        b = render(spec, R1, R1 @ np.array(off_w) + t1, TRUE_K, TRUE_D, size, tex, off)
+        da, db, _ = B.detect_pair(a, b, spec)
+        if da.ok and db.ok:
+            sess.add_stereo({"0": {"seq": 0}, "1": {"seq": 0}}, {0: a, 1: b},
+                            {0: da, 1: db}, dt_ms=0.3,
+                            signature=B.pose_signature(da, spec), phase="validation")
+    return sess
+
+
+def test_cli_and_state(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
+    print("\n[7] CLI 保存 / 重载恢复 / 新增采集后的失效")
+    import calibration.service as SVC
+
+    root = os.path.join(tmp, "cli_session")
+    _build_session(root, spec, size, tex, off)
+    out = os.path.join(tmp, "cli_calibration.json")
+
+    # (1) CLI 保存：既验证没有重复 cmd_save，也验证参数齐全
+    cmd = [sys.executable, os.path.join(_API, "calib_cli.py"), "save",
+           "--session", root, "--out", out, "--validate", "--orientation-confirmed"]
+    proc = subprocess.run(cmd, cwd=_API, capture_output=True, text=True,
+                          encoding="utf-8", errors="replace")
+    ok = proc.returncode == 0 and os.path.isfile(out)
+    check("CLI save 正常退出并写出结果", ok,
+          (proc.stderr or proc.stdout).strip().splitlines()[-1] if not ok else out)
+    if ok:
+        with open(out, encoding="utf-8") as fh:
+            data = json.load(fh)
+        ext = data.get("extrinsics") or {}
+        check("CLI 结果 schema v2 且含世界系外参",
+              data.get("version") == 2 and ext.get("method", "").startswith("solvePnP"),
+              ext.get("method"))
+        check("结果记录方向确认状态",
+              ext.get("orientation_confirmed") is True
+              and ext.get("cameras", {}).get("0", {}).get("R_world_to_cam") is not None,
+              "orientation_confirmed=%s" % ext.get("orientation_confirmed"))
+
+    # (2) 重载会话要能恢复已保存的结果（不需要重算）
+    svc = SVC.service()
+    svc.reload_session(root)
+    check("重载会话恢复内参结果", bool(svc._intrinsics),
+          "相机 %s" % ",".join(sorted(svc._intrinsics)))
+    check("重载会话恢复外参结果", svc._extrinsic is not None,
+          (svc._extrinsic or {}).get("method"))
+    check("重载后 build_result 可用", svc.build_result().get("version") == 2)
+
+    # (3) 新增采集后旧结果必须失效（不能拿旧外参当新结果保存）
+    before = svc._extrinsic
+    svc._invalidate("extrinsic")
+    check("新增外参样本后旧外参被作废", before is not None and svc._extrinsic is None)
+
+
+class _FakeWorker:
+    """最小相机替身：只有采集用得到的那几个属性/方法。"""
+
+    state = "streaming"
+    device_name = "fake-cam"
+    format_info = "NV12"
+    requested = {}
+
+    def __init__(self, frame, index=0):
+        self.index = int(index)
+        self.frames = [frame]
+
+    def push(self, frame):
+        self.frames.append(frame)
+
+    def latest(self):
+        return self.frames[-1]
+
+    def wait_frame(self, after_seq, timeout=1.0):
+        f = self.frames[-1]
+        return f if f.seq > after_seq else None
+
+    @property
+    def buffered(self):
+        return len(self.frames)
+
+
+class _FakeManager:
+    def __init__(self, workers):
+        self._workers = workers
+
+    def worker(self, index):
+        return self._workers.get(int(index))
+
+
+class _FakeSync:
+    """最小同步服务替身：每次返回同一对新帧，用于测"重复帧对"拒绝。"""
+
+    max_dt_ms = 20.0
+
+    def __init__(self, fa, fb):
+        self._fa, self._fb = fa, fb
+        self.calls = 0
+
+    def recent_pairs(self, count=1):
+        from sync import PairRecord
+        self.calls += 1
+        return [PairRecord(pair_seq=1, dt_ms=0.3, frame_a=self._fa,
+                           frame_b=self._fb, created_mono=time.perf_counter())]
+
+
+def test_capture_http(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
+    """HTTP 采集 + 重复帧/重复帧对拒绝（用假相机，不碰真实设备）。"""
+    print("\n[8] HTTP 采集与重复帧处理（模拟相机）")
+    import calibration.service as SVC
+    from camera_manager import Frame
+    from preview_server import build_app
+
+    _, _, (R0, t0), (R1, t1) = _two_camera_poses()
+    img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
+    img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
+
+    def _frame(gray, seq):
+        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
+                     host_ts=time.time(), mono_ts=time.perf_counter())
+
+    w0, w1 = _FakeWorker(_frame(img0, 100), 0), _FakeWorker(_frame(img1, 200), 1)
+    orig_manager, orig_sync = SVC.manager, SVC.sync_service
+    SVC.manager = lambda: _FakeManager({0: w0, 1: w1})
+    try:
+        svc = SVC.service()
+        root = os.path.join(tmp, "http_session")
+        shutil.rmtree(root, ignore_errors=True)
+        client = build_app().test_client()
+        r = client.post("/api/calib/session", json={
+            "cols": spec.cols, "rows": spec.rows, "square_mm": spec.square_mm,
+            "cameras": [0, 1], "root": root})
+        check("HTTP 建会话", r.status_code == 200, r.json if r.status_code != 200 else "")
+
+        r1 = client.post("/api/calib/capture/single", json={"camera": 0})
+        check("HTTP 采集第一帧", r1.status_code == 200 and r1.json.get("ok"),
+              r1.json.get("message") if r1.status_code == 200 else r1.json)
+        r2 = client.post("/api/calib/capture/single", json={"camera": 0})
+        check("同一帧不会被当成第二次观测", r2.status_code == 409,
+              (r2.json or {}).get("error", "")[:60])
+
+        w0.push(_frame(img0, 101))
+        r3 = client.post("/api/calib/capture/single", json={"camera": 0})
+        check("新帧到达后采集被接受（姿态判重仍可能拦）", r3.status_code == 200,
+              (r3.json or {}).get("message"))
+        check("采集后旧外参被作废", svc._extrinsic is None)
+
+        # 同步帧对：同一对不会被重复入库
+        fa, fb = _frame(img0, 300), _frame(img1, 400)
+        SVC.sync_service = lambda: _FakeSync(fa, fb)
+        r4 = client.post("/api/calib/capture/stereo", json={})
+        check("HTTP 采集同步帧对", r4.status_code == 200, (r4.json or {}).get("message"))
+        t0_ts = time.perf_counter()
+        r5 = client.post("/api/calib/capture/stereo", json={})
+        check("同一对同步帧被拒绝", r5.status_code == 409,
+              (r5.json or {}).get("error", "")[:60])
+        check("重复帧对检测确实等待过新帧", time.perf_counter() - t0_ts > 1.0,
+              "%.1fs" % (time.perf_counter() - t0_ts))
+    finally:
+        SVC.manager, SVC.sync_service = orig_manager, orig_sync
+        try:
+            SVC.service().close_session()
+        except Exception:
+            pass
+
+
+
+# ---------------------------------------------------------------------------
+# 用例 9：会话落盘 / 读回 / 结果 JSON / 坐标变换
 # ---------------------------------------------------------------------------
 def test_persistence(spec: B.BoardSpec, size: tuple[int, int],
                      intr: dict, stereo_res: dict, tmp: str) -> None:
-    print("\n[5] 会话落盘、读回与结果文件")
+    print("\n[9] 会话落盘、读回与结果文件")
     root = os.path.join(tmp, "session_test")
     sess = Session.create(root, spec, [0, 1], size, "NV12", "自检会话")
     tex, off = board_texture(spec)
@@ -644,6 +895,18 @@ def test_persistence(spec: B.BoardSpec, size: tuple[int, int],
           "重投影差 %.2fpx" % float(np.linalg.norm(p1_est - p1)))
 
 
+def _selftest_dir() -> str:
+    """建自检用的临时目录。
+
+    刻意**不用** ``%TEMP%``：Windows 上杀软/索引会临时占用那里的 .tmp 文件，
+    导致写 session.json 时报 PermissionError。放在工作区 ``captures/`` 下
+    （已 gitignore）更稳。
+    """
+    root = os.path.join(os.path.dirname(_API), "captures")
+    os.makedirs(root, exist_ok=True)
+    return tempfile.mkdtemp(prefix="calib_selftest_", dir=root)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="标定模块合成数据自检")
     ap.add_argument("--quick", action="store_true", help="减少样本数，快速跑")
@@ -654,7 +917,7 @@ def main(argv=None) -> int:
     # 现场配置：12×9 个方格 → 11×8 内角点，单格 30mm
     spec = B.BoardSpec(11, 8, 30.0)
 
-    tmp = tempfile.mkdtemp(prefix="mocap_calib_selftest_")
+    tmp = _selftest_dir()
     keep_dir = tmp if args.keep else None
     print("自检临时目录：%s" % tmp)
     print("标定板 %dx%d 内角点（%d×%d 方格），方格 %gmm，图像 %dx%d"
@@ -671,6 +934,10 @@ def main(argv=None) -> int:
     if st:
         test_auto_flip(spec, size, intr, intr)
     test_pnp(spec, size, intr, intr, args.quick, keep_dir)
+    _tex, _off = board_texture(spec)
+    test_frame_pairing(spec, size, _tex, _off)
+    test_cli_and_state(spec, size, _tex, _off, tmp)
+    test_capture_http(spec, size, _tex, _off, tmp)
     if st:
         test_persistence(spec, size, intr, st, tmp)
 

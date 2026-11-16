@@ -218,6 +218,8 @@ def calib_solve_extrinsic():
     try:
         return jsonify(service().solve_extrinsic(
             flip180=bool(b.get("flip180", False)),
+            flip_cam=b.get("flip_cam") or None,
+            orientation_confirmed=bool(b.get("orientation_confirmed", False)),
             exclude=b.get("exclude") or ()))
     except Exception as exc:
         return _fail(exc)
@@ -327,21 +329,6 @@ def calib_stereo():
             exclude=b.get("exclude") or (),
             auto_flip=bool(b.get("auto_flip", True)),
             flip_b=b.get("flip_b")))
-    except Exception as exc:
-        return _fail(exc)
-
-
-@bp.post("/api/calib/validate")
-def calib_validate():
-    b = _body()
-    try:
-        cp = b.get("corner_pair")
-        return jsonify(service().validate(
-            exclude=b.get("exclude") or (),
-            holdout=float(b.get("holdout", 0.3)),
-            auto_flip=b.get("auto_flip"),
-            expected_mm=b.get("expected_mm"),
-            corner_pair=(int(cp[0]), int(cp[1])) if cp else None))
     except Exception as exc:
         return _fail(exc)
 

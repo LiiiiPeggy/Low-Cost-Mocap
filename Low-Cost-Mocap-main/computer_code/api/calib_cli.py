@@ -36,6 +36,9 @@ from calibration import board as B  # noqa: E402
 from calibration.dataset import Session  # noqa: E402
 from calibration.service import DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, service  # noqa: E402
 
+# 相机线程只存在于跑着 preview_server 的那个进程里，所以采集默认走 HTTP。
+DEFAULT_API = os.environ.get("MOCAP_CALIB_API", "http://127.0.0.1:3002")
+
 
 def _die(msg: str, code: int = 1):
     print("错误：%s" % msg, file=sys.stderr)
@@ -139,7 +142,9 @@ def cmd_list(args) -> int:
 
 
 def _print_rig(rig: dict) -> None:
-    print("\n外参（固定棋盘格 + solvePnP）  全局 flip180=%s" % rig["flip180"])
+    fc = rig.get("flip_cam") or {}
+    print("\n外参（固定棋盘格 + solvePnP）  flip_cam=%s  方向已人工确认=%s"
+          % (fc, rig.get("orientation_confirmed")))
     print("  世界系：原点=图案中心，X=12 格长边，Y=9 格短边，Z=向上（右手）")
     for key in ("0", "1"):
         p = rig["cameras"][key]
@@ -163,8 +168,9 @@ def _print_rig(rig: dict) -> None:
     print("  三角化自洽（对已知世界点）：rms %.4f mm  max %.4f mm"
           % (cons["rms_m"] * 1000, cons["max_m"] * 1000))
     for k, st in rig.get("stability", {}).items():
-        print("  相机 %s 帧间抖动：中心标准差 %.4f mm  最大偏离 %.4f mm"
-              % (k, st["centre_std_m"] * 1000, st["centre_range_m"] * 1000))
+        print("  相机 %s 帧间抖动：中心标准差 %.4f mm  最大偏离 %.4f mm（用第 %s 帧）"
+              % (k, st["centre_std_m"] * 1000, st["centre_range_m"] * 1000,
+                 st.get("used_frame_index")))
     for w in rig.get("warnings", []):
         print("  ! %s" % w)
     print("  · %s" % rig.get("caveat", ""))
@@ -194,11 +200,23 @@ def _print_rig_validation(val: dict) -> None:
 
 
 def cmd_new(args) -> int:
-    st = service().open_session(cols=args.cols, rows=args.rows, square_mm=args.square_mm,
-                               cameras=args.cameras, session_id=args.id,
-                               pixel_format=args.format, note=args.note,
-                               surface_height_m=args.surface_height_mm / 1000.0,
-                               root=args.root)
+    payload = {"cols": args.cols, "rows": args.rows, "square_mm": args.square_mm,
+               "surface_height_mm": args.surface_height_mm, "cameras": args.cameras,
+               "session_id": args.id, "format": args.format, "note": args.note,
+               "root": args.root}
+    st = None
+    if not args.local:
+        try:
+            st = _api_call("/api/calib/session", payload, base=args.api)
+        except RuntimeError as exc:
+            # 服务没起来就本地建目录，尺寸退化为 1280×720（与硬件一致）
+            print("[提示] 服务不可用（%s），改为本地创建会话" % exc, file=sys.stderr)
+    if st is None:
+        st = service().open_session(
+            cols=args.cols, rows=args.rows, square_mm=args.square_mm,
+            cameras=args.cameras, session_id=args.id,
+            pixel_format=args.format, note=args.note,
+            surface_height_m=args.surface_height_mm / 1000.0, root=args.root)
     s = st["session"]
     print("已创建会话：%s" % s["root"])
     wf = s["board"]["world_frame"]
@@ -222,15 +240,77 @@ def _ensure_cameras(indices) -> None:
     m = manager()
     missing = [i for i in indices if m.worker(i) is None]
     if missing:
-        _die("相机 %s 未启动。请先启动预览服务（python api/preview_server.py），"
-             "本工具不会自己打开相机" % missing)
+        _die("相机 %s 未启动。--local 只对本进程打开的相机有效；"
+             "正常用法是先在另一个窗口运行 preview_server，再用 --api 通过 HTTP 采集"
+             % missing)
     not_ready = [i for i in indices
                  if m.worker(i) is not None and m.worker(i).state != "streaming"]
     if not_ready:
         _die("相机 %s 还没进入 streaming 状态" % not_ready)
 
 
+def _api_call(path: str, payload=None, base: str | None = None, timeout: float = 10.0):
+    """调用运行中的预览服务（相机线程只存在于那个进程里）。"""
+    import urllib.error
+    import urllib.request
+
+    base = (base or DEFAULT_API).rstrip("/")
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        base + path, data=data, headers={"Content-Type": "application/json"},
+        method="POST" if data is not None else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", "replace")
+        try:
+            msg = json.loads(body).get("error", body)
+        except ValueError:
+            msg = body
+        raise RuntimeError("%s 返回 %d：%s" % (path, exc.code, msg))
+    except urllib.error.URLError as exc:
+        raise RuntimeError("连不上 %s：%s（先运行 preview_server，或用 --local）"
+                           % (base, exc.reason))
+
+
+def _load_session_over_http(args) -> None:
+    root = os.path.abspath(args.session) if args.session else ""
+    if not root or not os.path.isdir(root):
+        _die("需要 --session <会话目录>（calib_cli.py list 可查看已有会话）")
+    _api_call("/api/calib/session/load", {"root": root}, base=args.api)
+
+
+def _capture_loop(args, *, stereo: bool) -> int:
+    _load_session_over_http(args)
+    ok = 0
+    for k in range(args.count):
+        try:
+            if stereo:
+                r = _api_call("/api/calib/capture/stereo", {"force": args.force},
+                              base=args.api)
+            else:
+                r = _api_call("/api/calib/capture/single",
+                              {"camera": args.camera, "phase": args.phase,
+                               "force": args.force}, base=args.api)
+        except RuntimeError as exc:
+            print("第 %d 次采集失败：%s" % (k + 1, exc), file=sys.stderr)
+            if not args.keep_going:
+                break
+            time.sleep(args.interval)
+            continue
+        suffix = ("  Δt=%s ms" % r.get("dt_ms")) if stereo else ""
+        print("[%2d/%2d] %s%s" % (k + 1, args.count, r.get("message", ""), suffix))
+        ok += 1 if r.get("ok") else 0
+        if k + 1 < args.count:
+            time.sleep(args.interval)
+    print("\n本次有效 %d / %d %s。" % (ok, args.count, "对" if stereo else "张"))
+    return 0
+
+
 def cmd_capture_single(args) -> int:
+    if not args.local:
+        return _capture_loop(args, stereo=False)
     svc = service()
     if svc.session is None:
         svc.reload_session(args.session)
@@ -254,6 +334,8 @@ def cmd_capture_single(args) -> int:
 
 
 def cmd_capture_stereo(args) -> int:
+    if not args.local:
+        return _capture_loop(args, stereo=True)
     svc = service()
     if svc.session is None:
         svc.reload_session(args.session)
@@ -362,34 +444,46 @@ def cmd_stereo(args) -> int:
     return 0
 
 
+def _flip_cam_arg(args):
+    """把 --flip-cam0/--flip-cam1 转成 {"0":bool,"1":bool}；都没给就是 None。"""
+    if not (getattr(args, "flip_cam0", False) or getattr(args, "flip_cam1", False)):
+        return None
+    return {"0": bool(args.flip_cam0), "1": bool(args.flip_cam1)}
+
+
+def _ensure_intrinsics(svc, args) -> None:
+    """优先用会话里已保存的内参，没有再重算（避免每次求解都覆盖内参）。"""
+    if getattr(args, "intrinsic", None):
+        if not os.path.isfile(args.intrinsic):
+            _die("内参文件不存在：%s" % args.intrinsic)
+        with open(args.intrinsic, encoding="utf-8") as fh:
+            data = json.load(fh)
+        svc._intrinsics = data.get("intrinsics", data)
+        return
+    if not svc._intrinsics:
+        svc.run_intrinsic(None, exclude=getattr(args, "exclude", ()))
+
+
 def cmd_extrinsic(args) -> int:
     svc = service()
     svc.reload_session(args.session)
-    if args.intrinsic:
-        if os.path.isfile(args.intrinsic):
-            with open(args.intrinsic, encoding="utf-8") as fh:
-                data = json.load(fh)
-            svc._intrinsics = data.get("intrinsics", data)
-        else:
-            _die("内参文件不存在：%s" % args.intrinsic)
-    else:
-        svc.run_intrinsic(None, exclude=args.exclude)
-    rig = svc.solve_extrinsic(flip180=args.flip180, exclude=args.exclude)
+    _ensure_intrinsics(svc, args)
+    rig = svc.solve_extrinsic(flip180=args.flip180, flip_cam=_flip_cam_arg(args),
+                              orientation_confirmed=args.orientation_confirmed,
+                              exclude=args.exclude)
     _print_rig(rig)
     print("\n中间结果：%s" % os.path.join(svc.session.root, "result_extrinsic.json"))
     return 0
 
 
 def cmd_validate_rig(args) -> int:
+    """独立验证：只读已保存的内参/外参，**不会**改写它们。"""
     svc = service()
     svc.reload_session(args.session)
-    svc.run_intrinsic(None)
-    if os.path.isfile(os.path.join(svc.session.root, "result_extrinsic.json")):
-        with open(os.path.join(svc.session.root, "result_extrinsic.json"),
-                  encoding="utf-8") as fh:
-            svc._extrinsic = json.load(fh)
-    else:
-        svc._extrinsic = svc.solve_extrinsic(flip180=args.flip180)
+    _ensure_intrinsics(svc, args)
+    if svc._extrinsic is None:
+        svc.solve_extrinsic(flip180=args.flip180, flip_cam=_flip_cam_arg(args),
+                            orientation_confirmed=args.orientation_confirmed)
     val = svc.validate_rig(holdout=args.holdout)
     _print_rig_validation(val)
     return 0
@@ -398,66 +492,20 @@ def cmd_validate_rig(args) -> int:
 def cmd_save(args) -> int:
     svc = service()
     svc.reload_session(args.session)
-    svc.run_intrinsic(None, exclude=args.exclude)
-    svc.solve_extrinsic(flip180=args.flip180, exclude=args.exclude)
+    _ensure_intrinsics(svc, args)
+    svc.solve_extrinsic(flip180=args.flip180, flip_cam=_flip_cam_arg(args),
+                        orientation_confirmed=args.orientation_confirmed,
+                        exclude=args.exclude)
     if args.validate:
         svc.validate_rig(holdout=False)
     r = svc.save_result(args.out)
     print("\n已保存标定结果：%s" % r["path"])
     print("  会话副本：%s" % r["session_copy"])
-    print("  方法 %s  基线 %.2fmm  重投影 %.4fpx"
-          % (r["method"], (r["baseline_m"] or 0) * 1000, r["stereo_rms_px"] or -1))
-    return 0
-
-
-def cmd_validate(args) -> int:
-    svc = service()
-    svc.reload_session(args.session)
-    svc.run_intrinsic(None)
-    r = svc.validate(holdout=args.holdout,
-                     auto_flip=None if not args.no_auto_flip else False,
-                     expected_mm=args.expected_mm,
-                     corner_pair=tuple(args.corner_pair) if args.corner_pair else None)
-    print("\n切分：训练 %d 对 / 验证 %d 对" % (r["split"]["train"], r["split"]["validation"]))
-
-    def show(tag, d):
-        if not d:
-            return
-        print("\n%s" % tag)
-        print("  极线 median %.4f / p95 %.4f / max %.4f px"
-              % (d["epipolar"]["median_px"], d["epipolar"]["p95_px"], d["epipolar"]["max_px"]))
-        print("  三角化 median %.4f / p95 %.4f px"
-              % (d["triangulation"]["median_px"], d["triangulation"]["p95_px"]))
-        kd = d.get("known_distance") or {}
-        if kd:
-            print("  已知间距误差 mean %.4fmm（相对 %.3f%%）最大 %.4fmm"
-                  % (kd["mean_error_mm"], kd["mean_relative_error_pct"],
-                     kd["max_abs_error_mm"]))
-        print("  落在两相机前方 %.1f%%" % (100 * d["checks"]["in_front_ratio"]))
-        worst = sorted(d["per_pair"], key=lambda p: -(p["epipolar_median_px"] or 0))[:3]
-        if worst:
-            print("  极线误差最大的帧对：%s"
-                  % "，".join("%s=%.2fpx" % (p["sample"], p["epipolar_median_px"]) for p in worst))
-
-    show("训练集（自洽评估，偏乐观）", r["on_train"])
-    show("验证集（独立参考）", r["on_validation"])
-    for s in r["interpretation"]:
-        print("\n· %s" % s)
-    return 0
-
-
-def cmd_save(args) -> int:
-    svc = service()
-    svc.reload_session(args.session)
-    svc.run_intrinsic(None, exclude=args.exclude)
-    svc.run_stereo(exclude=args.exclude, auto_flip=not args.no_auto_flip)
-    if args.validate:
-        svc.validate(holdout=args.holdout)
-    r = svc.save_result(args.out)
-    print("\n已保存标定结果：%s" % r["path"])
-    print("  会话副本：%s" % r["session_copy"])
-    print("  基线 %.2fmm  双目 RMS %.4fpx"
-          % (r["baseline_m"] * 1000, r["stereo_rms_px"]))
+    print("  方法 %s  基线 %.2fmm  最大重投影 %.4fpx  三角化自洽 %.2fmm  方向已确认=%s"
+          % (r["method"], (r["baseline_m"] or 0) * 1000,
+             r["max_reprojection_rms_px"] if r["max_reprojection_rms_px"] is not None else -1,
+             r["consistency_max_mm"] if r["consistency_max_mm"] is not None else -1,
+             r["orientation_confirmed"]))
     return 0
 
 
@@ -491,9 +539,10 @@ def cmd_info(args) -> int:
                   % (cam, pos[0], pos[1], pos[2],
                      c.get("height_above_floor_m") or 0,
                      c.get("reprojection_rms_px") or 0))
-        print("  基线 %.3f mm  相对旋转 %.3f°  flip180=%s"
+        print("  基线 %.3f mm  相对旋转 %.3f°  flip_cam=%s  方向已确认=%s"
               % ((e.get("baseline_m") or 0) * 1000,
-                 e.get("rotation_angle_deg") or 0, e.get("flip180_global")))
+                 e.get("rotation_angle_deg") or 0, e.get("flip_cam"),
+                 e.get("orientation_confirmed")))
     v = d.get("validation")
     if v and v.get("aggregate"):
         agg = v["aggregate"]
@@ -506,6 +555,12 @@ def cmd_info(args) -> int:
     for c in d.get("caveats", []):
         print("· %s" % c)
     return 0
+
+
+def _add_api_args(sp) -> None:
+    sp.add_argument("--api", default=DEFAULT_API, help="标定服务地址（默认 %s）" % DEFAULT_API)
+    sp.add_argument("--local", action="store_true",
+                    help="不用 HTTP，直接在本进程采集（要求相机由本进程打开，一般不用）")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -526,25 +581,28 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--id", default=None, help="会话名（默认时间戳）")
     sp.add_argument("--format", default="", help="采集格式记录（NV12/MJPG）")
     sp.add_argument("--note", default="")
+    _add_api_args(sp)
     sp.set_defaults(func=cmd_new)
 
-    sp = sub.add_parser("capture-single", help="采单相机标定图")
+    sp = sub.add_parser("capture-single", help="采单相机标定图（默认走 HTTP）")
     sp.add_argument("--camera", type=int, default=0)
     sp.add_argument("--count", type=int, default=10)
     sp.add_argument("--interval", type=float, default=1.5, help="两次采集间隔秒")
     sp.add_argument("--phase", choices=["intrinsic", "extrinsic"], default="intrinsic",
                     help="intrinsic=移动标定板采内参；extrinsic=固定板采外参")
-    sp.add_argument("--session", default=None)
+    sp.add_argument("--session", default=None, help="会话目录（必填）")
     sp.add_argument("--force", action="store_true", help="允许重复姿态")
     sp.add_argument("--keep-going", action="store_true")
+    _add_api_args(sp)
     sp.set_defaults(func=cmd_capture_single)
 
-    sp = sub.add_parser("capture-stereo", help="采双相机同步帧对")
+    sp = sub.add_parser("capture-stereo", help="采双相机同步帧对（默认走 HTTP）")
     sp.add_argument("--count", type=int, default=10)
     sp.add_argument("--interval", type=float, default=2.0)
-    sp.add_argument("--session", default=None)
+    sp.add_argument("--session", default=None, help="会话目录（必填）")
     sp.add_argument("--force", action="store_true")
     sp.add_argument("--keep-going", action="store_true")
+    _add_api_args(sp)
     sp.set_defaults(func=cmd_capture_stereo)
 
     sp = sub.add_parser("detect", help="对已落盘图像重新检测（离线）")
@@ -562,13 +620,21 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--intrinsic", default=None, help="直接指定 result_intrinsic.json")
     sp.add_argument("--exclude", nargs="*", default=())
     sp.add_argument("--flip180", action="store_true",
-                    help="全局绕板法向转 180°（两台一起，人工确认用）")
+                    help="两台一起绕板法向转 180°（人工确认用）")
+    sp.add_argument("--flip-cam0", action="store_true", help="只翻相机 0 的 180°")
+    sp.add_argument("--flip-cam1", action="store_true", help="只翻相机 1 的 180°")
+    sp.add_argument("--orientation-confirmed", action="store_true",
+                    help="已用世界轴叠加人工确认过方向（写入结果）")
     sp.set_defaults(func=cmd_extrinsic)
 
     sp = sub.add_parser("validate-rig", help="独立验证：多位置/高度三角化精度（离线）")
     sp.add_argument("--session", required=True)
+    sp.add_argument("--intrinsic", default=None)
     sp.add_argument("--holdout", action="store_true", help="只取三分之一的验证帧对")
     sp.add_argument("--flip180", action="store_true")
+    sp.add_argument("--flip-cam0", action="store_true")
+    sp.add_argument("--flip-cam1", action="store_true")
+    sp.add_argument("--orientation-confirmed", action="store_true")
     sp.set_defaults(func=cmd_validate_rig)
 
     sp = sub.add_parser("stereo", help="stereoCalibrate 交叉校验（非主路线，离线）")
@@ -580,21 +646,15 @@ def build_parser() -> argparse.ArgumentParser:
                     help="强制翻转相机1角点顺序")
     sp.set_defaults(func=cmd_stereo)
 
-    sp = sub.add_parser("validate", help="留出集独立验证（离线）")
-    sp.add_argument("--session", required=True)
-    sp.add_argument("--holdout", type=float, default=0.3, help="验证集比例，0 表示不切分")
-    sp.add_argument("--expected-mm", type=float, default=None,
-                    help="自定义已知物理距离（需配 --corner-pair）")
-    sp.add_argument("--corner-pair", type=int, nargs=2, default=None,
-                    metavar=("I", "J"), help="自定义距离对应的两个角点编号")
-    sp.add_argument("--no-auto-flip", action="store_true")
-    sp.set_defaults(func=cmd_validate)
-
     sp = sub.add_parser("save", help="求解并保存 calibration.json（离线）")
     sp.add_argument("--session", required=True)
     sp.add_argument("--out", default=None, help="输出路径（默认 api/calibration/calibration.json）")
+    sp.add_argument("--intrinsic", default=None)
     sp.add_argument("--exclude", nargs="*", default=())
     sp.add_argument("--flip180", action="store_true")
+    sp.add_argument("--flip-cam0", action="store_true")
+    sp.add_argument("--flip-cam1", action="store_true")
+    sp.add_argument("--orientation-confirmed", action="store_true")
     sp.add_argument("--validate", action="store_true", help="顺便跑一次独立验证并写入结果")
     sp.set_defaults(func=cmd_save)
 
@@ -606,8 +666,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    if getattr(args, "root", None) is None:
-        pass
     return args.func(args)
 
 

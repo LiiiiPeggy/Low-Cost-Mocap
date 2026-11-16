@@ -171,18 +171,20 @@ python api\preview_server.py --indices 0 1
 ```
 
 面板内：新建会话（11×8 / 30mm）→ 板移动采 30–40 张内参图 → 板固定到中心地面
-采外参图（各 5–10 张）→「解外参 solvePnP」→ 勾「世界轴叠加」确认 X 轴沿长边
-（反了就勾「全局翻转 180°」）→ 板挪到 3 个不同位置/高度采同步帧对 → 独立验证 → 保存。
+采外参图（各 5–10 张）→「解外参 solvePnP」→ 勾「世界轴叠加」逐台确认 X 轴沿长边
+（不对就勾对应相机的「反向 180°」，确认后勾「已用轴叠加确认」）→ 板挪到 3 个不同位置/高度
+采同步帧对 → 独立验证 → 保存。
 
-**命令行**（`intrinsic / extrinsic / validate-rig / save` 不需要相机在线）
+**命令行**（采集默认走 HTTP，复用网页服务里的相机；求解不需要相机在线）
 
 ```bat
+:: 先起服务：python api\preview_server.py --indices 0 1
 python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
-python api\calib_cli.py capture-single --camera 0 --count 30
-python api\calib_cli.py capture-single --camera 0 --count 6 --phase extrinsic
-python api\calib_cli.py extrinsic --session captures\calibration\<会话> [--flip180]
-python api\calib_cli.py validate-rig --session captures\calibration\<会话>
-python api\calib_cli.py save --session captures\calibration\<会话> --validate
+python api\calib_cli.py capture-single --session <会话> --camera 0 --count 30
+python api\calib_cli.py capture-single --session <会话> --camera 0 --count 6 --phase extrinsic
+python api\calib_cli.py extrinsic --session <会话> [--flip-cam0|--flip-cam1] [--orientation-confirmed]
+python api\calib_cli.py validate-rig --session <会话>
+python api\calib_cli.py save --session <会话> --validate --orientation-confirmed
 ```
 
 **关键约定**
@@ -191,8 +193,9 @@ python api\calib_cli.py save --session captures\calibration\<会话> --validate
 - 物点单位 **米**。`X_cam = R_wc @ X_world + t_wc`；`X_cam1 = R_10 @ X_cam0 + T_10`，
   `||T||` = 基线（米）。
 - **矩形板有 D2 四重对称**：4 种角点对应在几何上完全等价（重投影误差逐位相同），
-  本模块只用「相机在图案正面一侧」筛掉镜像解，剩下的 180° 必须人工看世界轴确认，
-  且**必须两台一起翻**（单侧翻会让基线从 2032mm 跳到 1635mm）。
+  本模块只用「相机在图案正面一侧」筛掉镜像解，剩下的 180° 必须人工看世界轴确认。
+  注意**看不出**来也要确认：单侧反向会把基线从 2032mm 变成 1635mm，而三角化自洽残差
+  两种情况下都只有 ~0.6mm，指标不会报警。
 - 结果写 `api/calibration/calibration.json`（schema v2，含每相机 world↔cam、相机位置、
   离地高度、相对位姿、自洽性、帧间抖动、独立验证）。旧 `camera-params.json` **未改动**。
 - 下游取参数：`calibration.service.load_calibration()` + `stereo_matrices(data, scaled_size=...)`，
@@ -223,10 +226,12 @@ cd Low-Cost-Mocap-main\computer_code\api && python -m calibration.selftest
 ```
 
 用已知 `K/D/R/T` 按真实畸变模型逐像素反向渲染虚拟棋盘格（11×8 / 30mm），再走正式代码求解。
-最近一次：**56/56 通过**。合成数据（相机距板心 ~1.8m、基线真值 2032.78mm）下：
+最近一次：**77/77 通过**。合成数据（相机距板心 ~1.8m、基线真值 2032.78mm）下：
 内参 fx 误差 0.13%、solvePnP 重投影 0.096/0.085 px、基线 2031.89mm（误差 0.89mm）、
 三角化自洽 max 0.56mm、验证集网格间距误差 max 0.001mm。
-这只是求解链路验证，**不是实机精度**。
+另外用合成数据/假相机覆盖了流程用例：代表帧与角点同源、IPPE 候选物理筛选、
+CLI `save` 端到端、重载恢复结果、新增采集后旧结果作废、HTTP 采集与重复帧/重复帧对拒绝。
+这只是求解链路与流程验证，**不是实机精度**。
 
 ### 实测结果（Windows 11 + lowcost_mocap，两台 LRCP G720P）
 
@@ -276,8 +281,9 @@ cd Low-Cost-Mocap-main\computer_code\api && python -m calibration.selftest
 - 合成数据下画面**四角的畸变外推**误差约 1.6 px（补采四角后从 20 px 降到这里），
   实机需按 `radius_coverage.ratio` 自查是否覆盖足够。
 - 标定 UI 只在 Flask 自带 `/preview` 页验证过；React 侧未加标定面板，也未构建。
-- **整体 180° 只能人工确认**：矩形板的 D2 四重对称在几何上不可分辨（详见
-  `docs/calibration.md` 第 6 节）。若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
+- **棋盘格方向（180°）只能人工确认**：矩形板的 D2 四重对称在几何上不可分辨，
+  单侧反向还会把基线改掉 20% 而不触发任何残差告警（详见 `docs/calibration.md` 第 6 节）。
+  若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
 - 未实现红外 LED 检测、三角化三维定位（LED 位置解算）、Go2 控制
   （标定与世界系已建立，见上文）。
 

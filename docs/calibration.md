@@ -122,27 +122,39 @@ python api\preview_server.py --indices 0 1
 
 ## 5. 命令行
 
-在 `Low-Cost-Mocap-main/computer_code` 下：
+**采集走 HTTP**：相机线程只存在于跑着 `preview_server` 的那个进程里，所以
+`new / capture-single / capture-stereo` 默认请求 `http://127.0.0.1:3002`
+（可用 `--api` 改地址）。CLI 会先 `POST /api/calib/session/load` 把会话挂到服务上，
+再调用采集接口——不会重复打开相机，也不改 Media Foundation 驱动。
+`--local` 只用于"相机确实由本进程打开"的特殊场景。
 
 ```bat
-python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
-python api\calib_cli.py capture-single --camera 0 --count 30 --interval 1.5
-python api\calib_cli.py capture-single --camera 1 --count 30 --interval 1.5
-:: 板固定到中心地面后：
-python api\calib_cli.py capture-single --camera 0 --count 6 --phase extrinsic
-python api\calib_cli.py capture-single --camera 1 --count 6 --phase extrinsic
-:: 板挪到别处后采集验证帧对：
-python api\calib_cli.py capture-stereo --count 3
+:: 先起服务（另一个窗口）
+python api\preview_server.py --indices 0 1
 
-:: 以下不需要相机在线
-python api\calib_cli.py intrinsic     --session captures\calibration\<会话>
-python api\calib_cli.py extrinsic    --session captures\calibration\<会话> [--flip180]
-python api\calib_cli.py validate-rig --session captures\calibration\<会话>
-python api\calib_cli.py save         --session captures\calibration\<会话> --validate
+:: 在线采集（HTTP）
+python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
+python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 0 --count 30
+python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 1 --count 30
+:: 板固定到中心地面后：
+python api\calib_cli.py capture-single --session <会话> --camera 0 --count 6 --phase extrinsic
+python api\calib_cli.py capture-single --session <会话> --camera 1 --count 6 --phase extrinsic
+:: 板挪到别处后采集验证帧对：
+python api\calib_cli.py capture-stereo --session <会话> --count 3
+
+:: 离线求解（不需要相机）
+python api\calib_cli.py intrinsic    --session <会话>
+python api\calib_cli.py extrinsic    --session <会话> [--flip180 | --flip-cam0 | --flip-cam1] [--orientation-confirmed]
+python api\calib_cli.py validate-rig --session <会话>
+python api\calib_cli.py save         --session <会话> --validate --orientation-confirmed
 python api\calib_cli.py info
 ```
 
 `stereo` 子命令保留为 `stereoCalibrate` 交叉校验（不是主路线）。
+
+`intrinsic / extrinsic / validate-rig / save` 会优先复用会话目录里已保存的
+`result_intrinsic.json`，不会每次重算覆盖内参；`validate-rig` 只读已解出的外参，
+**不会改写**它。
 
 ---
 
@@ -156,10 +168,17 @@ python api\calib_cli.py info
 
 1. 两台相机从不同方向拍同一块板时，检测到的**0 号角点不一定是同一个物理角点**，
    不能默认对应。
-2. 本模块只用「相机必须在图案正面一侧（世界 Z > 0）」筛掉两个镜像解，剩下一对相差 180°。
-3. 剩下的 180° **必须人工确认**：把世界轴投影回图像，看 X 轴是否沿 12 格长边。
-4. 180° 是**全局**开关，**必须两台一起翻**。只翻一台会让两台的世界系差 180°，
-   相对位姿与三角化全错（实测基线会从 2032 mm 跳到 1635 mm）。
+2. 本模块只用「相机必须在图案正面一侧（世界 Z > 0）」筛掉两个镜像解，剩下一对相差 180°，
+   并且**刻意不按重投影误差挑选**（两种解误差逐位相同，按误差选等于瞎猜）；结果里的
+   `orientation_ambiguous` 会标出还有另一种解。
+3. 剩下的 180° 只能**人工确认**：勾「世界轴叠加」，逐台看 X 轴是否沿 12 格长边。
+   界面里 cam0 / cam1 各有独立的 180° 开关，确认后勾「已用轴叠加确认」，
+   这个状态会写进结果（`orientation_confirmed`）。
+4. **三角化一致性残差查不出 180° 错误**。实测：cam1 反向时基线从 **2032 mm 变成 1635 mm**，
+   而自洽残差两种情况都只有 **0.6–0.8 mm**。也就是说，基线错了 20%，指标却看不出来。
+   → 这就是为什么必须人眼看轴，也是为什么单翻一台相机的开关要单独给出。
+5. 两台相机的 X 轴必须指向**同一物理方向**。如果一台对、一台反，说明两路检测顺序确实
+   相差 180°，此时单翻那一台是对的；如果两台都反，两台一起翻即可。
 
 更严谨的做法是在板上加非对称标记（ArUco / 缺角标记），本次未做。
 
@@ -194,7 +213,8 @@ captures/calibration/<会话>/
 |---|---|
 | `method` | `solvePnP (IPPE candidates + LM refine) per camera against one fixed board` |
 | `world_frame` | 世界系定义（原点、三轴、手性、板面高、地面 Z） |
-| `flip180_global` | 人工确认的全局 180° |
+| `flip_cam` | 每台相机的 180° 开关 `{"0":bool,"1":bool}` |
+| `orientation_confirmed` | 是否已人工用轴叠加确认方向（几何无法自动判定） |
 | `cameras.{0,1}.R_world_to_cam` / `t_world_to_cam_m` | 世界 → 相机 |
 | `cameras.{0,1}.R_cam_to_world` / `t_cam_to_world_m` | 相机 → 世界 |
 | `cameras.{0,1}.camera_centre_world_m` | 相机光心世界坐标 |
@@ -251,7 +271,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 用已知 `K/D/R/T` 按**真实畸变模型**逐像素反向渲染虚拟棋盘格（11×8 / 30 mm），再走正式代码
 检测与求解，最后与真值比对。
 
-最近一次：**56/56 通过**。合成数据（两台相机距板心 ~1.8 m、基线 2032.78 mm）：
+最近一次：**77/77 通过**。合成数据（两台相机距板心 ~1.8 m、基线 2032.78 mm）：
 
 | 项目 | 结果 |
 |---|---|
@@ -263,6 +283,15 @@ python -m calibration.selftest --keep     :: 保留渲染图
 | 三角化自洽（对已知世界点） | rms 0.227 mm，max 0.558 mm |
 | 验证集网格间距误差 | mean 0.000 mm，max 0.001 mm |
 | 验证集重投影 / 平面度 | 0.070 px / 0.227 mm |
+
+除求解精度外，还覆盖了这些**流程**用例（全部用合成数据/假相机，不接硬件）：
+
+- 代表位姿取重投影最好的那一帧，且一致性检查用**同一帧**的角点（防错配）
+- IPPE 候选带物理合理性标记；选中解满足"相机在板面上方 + 角点全在前方"
+- 自动格点对应不按误差挑选，仍报 `orientation_ambiguous`
+- CLI `save` 端到端跑通（防重复定义/参数缺失）
+- 重载会话能恢复 `result_intrinsic/extrinsic`；新增采集后旧外参被作废
+- HTTP 采集（`/api/calib/capture/*`）用假相机验证；同一帧、同一同步帧对会被拒绝
 
 **这不是实机精度**：合成图没有镜头杂散光、板面不平、运动模糊、滚动快门和 USB 传输抖动。
 实机必须自己采数据重跑。

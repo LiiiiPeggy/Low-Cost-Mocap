@@ -204,13 +204,12 @@
     <div class="row">
       <button id="c-intr">内参标定</button>
       <button id="c-stereo">外参标定（双目标定）</button>
-      <button id="c-valid">独立验证（留出集）</button>
       <button id="c-view">查看结果</button>
       <button id="c-cover">覆盖检查</button>
       <button id="c-save" class="primary">保存 calibration.json</button>
       <span class="spacer"></span>
       <span id="c-intr-tag" class="badge">内参 —</span>
-      <span id="c-stereo-tag" class="badge">外参 —</span>
+      <span id="c-stereo-tag" class="badge">双目标定 —</span>
     </div>
     <div class="row" style="border-top:1px dashed var(--line); margin-top:4px; padding-top:8px">
       <b>世界系外参</b>
@@ -219,11 +218,17 @@
       <button id="c-ex1">采外参图 相机1</button>
       <span>帧数 <b id="c-nx0">0</b> / <b id="c-nx1">0</b></span>
       <button id="c-solex" class="primary">解外参 solvePnP</button>
-      <label><input type="checkbox" id="c-flip"> 全局翻转 180°</label>
       <span class="sep"></span>
       <label><input type="checkbox" id="c-axes"> 世界轴叠加</label>
       <button id="c-valrig">独立验证（多位置）</button>
       <span id="c-extag" class="badge">外参 —</span>
+    </div>
+    <div class="row">
+      <span class="hintline">方向（必须人工确认）：</span>
+      <label><input type="checkbox" id="c-flip0"> 相机0 反向 180°</label>
+      <label><input type="checkbox" id="c-flip1"> 相机1 反向 180°</label>
+      <label><input type="checkbox" id="c-confirmed"> 已用轴叠加确认</label>
+      <span class="hintline">两台相机的 X 轴都须沿 12 格长边；只在两路检测顺序真的差 180° 时才单翻一台</span>
     </div>
     <div class="live">
       <figure><img id="c-img0" alt="cam0 detection"><figcaption>相机 0 检测</figcaption></figure>
@@ -720,31 +725,6 @@ el('c-stereo').onclick = async () => {
   finally { el('c-stereo').disabled = false; }
 };
 
-el('c-valid').onclick = async () => {
-  cLog('独立验证中（切分训练/验证集）…');
-  el('c-valid').disabled = true;
-  try {
-    const r = await api('/api/calib/validate', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ holdout: 0.3 })
-    });
-    cLog(`切分：训练 ${r.split.train} 对 / 验证 ${r.split.validation} 对`);
-    cLog(`  训练集 RMS=${r.fit.rms_px}px  极线中位=${r.fit.epipolar.median_px}px`);
-    const v = r.on_validation;
-    if (v) {
-      cLog(`  验证集 极线中位=${v.epipolar.median_px}px  P95=${v.epipolar.p95_px}px`);
-      cLog(`  验证集 三角化中位=${v.triangulation.median_px}px  `
-         + `落在前方=${(100 * v.checks.in_front_ratio).toFixed(0)}%`);
-      if (v.known_distance && v.known_distance.mean_error_mm !== undefined) {
-        cLog(`  验证集 已知间距误差 mean=${v.known_distance.mean_error_mm}mm `
-           + `(${v.known_distance.mean_relative_error_pct}%)`);
-      }
-    }
-    (r.interpretation || []).forEach(s => cLog('  · ' + s));
-  } catch (e) { cLog('验证失败：' + e.message); }
-  finally { el('c-valid').disabled = false; }
-};
-
 el('c-view').onclick = async () => {
   try {
     const d = await api('/api/calib/result');
@@ -756,9 +736,15 @@ el('c-view').onclick = async () => {
       cLog(`  D = [${it.D.map(v => v.toFixed(5)).join(', ')}]`);
     });
     if (e.R_10) {
-      cLog(`外参：${e.convention}，基线 ${(e.baseline_m * 1000).toFixed(2)}mm，RMS ${e.stereo_rms_px}px`);
+      cLog(`外参：${e.convention}，基线 ${(e.baseline_m * 1000).toFixed(2)}mm，`
+         + `方向已确认=${e.orientation_confirmed}`);
       cLog(`  R_10 = ${JSON.stringify(e.R_10)}`);
       cLog(`  T_10 = [${e.T_10.map(v => v.toFixed(6)).join(', ')}] m`);
+      Object.entries(e.cameras || {}).forEach(([cam, c]) => {
+        const p = c.camera_centre_world_m || [0, 0, 0];
+        cLog(`  相机 ${cam}：位置 [${p.map(v => v.toFixed(3)).join(', ')}] m  `
+           + `重投影 ${c.reprojection_rms_px}px`);
+      });
     }
     (d.caveats || []).forEach(s => cLog('  · ' + s));
   } catch (err) {
@@ -797,16 +783,17 @@ el('c-cover').onclick = async () => {
 });
 
 el('c-solex').onclick = async () => {
-  const flip = el('c-flip').checked;
-  cLog(`解外参（solvePnP，IPPE+LM，全局翻转=${flip}）…`);
+  const flipCam = { 0: el('c-flip0').checked, 1: el('c-flip1').checked };
+  const confirmed = el('c-confirmed').checked;
+  cLog(`解外参（solvePnP，IPPE+LM）flip_cam=${JSON.stringify(flipCam)} 已确认=${confirmed}`);
   el('c-solex').disabled = true;
   try {
     const r = await api('/api/calib/solve/extrinsic', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ flip180: flip })
+      body: JSON.stringify({ flip_cam: flipCam, orientation_confirmed: confirmed })
     });
     cLog(`基线 ${(r.relative.baseline_m * 1000).toFixed(2)}mm  相对旋转 `
-       + `${r.relative.rotation_angle_deg.toFixed(3)}°  自洽残差 `
+       + `${r.relative.rotation_angle_deg.toFixed(3)}°  三角化自洽 `
        + `${(r.consistency.max_m * 1000).toFixed(2)}mm`);
     ['0', '1'].forEach(k => {
       const c = r.cameras[k];
@@ -819,7 +806,8 @@ el('c-solex').onclick = async () => {
     (r.warnings || []).forEach(w => cLog('  ! ' + w));
     (r.stability ? Object.entries(r.stability) : []).forEach(([k, s]) => {
       cLog(`  相机 ${k} 帧间抖动：中心 σ=${(s.centre_std_m * 1000).toFixed(3)}mm `
-         + `最大偏离 ${(s.centre_range_m * 1000).toFixed(3)}mm（${s.frames} 帧）`);
+         + `最大偏离 ${(s.centre_range_m * 1000).toFixed(3)}mm（${s.frames} 帧，`
+         + `用第 ${s.used_frame_index} 帧）`);
     });
     cLog('  · ' + (r.caveat || ''));
     refreshCalib();
@@ -827,9 +815,16 @@ el('c-solex').onclick = async () => {
   finally { el('c-solex').disabled = false; }
 };
 
-el('c-flip').onchange = () => {
-  cLog(`全局翻转 180° = ${el('c-flip').checked}：请用「世界轴叠加」确认 X 轴是否沿 12 格长边`);
-  if (el('c-axes').checked) startCalibLive();
+['c-flip0', 'c-flip1'].forEach((id, cam) => {
+  el(id).onchange = () => {
+    const on = el(id).checked;
+    cLog(`相机 ${cam} 反向 180° = ${on}：单翻一台会改变基线，请用「世界轴叠加」逐台核对`);
+    if (el('c-axes').checked) startCalibLive();
+  };
+});
+
+el('c-confirmed').onchange = () => {
+  cLog(`方向已人工确认 = ${el('c-confirmed').checked}（需先看轴叠加：X 轴须沿 12 格长边）`);
 };
 
 el('c-axes').onchange = () => {
@@ -875,7 +870,10 @@ el('c-save').onclick = async () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
     cLog(`已保存：${r.path}`);
-    cLog(`  基线 ${(r.baseline_m * 1000).toFixed(2)}mm  双目 RMS ${r.stereo_rms_px}px`);
+    cLog(`  基线 ${(r.baseline_m * 1000).toFixed(2)}mm  `
+       + `最大重投影 ${r.max_reprojection_rms_px}px  `
+       + `三角化自洽 ${r.consistency_max_mm}mm  `
+       + `方向已确认=${r.orientation_confirmed}`);
     cLog(`  会话副本：${r.session_copy}`);
   } catch (e) { cLog('保存失败：' + e.message); }
 };
@@ -891,7 +889,7 @@ function startCalibLive() {
         const img = el('c-img' + cam);
         if (!img) continue;
         const axes = el('c-axes').checked;
-        const flip = el('c-flip').checked ? 1 : 0;
+        const flip = el(cam === 0 ? 'c-flip0' : 'c-flip1').checked ? 1 : 0;
         const qs = `camera=${cam}&scale=0.55&t=${Date.now()}`;
         const feed = axes ? `/api/calib/extrinsic/overlay?${qs}&flip180=${flip}`
                           : `/api/calib/live?${qs}`;
@@ -1090,9 +1088,12 @@ async function refreshCalib() {
     const exr = st.extrinsic;
     const xtag = el('c-extag');
     if (exr) {
+      const okDir = exr.orientation_confirmed === true;
       xtag.textContent = `外参 基线 ${(exr.baseline_m * 1000).toFixed(1)}mm · `
-                       + `自洽 ${(exr.consistency_max_mm).toFixed(1)}mm`;
-      xtag.className = 'badge ok';
+                       + `自洽 ${(exr.consistency_max_mm).toFixed(1)}mm`
+                       + (okDir ? ' · 方向已确认' : ' · 方向未确认');
+      xtag.className = 'badge ' + (okDir ? 'ok' : 'err');
+      if (!el('c-confirmed').checked && okDir) el('c-confirmed').checked = true;
     } else {
       xtag.textContent = '外参 —';
       xtag.className = 'badge';
