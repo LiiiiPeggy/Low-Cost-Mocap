@@ -18,7 +18,8 @@
 | 项 | 值 |
 |---|---|
 | 相机 | 两台固定在不同位置，朝房间中心区域 |
-| 标定板 | **12×9 个方格 → 11×8 内角点**，单格 **30 mm** |
+| 标定板 | **12×9 个方格 → 11×8 内角点**，单格 **30 mm**，总尺寸 360×270 mm |
+| 板面高 | 图案表面高于地面，**默认 5 mm**，按实际修改 |
 | 图像 | 1280×720，NV12@30（MJPG 同样可用） |
 | 环境 | conda `lowcost_mocap`：Python 3.10.22 / OpenCV 4.10.0 / NumPy 1.26.4 |
 
@@ -53,18 +54,28 @@ python api\preview_server.py --indices 0 1
 
 面板里 5 步：
 
-1. **新建 / 打开会话**：内角点 `11 × 8`、方格 `30` mm、板面高按实际填（贴地就填 0）。
+1. **新建 / 打开会话**：内角点 `11 × 8`、方格 `30` mm、板面高默认 `5` mm（按实际改）。
 2. **内参**：让板在**两台相机前移动**，各采 30–40 张（角度/距离/位置都要变，尽量铺到画面四角）
-   → 「内参标定」。看 RMS 与「角点半径覆盖」告警。
-3. **外参**：把板**固定在中心地面** → 「采外参图 相机0 / 相机1」各拍 5–10 张（静止板，多拍
-   几张用来看位姿抖动）→ 勾选「世界轴叠加」→「解外参 solvePnP」。
-4. **确认 180°**：打开「世界轴叠加」，图上会画出世界原点、X（红）/Y（绿）/Z（蓝）轴和
-   角点编号，0 号角点有红圈。**看 X 轴是否沿实物 12 格长边**；如果反了，勾「全局翻转 180°」
-   再看一次。这一步只能人眼判断，原因见第 6 节。
-5. **独立验证**：把板挪到**其它位置和高度**（至少 3 处），每处用「采集同步帧对」拍一对
-   → 「独立验证（多位置）」。看网格间距误差、平面度、极差。
+   → 「内参标定」。日志会分别给出相机 0/1 的 K、D、RMS、有效张数和**区域覆盖率**
+   （6×6 网格，仅统计该相机的 intrinsic 样本）。可视化模式默认是
+   **棋盘格角点可视化**，可直接看角点/编号/网格；确认方向时再切到世界坐标轴。
+3. **外参**：把板**固定在中心地面** → 「采集双相机图片」按一次同时取一对同步帧，分别存入
+   两台相机的 `extrinsic` 阶段。**每台 1 张有效图即可 solvePnP**；可重复按 3–5 次观察位姿
+   抖动（单张时不会输出无意义的标准差）→「解外参 solvePnP」。
+4. **确认 180°**：把「可视化模式」切到**世界坐标轴可视化**，图上会画出世界原点、
+   X（红）/Y（绿）/Z（蓝）轴和角点编号，0 号角点有红圈。**看 X 轴是否沿实物 12 格长边**；
+   如果反了，勾对应相机的「反向 180°」再看一次。确认后勾「已确认世界坐标轴方向」。
+   改任一相机的 180° 或重新采集外参图片，都会自动取消这个确认。这一步只能人眼判断，
+   原因见第 6 节。
+5. **三维定位精度验证**：把板挪到**其它位置和高度**（建议至少 3 处），每处点
+   「采集并验证三维精度」——自动取同步帧对、入库、三角化并更新历史统计；
+   「重新计算」复用已保存的验证帧对，不再采集图像。
 
-最后「保存 calibration.json」写 `api/calibration/calibration.json`。
+下方的三维世界视图用真实外参画出两台相机的位置、朝向与视锥体，并显示基线、世界轴、
+棋盘格和相机编号/位置/离地高度/重投影误差。左键拖动旋转、滚轮缩放、右键拖动平移；
+另有「重置视角」「俯视图」。标定结果变化后视图自动更新。
+
+最后「保存 calibration.json」写 `api/calibration/calibration.json`（界面显示项目相对路径）。
 
 命令行等价流程见第 5 节。
 
@@ -87,7 +98,9 @@ python api\preview_server.py --indices 0 1
 ### 4.1 内参
 
 `cv2.calibrateCamera`（针孔 + `[k1,k2,p1,p2,k3]`），输出 K、D、整体 RMS、逐张 RMS、
-建议剔除样本、角点半径覆盖。
+建议剔除样本、角点半径覆盖。另给出**区域覆盖率**（`board.coverage_map` 的 6×6 网格，
+`coverage.covered_ratio`），只统计该相机 `phase="intrinsic"` 的有效样本，不会混入外参图
+或验证图。
 
 **为什么强调半径覆盖**：角点只集中在画面中心时，`k2/k3` 会互相补偿，重投影 RMS 仍可低到
 0.07px，但把模型用到画面四角会出现明显偏差（合成实验里 20px → 补采四角后 1.6px）。
@@ -97,6 +110,20 @@ python api\preview_server.py --indices 0 1
 
 对每台相机：`solvePnPGeneric(SOLVEPNP_IPPE)` 得到两个候选，用
 `cv2.solvePnPRefineLM` 精化，输出 `X_cam = R @ X_world + t`。
+
+固定板 + 固定相机时，**每台相机最少 1 张有效图**（`extrinsic.MIN_FRAMES = 1`）即可求解。
+重复采集多张只用于观察位姿稳定性；只有 1 张时 `stability.*.centre_std_m` 为 `null`，
+并带说明文字，不会输出“标准差 0”这种误导性数字。
+
+外参图同样有两台相机各自的质量门限（`MIN_SHARPNESS`、覆盖率）。覆盖率分两档：
+
+- **内参**：`MIN_COVERAGE = 0.8%`，低于此直接拒绝。
+- **固定板外参 / 验证**：`MIN_COVERAGE_EXTRINSIC = 0.1%`（现场要求，仅要求能检出 88 个
+  角点并做 PnP）。板放在地面、离相机较远时通常只有 0.3%–0.6%，现在允许入库；但低于
+  0.8% 时会在按钮旁和结果 `warnings` 里写入“覆盖率偏低”，提示位姿/深度精度会下降。
+  条件允许时仍建议把板移近到画面约 **100 px 宽以上**，或让板面更正对两台相机。
+
+强行把内参阶段也降到 0.1% 是不合适的：畸变参数需要画面边缘的角点覆盖。
 
 **候选解怎么选**：平面的两解互为"穿过板面的镜像"，重投影误差几乎相同，**不能按误差选**。
 用物理先验——图案正面朝上，相机只能在其上方，所以取相机世界 Z 最大的解。
@@ -116,7 +143,17 @@ python api\preview_server.py --indices 0 1
 三角化 88 个角点 → 重投影误差、极线误差、**已知网格间距误差**（30 mm）、重建平面度、
 板心世界坐标；跨位置可给出实测距离与卷尺值对比。
 
-**重投影误差小不等于三维精度高**。以间距误差与平面度为准，而且必须是独立数据。
+网页上的「采集并验证三维精度」把“取一对同步帧 → 入库 → 验证”合成一次操作，只有内外参
+已求解且本次采集通过质检时才自动计算；失败样本以 `invalid` 落盘、原图保留，但不计入有效
+结果。「重新计算」只复用已保存的 validation 数据。
+
+**单位**：`aggregate.spacing_abs_error_mm` 的 `mean/p95/max` 与逐位置字段一样都是**毫米**
+（修复了早期汇总把米当毫米、数值小 1000 倍的问题），结果里另有 `unit: "mm"`。
+读回旧版 `result_validation.json` / `calibration.json` 时，若缺少 `unit` 标记，会按
+米→毫米**迁移一次**（幂等，不会重复放大）；逐位置字段本来就是毫米，不做转换。
+
+**重投影误差小不等于三维精度高**。以间距误差与平面度为准，而且必须是独立数据。这些指标
+是**三维几何一致性检查**：没有外部真实坐标时，不能称为绝对定位精度。
 
 ---
 
@@ -133,13 +170,13 @@ python api\preview_server.py --indices 0 1
 python api\preview_server.py --indices 0 1
 
 :: 在线采集（HTTP）
-python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
+python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 5
 python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 0 --count 30
 python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 1 --count 30
-:: 板固定到中心地面后：
-python api\calib_cli.py capture-single --session <会话> --camera 0 --count 6 --phase extrinsic
-python api\calib_cli.py capture-single --session <会话> --camera 1 --count 6 --phase extrinsic
-:: 板挪到别处后采集验证帧对：
+:: 板固定到中心地面后（CLI 仍是逐相机采集；网页用「采集双相机图片」一次采一对）
+python api\calib_cli.py capture-single --session <会话> --camera 0 --count 1 --phase extrinsic
+python api\calib_cli.py capture-single --session <会话> --camera 1 --count 1 --phase extrinsic
+:: 板挪到别处后采集验证帧对（等价于网页「采集并验证三维精度」的采集步骤）：
 python api\calib_cli.py capture-stereo --session <会话> --count 3
 
 :: 离线求解（不需要相机）
@@ -171,9 +208,10 @@ python api\calib_cli.py info
 2. 本模块只用「相机必须在图案正面一侧（世界 Z > 0）」筛掉两个镜像解，剩下一对相差 180°，
    并且**刻意不按重投影误差挑选**（两种解误差逐位相同，按误差选等于瞎猜）；结果里的
    `orientation_ambiguous` 会标出还有另一种解。
-3. 剩下的 180° 只能**人工确认**：勾「世界轴叠加」，逐台看 X 轴是否沿 12 格长边。
-   界面里 cam0 / cam1 各有独立的 180° 开关，确认后勾「已用轴叠加确认」，
-   这个状态会写进结果（`orientation_confirmed`）。
+3. 剩下的 180° 只能**人工确认**：把「可视化模式」切到「世界坐标轴可视化」，逐台看
+   X 轴是否沿 12 格长边。界面里 cam0 / cam1 各有独立的 180° 开关，确认后勾
+   「已确认世界坐标轴方向」，这个状态会写进结果（`orientation_confirmed`）。改任一
+   相机的 180° 或重新采集外参图片会自动取消该确认。
 4. **三角化一致性残差查不出 180° 错误**。实测：cam1 反向时基线从 **2032 mm 变成 1635 mm**，
    而自洽残差两种情况都只有 **0.6–0.8 mm**。也就是说，基线错了 20%，指标却看不出来。
    → 这就是为什么必须人眼看轴，也是为什么单翻一台相机的开关要单独给出。
@@ -201,6 +239,11 @@ captures/calibration/<会话>/
 ```
 
 `samples.json` 里 `phase` 取值：`intrinsic`（板移动）/ `extrinsic`（板固定）/ `validation`（板换位置）。
+
+**路径约定**：数据基准目录是 `computer_code/`。默认会话根目录 `captures/calibration/`、
+默认结果 `api/calibration/calibration.json`，界面与结果文件里的 `session.root` 使用项目
+相对路径；内部读写时再解析成绝对路径，因此不依赖启动进程时的当前工作目录。旧会话里保存
+的绝对路径仍可直接读取，历史采集目录不会被覆盖。
 
 ### 7.2 `api/calibration/calibration.json`（schema v2）
 
@@ -245,15 +288,17 @@ K0, D0, K1, D1, R, T = stereo_matrices(data)    # 或 scaled_size=(640, 360)
 |---|---|---|
 | GET | `/api/calib/status` | 会话、样本计数（按 phase）、内外参状态、相机位姿摘要 |
 | POST | `/api/calib/session` | 新建/打开会话（`cols/rows/square_mm/surface_height_mm`） |
-| POST | `/api/calib/capture/single` | 采一张内参图（判重 + 质量门限） |
-| POST | `/api/calib/capture/extrinsic` | 采一张外参图（固定板，不判重） |
+| POST | `/api/calib/capture/single` | 采一张单相机图（默认 intrinsic，判重 + 质量门限） |
+| POST | `/api/calib/capture/extrinsic` | 采一张外参图（单相机兼容接口，固定板不判重） |
+| POST | `/api/calib/capture/extrinsic-pair` | **采集双相机图片**：一对同步帧分别写入两台相机的 `extrinsic` 阶段 |
 | POST | `/api/calib/capture/stereo` | 采一对同步帧（validation 用） |
-| GET | `/api/calib/live?camera=0` | 实时检测叠加（JPEG） |
-| GET | `/api/calib/extrinsic/overlay?camera=0&flip180=0` | **世界轴叠加**（确认角点对应） |
-| POST | `/api/calib/intrinsic` | 内参标定 |
+| GET | `/api/calib/live?camera=0` | 角点检测可视化（JPEG） |
+| GET | `/api/calib/extrinsic/overlay?camera=0&flip180=0` | **世界坐标轴可视化**（确认角点对应） |
+| POST | `/api/calib/intrinsic` | 内参标定（含每相机区域覆盖率） |
 | POST | `/api/calib/solve/extrinsic` | **外参标定（solvePnP）** |
-| POST | `/api/calib/validate/rig` | 独立验证（多位置/高度） |
-| POST | `/api/calib/stereo` | stereoCalibrate 交叉校验 |
+| POST | `/api/calib/validate/rig` | 重新计算验证（复用已保存数据） |
+| POST | `/api/calib/validate/capture` | **采集并验证三维精度**（采一对新帧 + 自动验证） |
+| POST | `/api/calib/stereo` | stereoCalibrate 交叉校验（保留，网页不再入口） |
 | POST | `/api/calib/save` | 写 `calibration.json` |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取矩阵 |
 
@@ -271,18 +316,17 @@ python -m calibration.selftest --keep     :: 保留渲染图
 用已知 `K/D/R/T` 按**真实畸变模型**逐像素反向渲染虚拟棋盘格（11×8 / 30 mm），再走正式代码
 检测与求解，最后与真值比对。
 
-最近一次：**77/77 通过**。合成数据（两台相机距板心 ~1.8 m、基线 2032.78 mm）：
+最近一次：**102/102 通过**（`--quick` 与完整模式均通过）。合成数据（两台相机距板心
+~1.8 m、基线 2032.78 mm）的代表性量级：
 
 | 项目 | 结果 |
 |---|---|
-| 内参 fx 相对误差 | 0.13% |
-| 内参 RMS | 0.07 px |
-| solvePnP 重投影 | 0.096 / 0.085 px |
-| 相机到板心距离误差 | 1.8 / 0.5 mm |
-| 基线 | 2031.89 mm（误差 0.89 mm） |
-| 三角化自洽（对已知世界点） | rms 0.227 mm，max 0.558 mm |
-| 验证集网格间距误差 | mean 0.000 mm，max 0.001 mm |
-| 验证集重投影 / 平面度 | 0.070 px / 0.227 mm |
+| 内参 fx 相对误差 | ~0.13% |
+| 内参 RMS | ~0.07 px |
+| solvePnP 重投影 | ~0.09 px |
+| 三角化自洽（对已知世界点） | rms ~0.23 mm，max ~0.62 mm |
+| 验证集网格间距误差（已修正为 mm） | mean ~0.17 mm，max ~1.1 mm |
+| 验证集重投影 / 平面度 | ~0.06 px / ~0.18 mm |
 
 除求解精度外，还覆盖了这些**流程**用例（全部用合成数据/假相机，不接硬件）：
 
@@ -292,6 +336,14 @@ python -m calibration.selftest --keep     :: 保留渲染图
 - CLI `save` 端到端跑通（防重复定义/参数缺失）
 - 重载会话能恢复 `result_intrinsic/extrinsic`；新增采集后旧外参被作废
 - HTTP 采集（`/api/calib/capture/*`）用假相机验证；同一帧、同一同步帧对会被拒绝
+- 内参区域覆盖率只统计本相机 `intrinsic` 样本，外参图不会混入；两台相机独立
+- 一次同步采集把两张图分别写入相机 0/1 的 `extrinsic`，各 1 张即可 solvePnP；
+  单帧时 `centre_std_m` 为 `None`
+- 固定板外参/验证使用 0.1% 覆盖率下限，0.15% 的图被接受并带告警；内参仍要求 0.8%
+- 「采集并验证三维精度」自动入库并计算，验证计数与外参/内参计数互不混算
+- 汇总间距误差与逐位置结果单位一致（mm）；旧结果的米→毫米迁移幂等
+- 网页包含三种可视化模式、三维视图/重置/俯视入口，旧的双目标定/覆盖检查/分散采集
+  入口已移除
 
 **这不是实机精度**：合成图没有镜头杂散光、板面不平、运动模糊、滚动快门和 USB 传输抖动。
 实机必须自己采数据重跑。
@@ -310,6 +362,11 @@ python -m calibration.selftest --keep     :: 保留渲染图
 5. **世界系锚在板的那一次摆放上**：板挪走后世界系不变（这正是本意），所以板所在平面
    必须与你声明的 `surface_height_m` 一致，否则所有高度会整体偏移。
 6. **三角化精度依赖基线/距离**：基线越短、目标越远，深度误差越大。验证请覆盖实际工作距离。
+7. **三维视图是检查工具，不是测量结果**：网页里的三维场景由 Canvas 2D 透视投影绘制
+   （不依赖联网或额外前端工程），相机位置/朝向/视锥体来自已求解的外参和内参，用于检查
+   方向与几何关系；数值精度仍以 `calibration.json` 和验证指标为准。
+8. **板面高是声明值**：默认 5 mm 只描述图案表面高于地面的高度，世界原点仍在图案表面；
+   如果实际板面高与填写值不符，基于地面的高度会整体偏移。
 
 ---
 

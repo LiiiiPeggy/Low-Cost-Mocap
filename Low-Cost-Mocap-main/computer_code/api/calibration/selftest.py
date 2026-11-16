@@ -560,6 +560,13 @@ def test_pnp(spec: B.BoardSpec, size: tuple[int, int], intr0: dict, intr1: dict,
         check("验证：重投影 < 1px", agg["reprojection_rms_px"]["mean"] < 1.0,
               "mean=%.3fpx max=%.3fpx"
               % (agg["reprojection_rms_px"]["mean"], agg["reprojection_rms_px"]["max"]))
+        # 汇总间距误差曾经把“米”当“毫米”输出（比逐位置小 1000 倍）。
+        sp = agg["spacing_abs_error_mm"]
+        per_max = max(p["spacing_max_abs_error_mm"] for p in val["per_placement"])
+        check("验证：汇总间距误差单位与逐位置一致（mm）",
+              sp.get("unit") == "mm" and abs(sp["max"] - per_max) < 1e-3
+              and sp["expected_spacing_mm"] == round(spec.square_mm, 3),
+              "汇总 max=%.4fmm  逐位置 max=%.4fmm" % (sp["max"], per_max))
         check("验证：极线中位 < 1.5px", agg["epipolar_median_px"]["mean"] < 1.5,
               "mean=%.3fpx" % agg["epipolar_median_px"]["mean"])
         check("验证：重建平面度 < 1mm",
@@ -755,14 +762,15 @@ class _FakeSync:
 
     max_dt_ms = 20.0
 
-    def __init__(self, fa, fb):
+    def __init__(self, fa, fb, pair_seq: int = 1):
         self._fa, self._fb = fa, fb
+        self.pair_seq = int(pair_seq)
         self.calls = 0
 
     def recent_pairs(self, count=1):
         from sync import PairRecord
         self.calls += 1
-        return [PairRecord(pair_seq=1, dt_ms=0.3, frame_a=self._fa,
+        return [PairRecord(pair_seq=self.pair_seq, dt_ms=0.3, frame_a=self._fa,
                            frame_b=self._fb, created_mono=time.perf_counter())]
 
 
@@ -895,6 +903,247 @@ def test_persistence(spec: B.BoardSpec, size: tuple[int, int],
           "重投影差 %.2fpx" % float(np.linalg.norm(p1_est - p1)))
 
 
+# ---------------------------------------------------------------------------
+# 用例 10：内参覆盖率按相机 / 阶段隔离
+# ---------------------------------------------------------------------------
+def _add_intrinsic_samples(sess: Session, spec: B.BoardSpec, size, tex, off,
+                           n: int = 6) -> dict:
+    """给两台相机各写 n 张 intrinsic 阶段的合成样本。"""
+    counts = {}
+    for cam in (0, 1):
+        k, guard = 0, 0
+        while k < n and guard < n * 10:
+            guard += 1
+            R_b, t_b = pose_with_centered_board(
+                spec, RNG.uniform(0.62, 1.0), RNG.uniform(-0.4, 0.4),
+                RNG.uniform(-0.3, 0.3), RNG.uniform(-0.42, 0.42),
+                RNG.uniform(-0.16, 0.16), RNG.uniform(-0.08, 0.08))
+            img = render(spec, R_b, t_b, TRUE_K, TRUE_D, size, tex, off)
+            det = B.detect(img, spec)
+            if not det.ok:
+                continue
+            sess.add_single(cam, img, det, {"seq": k},
+                            signature=B.pose_signature(det, spec), phase="intrinsic")
+            k += 1
+        counts[cam] = k
+    return counts
+
+
+def test_intrinsic_coverage(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
+    print("\n[10] 内参覆盖率：只统计本相机 intrinsic 阶段")
+    import calibration.service as SVC
+
+    root = os.path.join(tmp, "coverage_session")
+    shutil.rmtree(root, ignore_errors=True)
+    sess = Session.create(root, spec, [0, 1], size, "NV12", "覆盖率自检")
+    counts = _add_intrinsic_samples(sess, spec, size, tex, off, 6)
+    check("覆盖率用例：两相机各有 6 张内参图",
+          counts == {0: 6, 1: 6}, counts)
+
+    # 再塞一张 extrinsic 图：它绝不能进入内参覆盖率统计
+    R_b, t_b = pose_with_centered_board(spec, 0.9, 0.2, -0.1, 0.3, 0.15, 0.10)
+    img = render(spec, R_b, t_b, TRUE_K, TRUE_D, size, tex, off)
+    det = B.detect(img, spec)
+    if det.ok:
+        sess.add_single(0, img, det, {"seq": 50},
+                        signature=B.pose_signature(det, spec), phase="extrinsic")
+
+    svc = SVC.service()
+    svc.reload_session(root)
+    try:
+        res = svc.run_intrinsic(None)
+        ok_counts, ok_cov = True, True
+        detail = []
+        for cam in (0, 1):
+            d = res["intrinsics"].get(str(cam), {})
+            cov = d.get("coverage") or {}
+            hits = cov.get("corner_hits")
+            ok_counts = ok_counts and d.get("num_views") == 6
+            ok_cov = ok_cov and hits == 6 * spec.count and 0 <= cov.get(
+                "covered_ratio", -1) <= 1
+            detail.append("cam%s views=%s hits=%s cov=%.0f%%" % (
+                cam, d.get("num_views"), hits,
+                100 * cov.get("covered_ratio", 0)))
+        check("内参样本数只算 intrinsic（外参图不混入）", ok_counts, "；".join(detail))
+        check("两台相机分别给出 6×6 网格覆盖率", ok_cov, "；".join(detail))
+    finally:
+        svc.close_session()
+
+
+# ---------------------------------------------------------------------------
+# 用例 11：双相机同帧外参采集 / 单张求解 / 采集并自动验证
+# ---------------------------------------------------------------------------
+def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
+                                       tmp: str) -> None:
+    print("\n[11] 双相机同帧外参采集 + 单张 solvePnP + 自动验证")
+    import calibration.service as SVC
+    from camera_manager import Frame
+
+    root = os.path.join(tmp, "pair_session")
+    shutil.rmtree(root, ignore_errors=True)
+    sess = Session.create(root, spec, [0, 1], size, "NV12", "同帧采集自检")
+    counts = _add_intrinsic_samples(sess, spec, size, tex, off, 6)
+    if counts != {0: 6, 1: 6}:
+        check("同帧采集用例：内参数据准备", False, counts)
+        return
+
+    svc = SVC.service()
+    svc.reload_session(root)
+    intr = svc.run_intrinsic(None)
+    check("同帧采集用例：先解出两台相机内参",
+          len(intr.get("intrinsics", {})) == 2, list(intr.get("intrinsics", {})))
+
+    C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
+
+    def _frame(gray, seq):
+        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
+                     host_ts=time.time(), mono_ts=time.perf_counter())
+
+    img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
+    img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
+    w0, w1 = _FakeWorker(_frame(img0, 1000), 0), _FakeWorker(_frame(img1, 2000), 1)
+
+    orig_manager, orig_sync = SVC.manager, SVC.sync_service
+    SVC.manager = lambda: _FakeManager({0: w0, 1: w1})
+    try:
+        SVC.sync_service = lambda: _FakeSync(w0.latest(), w1.latest(), pair_seq=10)
+        cap = svc.capture_extrinsic_pair()
+        check("一次采集同时保存两台相机的外参图像",
+              cap.get("ok") and all(v.get("ok") for v in cap["cameras"].values()),
+              cap.get("message"))
+
+        st = svc.session.stats()["by_phase"]
+        check("外参计数各 1，内参计数不变",
+              st.get("extrinsic") == {"0": 1, "1": 1}
+              and st.get("intrinsic") == {"0": 6, "1": 6}, st)
+
+        rig = svc.solve_extrinsic()
+        base_true = float(np.linalg.norm(C1 - C0))
+        check("每台相机仅 1 张有效外参图即可 solvePnP",
+              abs(rig["relative"]["baseline_m"] - base_true) * 1000 < 5.0,
+              "baseline %.2fmm（真值 %.2fmm）"
+              % (rig["relative"]["baseline_m"] * 1000, base_true * 1000))
+        check("单帧不输出无意义的帧间标准差",
+              rig["stability"]["0"]["frames"] == 1
+              and rig["stability"]["0"]["centre_std_m"] is None,
+              rig["stability"]["0"].get("note"))
+
+        # 板挪到别处，采一对新同步帧并自动验证
+        off_w = np.array([0.32, 0.10, 0.22])
+        va = render(spec, R0, R0 @ off_w + t0, TRUE_K, TRUE_D, size, tex, off)
+        vb = render(spec, R1, R1 @ off_w + t1, TRUE_K, TRUE_D, size, tex, off)
+        wa, wb = _FakeWorker(_frame(va, 1100), 0), _FakeWorker(_frame(vb, 2100), 1)
+        SVC.manager = lambda: _FakeManager({0: wa, 1: wb})
+        SVC.sync_service = lambda: _FakeSync(wa.latest(), wb.latest(), pair_seq=11)
+
+        val = svc.capture_and_validate()
+        check("采集并自动验证（一次操作）",
+              bool(val.get("ok")) and val.get("validation") is not None,
+              val.get("validation_error") or "")
+        if val.get("validation"):
+            agg = val["validation"]["aggregate"]
+            sp = agg["spacing_abs_error_mm"]
+            check("自动验证给出 1 个有效位置",
+                  agg["placements"] == 1, agg["placements"])
+            check("自动验证汇总间距误差为 mm（0–100 mm 合理区间）",
+                  sp.get("unit") == "mm" and 0 <= sp["mean"] <= 100,
+                  "mean=%.4fmm max=%.4fmm" % (sp["mean"], sp["max"]))
+            st2 = svc.session.stats()["by_phase"]
+            check("验证采集只增加 validation 帧对计数",
+                  st2.get("validation_pairs") == 1
+                  and st2.get("extrinsic") == {"0": 1, "1": 1}
+                  and st2.get("intrinsic") == {"0": 6, "1": 6}, st2)
+
+        # 低覆盖但高于外参下限：应接受（并告警），不能沿用内参 0.8% 门限
+        real_detect = SVC.board_mod.detect
+        base_det = B.detect(img0, spec)
+        fake = B.Detection(ok=True, corners=base_det.corners,
+                           method=base_det.method, polarity=base_det.polarity,
+                           reason="",
+                           quality=dict(base_det.quality, coverage=0.0015))
+        SVC.board_mod.detect = lambda gray, spec, **kw: fake
+        try:
+            wx = _FakeWorker(_frame(img0, 1200), 0)
+            wy = _FakeWorker(_frame(img1, 2200), 1)
+            SVC.manager = lambda: _FakeManager({0: wx, 1: wy})
+            SVC.sync_service = lambda: _FakeSync(wx.latest(), wy.latest(), pair_seq=12)
+            cap2 = svc.capture_extrinsic_pair()
+            check("0.15% 的外参图高于 0.1% 下限，被接受并带告警",
+                  bool(cap2.get("ok")) and all(
+                      v.get("ok") and v.get("warning")
+                      for v in cap2["cameras"].values()),
+                  {k: (v.get("status"), v.get("warning"))
+                   for k, v in cap2["cameras"].items()})
+            st3 = svc.session.stats()["by_phase"]
+            check("低覆盖外参图计入有效外参数量",
+                  st3.get("extrinsic") == {"0": 2, "1": 2}, st3)
+        finally:
+            SVC.board_mod.detect = real_detect
+    finally:
+        SVC.manager, SVC.sync_service = orig_manager, orig_sync
+        try:
+            SVC.service().close_session()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# 用例 12：网页入口与项目相对路径
+# ---------------------------------------------------------------------------
+def test_preview_ui_and_paths() -> None:
+    print("\n[12] 网页入口与项目相对路径")
+    from calibration.service import (
+        DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, MIN_COVERAGE,
+        MIN_COVERAGE_EXTRINSIC, _normalize_validation_units, coverage_limit_for,
+        project_relative,
+    )
+
+    check("外参/验证覆盖率为 0.1%，内参仍为 0.8%",
+          abs(MIN_COVERAGE_EXTRINSIC - 0.001) < 1e-12
+          and coverage_limit_for("intrinsic") == MIN_COVERAGE
+          and coverage_limit_for("extrinsic") == MIN_COVERAGE_EXTRINSIC,
+          "内参 %.1f%% / 外参 %.1f%%"
+          % (100 * MIN_COVERAGE, 100 * MIN_COVERAGE_EXTRINSIC))
+
+    check("默认会话目录位于 computer_code/captures/calibration",
+          project_relative(DEFAULT_SESSION_ROOT).startswith("captures/calibration"),
+          project_relative(DEFAULT_SESSION_ROOT))
+    check("默认标定结果路径为项目相对路径",
+          project_relative(DEFAULT_RESULT_PATH) == "api/calibration/calibration.json",
+          project_relative(DEFAULT_RESULT_PATH))
+
+    legacy = {"aggregate": {"spacing_abs_error_mm": {
+        "mean": 0.0038, "p95": 0.0112, "max": 0.2028,
+        "expected_spacing_mm": 30.0}}}
+    _normalize_validation_units(legacy)
+    _normalize_validation_units(legacy)          # 重复调用不能再次放大
+    sp = legacy["aggregate"]["spacing_abs_error_mm"]
+    check("旧验证结果的汇总间距误差按米→毫米迁移一次",
+          sp.get("unit") == "mm" and abs(sp["mean"] - 3.8) < 1e-6
+          and abs(sp["max"] - 202.8) < 1e-6, sp)
+
+    html_path = os.path.join(_API, "static", "preview.html")
+    with open(html_path, encoding="utf-8") as fh:
+        html = fh.read()
+    check("可视化模式选择框（三种模式）",
+          'id="c-vis-mode"' in html and "棋盘格角点可视化" in html
+          and "世界坐标轴可视化" in html and "无可视化" in html)
+    check("可视化模式默认选中棋盘格角点",
+          'value="corners" selected' in html)
+    check("三维视图与重置/俯视控制",
+          'id="c-scene"' in html and 'id="c-reset-view"' in html
+          and 'id="c-top-view"' in html and "R_cam_to_world" in html)
+    check("合并后的采集/验证入口",
+          'id="c-ex-pair"' in html and 'id="c-val-capture"' in html
+          and 'id="c-val-recalc"' in html)
+    check("方向确认标签已更名",
+          "已确认世界坐标轴方向" in html and "已用轴叠加确认" not in html)
+    check("已移除网页双目标定/覆盖检查/分散采集入口",
+          all(x not in html for x in (
+              'id="c-stereo"', 'id="c-cover"', 'id="c-ex0"', 'id="c-ex1"',
+              'id="c-cap-pair"', 'id="c-valrig"')))
+
+
 def _selftest_dir() -> str:
     """建自检用的临时目录。
 
@@ -938,6 +1187,9 @@ def main(argv=None) -> int:
     test_frame_pairing(spec, size, _tex, _off)
     test_cli_and_state(spec, size, _tex, _off, tmp)
     test_capture_http(spec, size, _tex, _off, tmp)
+    test_intrinsic_coverage(spec, size, _tex, _off, tmp)
+    test_extrinsic_pair_and_validation(spec, size, _tex, _off, tmp)
+    test_preview_ui_and_paths()
     if st:
         test_persistence(spec, size, intr, st, tmp)
 

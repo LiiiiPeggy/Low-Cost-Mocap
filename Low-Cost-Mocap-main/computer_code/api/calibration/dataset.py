@@ -214,7 +214,7 @@ class Session:
                    frame_meta: dict, *, overlay: np.ndarray | None = None,
                    status: str = "valid", reason: str = "",
                    signature: dict | None = None,
-                   phase: str = "intrinsic") -> Sample:
+                   phase: str = "intrinsic", note: str = "") -> Sample:
         sid = self._next_id("s")
         key = str(int(camera))
         fname = "%s_cam%s.png" % (sid, key)
@@ -228,7 +228,7 @@ class Session:
             images={key: dict(frame_meta, file=fname,
                               width=int(gray.shape[1]), height=int(gray.shape[0]))},
             detections={key: det.to_dict()},
-            status=status, reason=reason,
+            status=status, reason=reason, note=note,
             signature=signature or {}, phase=phase,
         )
         self.samples.append(sample)
@@ -239,7 +239,7 @@ class Session:
                    *, dt_ms: float | None, flip_b: bool = False,
                    overlay: dict | None = None, status: str = "valid",
                    reason: str = "", signature: dict | None = None,
-                   phase: str = "validation") -> Sample:
+                   phase: str = "validation", note: str = "") -> Sample:
         sid = self._next_id("p")
         images, detections = {}, {}
         for cam, gray in grays.items():
@@ -255,6 +255,7 @@ class Session:
         sample = Sample(
             id=sid, kind="stereo", created=_now(), images=images,
             detections=detections, status=status, reason=reason,
+            note=note,
             dt_ms=None if dt_ms is None else round(float(dt_ms), 3),
             flip_b=bool(flip_b), signature=signature or {}, phase=phase,
         )

@@ -256,7 +256,10 @@ def cameras_save():
 # ---------------------------------------------------------------------------
 @bp.get("/preview")
 def preview_page():
-    return send_from_directory(_STATIC_DIR, "preview.html")
+    # 标定页更新后不能让浏览器继续用旧缓存里的 HTML/JS
+    resp = send_from_directory(_STATIC_DIR, "preview.html", max_age=0)
+    resp.headers["Cache-Control"] = "no-store, must-revalidate"
+    return resp
 
 
 def register(app) -> None:

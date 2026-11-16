@@ -75,7 +75,7 @@
   #log {
     margin: 0 20px 24px; padding: 10px 14px; background: #fff; border: 1px solid var(--line);
     border-radius: 10px; color: #4b5563; font: 12px/1.7 ui-monospace, Consolas, monospace;
-    white-space: pre-wrap; max-height: 150px; overflow: auto;
+    white-space: pre-wrap; word-break: break-word; max-height: 150px; overflow: auto;
   }
   /* ---- 帧同步状态条 ---- */
   #syncbar {
@@ -127,8 +127,12 @@
   }
   #calib .out {
     margin-top: 8px; font: 12px/1.65 ui-monospace, Consolas, monospace; color: #374151;
-    white-space: pre-wrap; max-height: 240px; overflow: auto; background: #fff;
+    max-height: 240px; overflow: auto; background: #fff;
     border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
+  }
+  /* 每条日志独立成行：不依赖单个 textContent 里的 \n，长行自动换行、无空行 */
+  #calib .out .logline {
+    white-space: pre-wrap; word-break: break-word; margin: 0; padding: 0;
   }
   #calib .badge {
     font-size: 11px; padding: 1px 6px; border-radius: 999px;
@@ -136,9 +140,30 @@
   }
   #calib .badge.ok { background: #ecfdf5; border-color: #bbf7d0; color: #15803d; }
   #calib .badge.err { background: #fef2f2; border-color: #fecaca; color: #b91c1c; }
-  #c-map {
-    width: 100%; max-width: 680px; height: auto; display: block; margin-top: 8px;
+  #calib .badge.warn { background: #fffbeb; border-color: #fde68a; color: #b45309; }
+  #calib select {
+    padding: 3px 6px; border: 1px solid var(--line); border-radius: 5px;
+    font-size: 12px; color: var(--fg); background: #fff;
+  }
+  #c-scene {
+    width: 100%; height: 430px; display: block; margin-top: 8px;
+    background: #0d1117; border: 1px solid var(--line); border-radius: 8px;
+    cursor: grab; touch-action: none;
+  }
+  #c-scene:active { cursor: grabbing; }
+  .view3d-tools { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 6px; }
+  #c-val-out {
+    margin-top: 8px; display: grid; grid-template-columns: 1fr 1fr; gap: 10px;
+  }
+  @media (max-width: 900px) { #c-val-out { grid-template-columns: 1fr; } }
+  .val-card {
     background: #fff; border: 1px solid var(--line); border-radius: 8px;
+    padding: 8px 10px; font: 12px/1.65 ui-monospace, Consolas, monospace; color: #374151;
+    white-space: pre-wrap; word-break: break-word;
+  }
+  .val-card h4 {
+    margin: 0 0 4px; font: 600 12px -apple-system, "Segoe UI", "Microsoft YaHei", sans-serif;
+    color: var(--fg);
   }
   #calib .hintline { color: #98a1b0; font-size: 11px; }
 </style>
@@ -177,64 +202,77 @@
 <section id="calib" class="collapsed">
   <div class="bar">
     <b>标定</b>
-    <span class="pill">内参 + 双目外参 · OpenCV</span>
+    <span class="pill">内参 + 固定板世界系外参 · OpenCV</span>
     <label>内角点 <input id="c-cols" type="number" min="3" max="20" value="11"> ×
       <input id="c-rows" type="number" min="3" max="20" value="8"></label>
     <label>方格 <input id="c-sq" type="number" min="1" step="0.5" value="30"> mm</label>
-    <label>板面高 <input id="c-sqh" type="number" min="0" step="1" value="0"> mm</label>
+    <label>板面高 <input id="c-sqh" type="number" min="0" step="1" value="5"> mm</label>
     <button id="c-open" class="primary">新建 / 打开会话</button>
     <span id="c-sess" class="badge">未打开会话</span>
+    <span id="c-act" class="badge">就绪</span>
     <span class="spacer"></span>
-    <label><input type="checkbox" id="c-live"> 实时检测叠加</label>
     <button id="c-collapse">收起</button>
   </div>
   <div class="body">
     <div class="row">
-      <span>相机 0 有效 <b id="c-n0">0</b></span>
+      <span>内参 相机0 有效 <b id="c-n0">0</b></span>
       <button data-cap="0">采集相机 0</button>
       <span class="sep"></span>
-      <span>相机 1 有效 <b id="c-n1">0</b></span>
+      <span>内参 相机1 有效 <b id="c-n1">0</b></span>
       <button data-cap="1">采集相机 1</button>
-      <span class="sep"></span>
-      <span>同步帧对有效 <b id="c-np">0</b></span>
-      <button id="c-cap-pair" class="primary">采集同步帧对</button>
       <span class="spacer"></span>
       <button id="c-clear" class="danger">清空样本</button>
     </div>
     <div class="row">
       <button id="c-intr">内参标定</button>
-      <button id="c-stereo">外参标定（双目标定）</button>
       <button id="c-view">查看结果</button>
-      <button id="c-cover">覆盖检查</button>
       <button id="c-save" class="primary">保存 calibration.json</button>
       <span class="spacer"></span>
       <span id="c-intr-tag" class="badge">内参 —</span>
-      <span id="c-stereo-tag" class="badge">双目标定 —</span>
     </div>
     <div class="row" style="border-top:1px dashed var(--line); margin-top:4px; padding-top:8px">
-      <b>世界系外参</b>
+      <b>世界坐标系外参</b>
       <span class="hintline">固定板 · solvePnP</span>
-      <button id="c-ex0">采外参图 相机0</button>
-      <button id="c-ex1">采外参图 相机1</button>
-      <span>帧数 <b id="c-nx0">0</b> / <b id="c-nx1">0</b></span>
+      <button id="c-ex-pair" class="primary">采集双相机图片</button>
+      <span id="c-exmsg" class="badge">—</span>
+      <span>外参帧数 相机0 <b id="c-nx0">0</b> / 相机1 <b id="c-nx1">0</b></span>
       <button id="c-solex" class="primary">解外参 solvePnP</button>
       <span class="sep"></span>
-      <label><input type="checkbox" id="c-axes"> 世界轴叠加</label>
-      <button id="c-valrig">独立验证（多位置）</button>
+      <label>可视化模式
+        <select id="c-vis-mode">
+          <option value="none">无可视化</option>
+          <option value="corners" selected>棋盘格角点可视化</option>
+          <option value="axes">世界坐标轴可视化</option>
+        </select>
+      </label>
       <span id="c-extag" class="badge">外参 —</span>
     </div>
     <div class="row">
       <span class="hintline">方向（必须人工确认）：</span>
       <label><input type="checkbox" id="c-flip0"> 相机0 反向 180°</label>
       <label><input type="checkbox" id="c-flip1"> 相机1 反向 180°</label>
-      <label><input type="checkbox" id="c-confirmed"> 已用轴叠加确认</label>
+      <label><input type="checkbox" id="c-confirmed"> 已确认世界坐标轴方向</label>
       <span class="hintline">两台相机的 X 轴都须沿 12 格长边；只在两路检测顺序真的差 180° 时才单翻一台</span>
     </div>
     <div class="live">
-      <figure><img id="c-img0" alt="cam0 detection"><figcaption>相机 0 检测</figcaption></figure>
-      <figure><img id="c-img1" alt="cam1 detection"><figcaption>相机 1 检测</figcaption></figure>
+      <figure><img id="c-img0" alt="cam0 view"><figcaption id="c-cc0">相机 0</figcaption></figure>
+      <figure><img id="c-img1" alt="cam1 view"><figcaption id="c-cc1">相机 1</figcaption></figure>
     </div>
-    <canvas id="c-map" width="680" height="380"></canvas>
+    <canvas id="c-scene"></canvas>
+    <div class="view3d-tools">
+      <button id="c-reset-view">重置视角</button>
+      <button id="c-top-view">俯视图</button>
+      <span class="hintline">左键拖动旋转 · 滚轮缩放 · 右键拖动平移 · Z 轴向上</span>
+    </div>
+    <div class="row" style="border-top:1px dashed var(--line); margin-top:10px; padding-top:8px">
+      <b>三维定位精度验证</b>
+      <span class="hintline">同步帧对三角化 · 几何一致性检查（无外部真值，不称绝对定位精度）</span>
+      <button id="c-val-capture" class="primary">采集并验证三维精度</button>
+      <button id="c-val-recalc">重新计算</button>
+      <span>有效验证位置 <b id="c-np">0</b></span>
+      <span id="c-val-tag" class="badge">验证 —</span>
+    </div>
+    <div id="c-val-out"></div>
     <div id="c-out">标定面板：先「新建 / 打开会话」，再用标定板在各姿态下依次「采集」。</div>
   </div>
 </section>
@@ -566,7 +604,7 @@ timer = setInterval(refresh, 1000);
 (function markBuild() {
   const b = el('build');
   if (!b) return;
-  b.textContent = 'v5 · 白底 + 帧同步 + 标定';
+  b.textContent = 'v6 · 三维视图 + 合并采集';
 })();
 
 /* ==================================================================
@@ -574,28 +612,57 @@ timer = setInterval(refresh, 1000);
    —— 只调用 /api/calib/*，不碰相机线程：所有帧都取自后端已开的采集缓存
    ================================================================== */
 const cOut = el('c-out');
-let cLines = [];
 let cLiveTimer = null;
 let cLiveBusy = false;
 const cLiveUrl = {};
+let cValidation = null;        // 最近一次三维精度验证结果（status/接口返回）
+let cConfirmSuppressed = false; // 改 180°/重新采集后，禁止状态轮询把“已确认”自动勾回去
 
+/* 每条日志独立成一个 DOM 行：不依赖一个 textContent 里的 \n，长行由 CSS
+   pre-wrap 自动换行，也不会出现连续空行。 */
 function cLog(msg) {
   const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
-  cLines.unshift(`[${t}] ${msg}`);
-  if (cLines.length > 200) cLines.length = 200;
-  cOut.textContent = cLines.join('\n');
+  String(msg).split(/\r?\n/).forEach((line, i) => {
+    if (!line.trim()) return;
+    const div = document.createElement('div');
+    div.className = 'logline';
+    div.textContent = (i === 0 ? `[${t}] ` : '    ') + line;
+    cOut.appendChild(div);
+  });
+  while (cOut.childElementCount > 300) cOut.removeChild(cOut.firstChild);
+  cOut.scrollTop = cOut.scrollHeight;
 }
 
-el('btn-calib').onclick = () => {
+function cBadge(id, text, cls, title) {
+  const b = el(id);
+  if (!b) return;
+  b.textContent = text;
+  b.className = 'badge' + (cls ? ' ' + cls : '');
+  if (title !== undefined) b.title = title || '';
+}
+
+function cAct(text, cls) {
+  cBadge('c-act', text, cls);
+}
+
+function openCalibPanel(open) {
   const sec = el('calib');
-  sec.classList.toggle('collapsed');
-  if (!sec.classList.contains('collapsed')) {
+  sec.classList.toggle('collapsed', !open);
+  if (open) {
     refreshCalib();
+    startCalibLive();
     sec.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  } else {
+    stopCalibLive();
   }
-};
-el('c-collapse').onclick = () => el('calib').classList.add('collapsed');
-if (location.hash === '#calib') el('calib').classList.remove('collapsed');
+}
+
+el('btn-calib').onclick = () => openCalibPanel(el('calib').classList.contains('collapsed'));
+el('c-collapse').onclick = () => openCalibPanel(false);
+if (location.hash === '#calib') {
+  el('calib').classList.remove('collapsed');
+  startCalibLive();
+}
 
 // ---- 会话 ----
 el('c-open').onclick = async () => {
@@ -605,19 +672,32 @@ el('c-open').onclick = async () => {
     cameras: CAMERAS
   };
   if (!(body.cols >= 3 && body.rows >= 3 && body.square_mm > 0)) {
+    cAct('参数不合法', 'err');
     cLog('参数不合法：内角点至少 3×3，方格边长必须为正'); return;
   }
+  // 立即给可见反馈：请求在后台进行时按钮和状态徽标都会变化
+  el('c-open').disabled = true;
+  cAct('正在打开会话…');
+  cLog(`正在新建/打开会话：${body.cols}×${body.rows} 内角点，方格 ${body.square_mm}mm，`
+     + `板面高 ${body.surface_height_mm}mm…`);
   try {
     const st = await api('/api/calib/session', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body)
     });
     const s = st.session;
+    cAct('会话已打开', 'ok');
     cLog(`会话已打开：${s.board.cols}×${s.board.rows} 内角点，方格 ${s.board.square_mm}mm，`
        + `图像 ${s.image_size[0]}×${s.image_size[1]}，现有 ${s.stats.total} 个样本`);
     cLog(`  数据目录：${s.root}`);
     refreshCalib();
-  } catch (e) { cLog('打开会话失败：' + e.message); }
+  } catch (e) {
+    cAct('打开会话失败', 'err');
+    cLog('打开会话失败：' + e.message);
+    console.error('calib session error', e);
+  } finally {
+    el('c-open').disabled = false;
+  }
 };
 
 // ---- 采集 ----
@@ -632,6 +712,7 @@ document.querySelectorAll('#calib [data-cap]').forEach(btn => {
       });
       cLog(r.message);
       if (!r.ok && r.reason) cLog('  原因：' + r.reason);
+      if (r.warning) cLog('  ! ' + r.warning);
       if (r.ok) {
         const q = r.quality || {};
         cLog(`  角点边距 ${q.mean_edge_px}px  覆盖 ${(100 * (q.coverage || 0)).toFixed(1)}%`
@@ -642,22 +723,6 @@ document.querySelectorAll('#calib [data-cap]').forEach(btn => {
     finally { btn.disabled = false; }
   };
 });
-
-el('c-cap-pair').onclick = async () => {
-  el('c-cap-pair').disabled = true;
-  try {
-    const r = await api('/api/calib/capture/stereo', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
-    });
-    cLog(r.message + (r.dt_ms !== undefined ? `  Δt=${r.dt_ms} ms` : ''));
-    if (!r.ok && r.reason) cLog('  原因：' + r.reason);
-    if (r.caveat) cLog('  说明：' + r.caveat);
-    refreshCalib();
-  } catch (e) {
-    cLog('采集帧对失败：' + e.message);
-    cLog('  提示：确认两台相机在 streaming，且顶部「配对率」不是 0');
-  } finally { el('c-cap-pair').disabled = false; }
-};
 
 el('c-clear').onclick = async () => {
   if (!confirm('清空当前会话的全部样本（原图会被删除）？')) return;
@@ -680,11 +745,17 @@ el('c-intr').onclick = async () => {
       body: JSON.stringify({ cameras: 'both' })
     });
     Object.entries(r.intrinsics).forEach(([cam, d]) => {
-      cLog(`相机 ${cam}：RMS=${d.rms_px}px  样本=${d.num_views}  `
-         + `fx=${d.focal_px[0]}  fy=${d.focal_px[1]}  `
+      const cov = d.coverage || {};
+      const pct = cov.covered_ratio === undefined ? '—'
+        : (100 * cov.covered_ratio).toFixed(0) + '%';
+      cLog(`相机 ${cam}：RMS=${d.rms_px} px，有效 ${d.num_views} 张，覆盖率 ${pct}`);
+      const K = (d.K || []).map(row => '[' + row.map(v => (+v).toFixed(3)).join(', ') + ']')
+                            .join('\n      ');
+      cLog(`    K = ${K}`);
+      cLog(`    D = [${d.D.map(v => v.toFixed(5)).join(', ')}]`);
+      cLog(`    fx=${d.focal_px[0]}  fy=${d.focal_px[1]}  `
          + `cx=${d.principal_point_px[0]}  cy=${d.principal_point_px[1]}`);
-      cLog(`  D = [${d.D.map(v => v.toFixed(5)).join(', ')}]`);
-      (d.warnings || []).forEach(w => cLog('  ! ' + w));
+      (d.warnings || []).forEach(w => cLog('    ! ' + w));
       const bad = (d.outlier_suggestion || {}).exclude || [];
       if (bad.length) {
         cLog('  建议剔除：' + bad.map(b => `${b.sample}(${b.rms_px}px)`).join('，')
@@ -695,34 +766,6 @@ el('c-intr').onclick = async () => {
     refreshCalib();
   } catch (e) { cLog('内参标定失败：' + e.message); }
   finally { el('c-intr').disabled = false; }
-};
-
-el('c-stereo').onclick = async () => {
-  cLog('外参标定中（stereoCalibrate，固定内参）…');
-  el('c-stereo').disabled = true;
-  try {
-    const r = await api('/api/calib/stereo', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ auto_flip: true })
-    });
-    cLog(`外参：RMS=${r.rms_px}px  基线=${(r.baseline_m * 1000).toFixed(2)}mm  `
-       + `相对旋转=${r.checks.rotation_angle_deg}°  帧对=${r.num_pairs}`
-       + (r.flip_b ? '  [已翻转相机1角点顺序]' : ''));
-    cLog(`  约定 ${r.convention}，T 单位 ${r.T_unit}`);
-    cLog(`  T_10 = [${r.T_10.map(v => v.toFixed(6)).join(', ')}] m`);
-    cLog(`  极线中位=${r.epipolar.median_px}px  三角化中位=${r.triangulation.median_px}px`);
-    cLog(`  旋转正交误差=${r.checks.orthogonality_error}  det=${r.checks.determinant}`);
-    if (r.known_distance && r.known_distance.mean_error_mm !== undefined) {
-      cLog(`  已知间距误差 mean=${r.known_distance.mean_error_mm}mm `
-         + `(${r.known_distance.mean_relative_error_pct}%)`);
-    }
-    (r.warnings || []).forEach(w => cLog('  ! ' + w));
-    (r.search && r.search.attempts ? r.search.attempts : []).forEach(a => {
-      cLog(`  尝试 flip_b=${a.flip_b} → rms=${a.rms_px}px in_front=${a.in_front_ratio}`);
-    });
-    refreshCalib();
-  } catch (e) { cLog('外参标定失败：' + e.message); }
-  finally { el('c-stereo').disabled = false; }
 };
 
 el('c-view').onclick = async () => {
@@ -752,35 +795,52 @@ el('c-view').onclick = async () => {
   }
 };
 
-el('c-cover').onclick = async () => {
+// ---- 世界系外参（固定板 + solvePnP）：一次采两台相机的同一对同步帧 ----
+el('c-ex-pair').onclick = async () => {
+  el('c-ex-pair').disabled = true;
+  cBadge('c-exmsg', '正在采集同步帧…');
+  cLog('采集双相机图片：正在取同步帧对并检测两台相机的棋盘格…');
   try {
-    const r = await api('/api/calib/coverage?camera=0');
-    cLog('角点覆盖（相机0）：覆盖格子比例 '
-       + (100 * r.covered_ratio).toFixed(0) + '%，命中 ' + r.corner_hits + ' 次');
-    const max = Math.max(1, ...r.heat.flat());
-    r.heat.forEach(row => {
-      cLog('  ' + row.map(v => String(v).padStart(4)).join(''));
+    const r = await api('/api/calib/capture/extrinsic-pair', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
-    cLog('  ' + r.suggestion + `（每格最大 ${max} 次）`);
-  } catch (err) { cLog('覆盖检查失败：' + err.message); }
+    cLog(r.message);
+    let warned = false;
+    Object.entries(r.cameras || {}).forEach(([cam, c]) => {
+      if (c.ok) {
+        const q = c.quality || {};
+        cLog(`  相机 ${cam}：角点边距 ${q.mean_edge_px}px  覆盖 `
+           + `${(100 * (q.coverage || 0)).toFixed(1)}%  清晰度 ${q.sharpness}`);
+        if (c.warning) { warned = true; cLog(`  ! 相机 ${cam}：${c.warning}`); }
+      } else {
+        cLog(`  相机 ${cam} 未计入有效样本：${c.reason}`);
+      }
+    });
+    if (r.ok && warned) {
+      cBadge('c-exmsg', '两台均有效（覆盖率偏低，已告警）', 'warn',
+             Object.values(r.cameras || {}).map(c => c.warning).filter(Boolean).join('；'));
+    } else if (r.ok) {
+      cBadge('c-exmsg', '两台相机均有效', 'ok');
+    } else {
+      const why = Object.entries(r.cameras || {})
+        .filter(([, c]) => !c.ok)
+        .map(([cam, c]) => `相机${cam}：${c.reason}`).join('；');
+      const short = why || '未计入有效样本';
+      cBadge('c-exmsg', short.length > 72 ? short.slice(0, 72) + '…' : short,
+             'err', short);
+    }
+    // 重新采集外参图像后，之前的世界坐标轴方向确认作废
+    cConfirmSuppressed = true;
+    el('c-confirmed').checked = false;
+    if (r.caveat) cLog('  说明：' + r.caveat);
+    refreshCalib();
+  } catch (e) {
+    cBadge('c-exmsg', '采集失败：' + e.message, 'err');
+    cLog('采集双相机图片失败：' + e.message);
+    cLog('  提示：确认已打开会话、两台相机在 streaming，且顶部「配对率」不是 0');
+    console.error('extrinsic pair capture error', e);
+  } finally { el('c-ex-pair').disabled = false; }
 };
-
-// ---- 世界系外参（固定板 + solvePnP）----
-[['c-ex0', 0], ['c-ex1', 1]].forEach(([id, cam]) => {
-  el(id).onclick = async () => {
-    el(id).disabled = true;
-    try {
-      const r = await api('/api/calib/capture/extrinsic', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ camera: cam })
-      });
-      cLog(r.message);
-      if (!r.ok) cLog('  原因：' + r.reason);
-      refreshCalib();
-    } catch (e) { cLog('采外参图失败：' + e.message); }
-    finally { el(id).disabled = false; }
-  };
-});
 
 el('c-solex').onclick = async () => {
   const flipCam = { 0: el('c-flip0').checked, 1: el('c-flip1').checked };
@@ -805,11 +865,17 @@ el('c-solex').onclick = async () => {
     cLog(`  T_10 = [${r.relative.T_10.map(v => v.toFixed(6)).join(', ')}] m`);
     (r.warnings || []).forEach(w => cLog('  ! ' + w));
     (r.stability ? Object.entries(r.stability) : []).forEach(([k, s]) => {
-      cLog(`  相机 ${k} 帧间抖动：中心 σ=${(s.centre_std_m * 1000).toFixed(3)}mm `
-         + `最大偏离 ${(s.centre_range_m * 1000).toFixed(3)}mm（${s.frames} 帧，`
-         + `用第 ${s.used_frame_index} 帧）`);
+      if (s.centre_std_m === null || s.centre_std_m === undefined) {
+        cLog(`  相机 ${k} 帧间抖动：${s.note || '只有 1 帧，不计算标准差'}`);
+      } else {
+        cLog(`  相机 ${k} 帧间抖动：中心 σ=${(s.centre_std_m * 1000).toFixed(3)}mm `
+           + `最大偏离 ${(s.centre_range_m * 1000).toFixed(3)}mm（${s.frames} 帧，`
+           + `用第 ${s.used_frame_index} 帧）`);
+      }
     });
     cLog('  · ' + (r.caveat || ''));
+    cConfirmSuppressed = false;
+    el('c-confirmed').checked = r.orientation_confirmed === true;
     refreshCalib();
   } catch (e) { cLog('解外参失败：' + e.message); }
   finally { el('c-solex').disabled = false; }
@@ -818,50 +884,141 @@ el('c-solex').onclick = async () => {
 ['c-flip0', 'c-flip1'].forEach((id, cam) => {
   el(id).onchange = () => {
     const on = el(id).checked;
-    cLog(`相机 ${cam} 反向 180° = ${on}：单翻一台会改变基线，请用「世界轴叠加」逐台核对`);
-    if (el('c-axes').checked) startCalibLive();
+    // 改了任一相机的 180° 方向，之前的“已确认”立即失效
+    cConfirmSuppressed = true;
+    el('c-confirmed').checked = false;
+    cLog(`相机 ${cam} 反向 180° = ${on}：单翻一台会改变基线，`
+       + `请切到「世界坐标轴可视化」逐台核对；方向确认已取消`);
+    if (el('c-vis-mode').value === 'axes') liveTick();
   };
 });
 
 el('c-confirmed').onchange = () => {
-  cLog(`方向已人工确认 = ${el('c-confirmed').checked}（需先看轴叠加：X 轴须沿 12 格长边）`);
+  const on = el('c-confirmed').checked;
+  cConfirmSuppressed = !on;
+  cLog(`世界坐标轴方向已人工确认 = ${on}`
+     + `（需先看世界坐标轴可视化：X 轴须沿 12 格长边）`);
 };
 
-el('c-axes').onchange = () => {
-  if (el('c-axes').checked) {
-    if (!el('c-live').checked) { el('c-live').checked = true; }
-    cLog('开启世界轴叠加：X 红 / Y 绿 / Z 蓝，原点为图案中心，0 号角点红圈');
-    startCalibLive();
-  } else if (!el('c-live').checked) {
-    stopCalibLive();
-  } else {
-    startCalibLive();
+el('c-vis-mode').onchange = () => {
+  const names = { none: '无可视化（普通相机画面）',
+                  corners: '棋盘格角点可视化',
+                  axes: '世界坐标轴可视化（X 红 / Y 绿 / Z 蓝）' };
+  cLog('可视化模式：' + (names[el('c-vis-mode').value] || el('c-vis-mode').value));
+  updateFigCaptions();
+  liveTick();
+};
+
+// ---- 三维定位精度验证：采集 + 自动验证 / 仅重新计算 ----
+function validationSummary(r) {
+  if (!r || !r.aggregate) return '尚无可用的验证结果';
+  const a = r.aggregate, sp = a.spacing_abs_error_mm || {};
+  const per = r.per_placement || [];
+  const latest = per.length ? per[per.length - 1] : null;
+  const lines = [];
+  lines.push(`汇总：${a.placements} 个有效验证位置`);
+  lines.push(`  重投影 mean ${a.reprojection_rms_px.mean} px · max ${a.reprojection_rms_px.max} px`);
+  lines.push(`  极线中位 mean ${a.epipolar_median_px.mean} px`);
+  lines.push(`  网格间距（${sp.expected_spacing_mm} mm）误差 mean ${sp.mean} mm · `
+            + `p95 ${sp.p95} mm · max ${sp.max} mm`);
+  const plan = per.map(p => p.planarity_rms_mm);
+  if (plan.length) lines.push(`  平面度 max ${Math.max(...plan).toFixed(4)} mm`);
+  if (latest) {
+    lines.push('');
+    lines.push(`最新一组：${latest.id}`);
+    lines.push(`  重投影 ${latest.reprojection_rms_px} px · 间距 `
+              + `${latest.spacing_mean_abs_error_mm} mm · 平面度 `
+              + `${latest.planarity_rms_mm} mm · 极线 ${latest.epipolar_median_px} px`);
   }
+  return lines.join('\n');
+}
+
+function renderValidation(r) {
+  cValidation = r || null;
+  const out = el('c-val-out');
+  const per = (r && r.per_placement) || [];
+  const agg = (r && r.aggregate) || null;
+  const tag = el('c-val-tag');
+  if (!agg) {
+    out.innerHTML = '<div class="val-card"><h4>三维精度验证</h4>'
+      + '把标定板挪到其它位置/高度后点「采集并验证三维精度」。'
+      + '</div>';
+    tag.textContent = '验证 —';
+    tag.className = 'badge';
+    return;
+  }
+  tag.textContent = `${agg.placements} 个位置 · 重投影 ${agg.reprojection_rms_px.mean}px · `
+    + `间距 ${agg.spacing_abs_error_mm.mean}mm`;
+  tag.className = 'badge ' + (agg.placements >= 3 ? 'ok' : '');
+
+  const latest = per.length ? per[per.length - 1] : null;
+  const history = per.slice(0, -1).reverse();
+  let html = '<div class="val-card"><h4>汇总</h4>' + escapeHtml(validationSummary(r)) + '</div>';
+  html += '<div class="val-card"><h4>最新一组 / 历史</h4>';
+  if (latest) {
+    html += escapeHtml(`最新 ${latest.id}：重投影 ${latest.reprojection_rms_px} px · `
+      + `间距 ${latest.spacing_mean_abs_error_mm} mm · 平面度 ${latest.planarity_rms_mm} mm · `
+      + `极线 ${latest.epipolar_median_px} px · Δt ${latest.dt_ms} ms\n`);
+  }
+  if (history.length) {
+    html += escapeHtml(history.map(p =>
+      `${p.id}：重投影 ${p.reprojection_rms_px} px · 间距 ${p.spacing_mean_abs_error_mm} mm · `
+      + `平面度 ${p.planarity_rms_mm} mm · 极线 ${p.epipolar_median_px} px`
+    ).join('\n'));
+  } else {
+    html += '（暂无更早的验证记录）';
+  }
+  html += '</div>';
+  out.innerHTML = html;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, ch => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[ch]);
+}
+
+el('c-val-capture').onclick = async () => {
+  el('c-val-capture').disabled = true;
+  cLog('采集并验证三维精度：取同步帧对 → 入库 → 三角化…');
+  try {
+    const r = await api('/api/calib/validate/capture', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
+    });
+    const cap = r.capture || {};
+    cLog(cap.message || (r.ok ? '采集成功' : '采集失败'));
+    if (cap.reason) cLog('  原因：' + cap.reason);
+    if (cap.warning) cLog('  ! ' + cap.warning);
+    if (cap.caveat) cLog('  说明：' + cap.caveat);
+    if (r.validation) {
+      renderValidation(r.validation);
+      const a = r.validation.aggregate;
+      cLog(`本次验证完成：${a.placements} 个有效位置，重投影 `
+         + `${a.reprojection_rms_px.mean}px，间距误差 ${a.spacing_abs_error_mm.mean}mm，`
+         + `平面度 max ${Math.max(...r.validation.per_placement.map(
+              p => p.planarity_rms_mm))}mm`);
+    }
+    if (r.validation_error) cLog('验证未执行/失败：' + r.validation_error);
+    refreshCalib();
+  } catch (e) {
+    cLog('采集并验证失败：' + e.message);
+  } finally { el('c-val-capture').disabled = false; }
 };
 
-el('c-valrig').onclick = async () => {
-  cLog('独立验证中（需要 validation 阶段的同步帧对）…');
-  el('c-valrig').disabled = true;
+el('c-val-recalc').onclick = async () => {
+  el('c-val-recalc').disabled = true;
+  cLog('重新计算验证：复用已保存的 validation 帧对，不重新采集…');
   try {
     const r = await api('/api/calib/validate/rig', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
+    renderValidation(r);
     const a = r.aggregate;
-    cLog(`验证：${a.placements} 个位置/高度`);
-    cLog(`  重投影 mean ${a.reprojection_rms_px.mean}px  max ${a.reprojection_rms_px.max}px`);
-    cLog(`  极线   mean ${a.epipolar_median_px.mean}px`);
-    cLog(`  网格间距（${a.spacing_abs_error_mm.expected_spacing_mm}mm）误差 `
-       + `mean ${a.spacing_abs_error_mm.mean}mm  p95 ${a.spacing_abs_error_mm.p95}mm  `
-       + `max ${a.spacing_abs_error_mm.max}mm`);
-    cLog(`  板心高度范围 ${a.centre_z_range_m[0]} ~ ${a.centre_z_range_m[1]} m`);
-    (r.per_placement || []).forEach(p => {
-      cLog(`   ${p.id}  重投影 ${p.reprojection_rms_px}px  间距误差 `
-         + `${p.spacing_mean_abs_error_mm}mm  平面度 ${p.planarity_rms_mm}mm  `
-         + `z=${p.centre_world_m[2]}`);
-    });
+    cLog(`重新计算完成：${a.placements} 个位置，重投影 ${a.reprojection_rms_px.mean}px，`
+       + `间距误差 ${a.spacing_abs_error_mm.mean}mm`);
     (r.notes || []).forEach(n => cLog('  · ' + n));
-  } catch (e) { cLog('独立验证失败：' + e.message); }
-  finally { el('c-valrig').disabled = false; }
+    refreshCalib();
+  } catch (e) { cLog('重新计算失败：' + e.message); }
+  finally { el('c-val-recalc').disabled = false; }
 };
 
 el('c-save').onclick = async () => {
@@ -878,38 +1035,54 @@ el('c-save').onclick = async () => {
   } catch (e) { cLog('保存失败：' + e.message); }
 };
 
-// ---- 实时检测叠加 ----
-function startCalibLive() {
-  if (cLiveTimer) return;
-  const tick = async () => {
-    if (cLiveBusy) return;
-    cLiveBusy = true;
-    try {
-      for (const cam of CAMERAS) {
-        const img = el('c-img' + cam);
-        if (!img) continue;
-        const axes = el('c-axes').checked;
-        const flip = el(cam === 0 ? 'c-flip0' : 'c-flip1').checked ? 1 : 0;
-        const qs = `camera=${cam}&scale=0.55&t=${Date.now()}`;
-        const feed = axes ? `/api/calib/extrinsic/overlay?${qs}&flip180=${flip}`
-                          : `/api/calib/live?${qs}`;
-        let r = await fetch(apiUrl(feed), { cache: 'no-store' });
-        if (!r.ok && axes) {          // 没内参时退回普通检测叠加
-          r = await fetch(apiUrl(`/api/calib/live?${qs}`), { cache: 'no-store' });
-        }
-        if (!r.ok) { img.removeAttribute('src'); continue; }
-        const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        const old = cLiveUrl[cam];
-        img.src = url;
-        cLiveUrl[cam] = url;
-        if (old) setTimeout(() => URL.revokeObjectURL(old), 700);
+// ---- 可视化模式：无 / 角点 / 世界坐标轴（每 0.9 s 取一次图）----
+const VIS_NAMES = { none: '普通画面', corners: '角点检测', axes: '世界坐标轴' };
+
+function updateFigCaptions() {
+  const mode = el('c-vis-mode') ? el('c-vis-mode').value : 'none';
+  CAMERAS.forEach(cam => {
+    const cap = el('c-cc' + cam);
+    if (cap) cap.textContent = `相机 ${cam} · ${VIS_NAMES[mode] || mode}`;
+  });
+}
+
+async function liveTick() {
+  if (cLiveBusy) return;
+  cLiveBusy = true;
+  const mode = el('c-vis-mode') ? el('c-vis-mode').value : 'none';
+  try {
+    for (const cam of CAMERAS) {
+      const img = el('c-img' + cam);
+      if (!img) continue;
+      const flip = el(cam === 0 ? 'c-flip0' : 'c-flip1').checked ? 1 : 0;
+      const qs = `camera=${cam}&scale=0.55&t=${Date.now()}`;
+      let feed;
+      if (mode === 'axes') feed = `/api/calib/extrinsic/overlay?${qs}&flip180=${flip}`;
+      else if (mode === 'corners') feed = `/api/calib/live?${qs}`;
+      else feed = `/api/camera/${cam}/snapshot?t=${Date.now()}`;   // 普通画面
+
+      let r = await fetch(apiUrl(feed), { cache: 'no-store' });
+      if (!r.ok && mode === 'axes') {
+        // 还没解内参/外参时看不到世界轴：退回角点检测，保持可用的画面
+        r = await fetch(apiUrl(`/api/calib/live?${qs}`), { cache: 'no-store' });
       }
-    } catch (e) { /* 相机没开就静默 */ }
-    finally { cLiveBusy = false; }
-  };
-  cLiveTimer = setInterval(tick, 900);
-  tick();
+      if (!r.ok) { img.removeAttribute('src'); continue; }
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const old = cLiveUrl[cam];
+      img.src = url;
+      cLiveUrl[cam] = url;
+      if (old) setTimeout(() => URL.revokeObjectURL(old), 700);
+    }
+  } catch (e) { /* 相机没开就静默 */ }
+  finally { cLiveBusy = false; }
+}
+
+function startCalibLive() {
+  updateFigCaptions();
+  if (cLiveTimer) return;
+  cLiveTimer = setInterval(liveTick, 900);
+  liveTick();
 }
 
 function stopCalibLive() {
@@ -920,135 +1093,360 @@ function stopCalibLive() {
   });
 }
 
-el('c-live').onchange = () => {
-  if (el('c-live').checked) {
-    cLog('开启实时检测叠加（每 0.9s 检测一次，会占用一些 CPU）');
-    startCalibLive();
-  } else stopCalibLive();
+// ================= 三维世界视图（Canvas 2D 透视投影，Z 向上） =================
+// 世界系：X 沿 12 格长边、Y 沿 9 格短边、Z 向上（右手）。这里不使用 Three.js
+// 默认的 Y-up 约定，所有几何都在项目的 Z-up 世界系里计算，再做透视投影。
+const scene = {
+  az: -2.2, el: 0.56, dist: 3.0, target: [0, 0, 0],
+  drag: null, lastX: 0, lastY: 0, view: null,
+  lastStatus: null, autoKey: '', userMoved: false,
 };
 
-// ---- 相机位姿俯视图（世界 X-Y 平面，Z 向上）----
-function drawMap(st) {
-  const cv = el('c-map');
-  if (!cv) return;
-  const g = cv.getContext('2d');
-  const W = cv.width, H = cv.height;
-  g.clearRect(0, 0, W, H);
-  g.fillStyle = '#ffffff'; g.fillRect(0, 0, W, H);
+const vAdd = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+const vSub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const vMul = (a, s) => [a[0] * s, a[1] * s, a[2] * s];
+const vDot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const vCross = (a, b) => [a[1] * b[2] - a[2] * b[1],
+                          a[2] * b[0] - a[0] * b[2],
+                          a[0] * b[1] - a[1] * b[0]];
+const vLen = (a) => Math.hypot(a[0], a[1], a[2]);
+const vNorm = (a) => { const n = vLen(a) || 1; return [a[0] / n, a[1] / n, a[2] / n]; };
+const clampNum = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
 
+function sceneBoard(st) {
+  const s = st && st.session;
+  const b = s && s.board;
+  const wf = b && b.world_frame;
+  const squares = (b && b.squares) || [12, 9];
+  const sx = (wf && wf.board_extent_x_m) || (b ? b.square_m * squares[0] : 0.36);
+  const sy = (wf && wf.board_extent_y_m) || (b ? b.square_m * squares[1] : 0.27);
+  return {
+    sx, sy, squares,
+    floorZ: (wf && wf.floor_z_m !== undefined) ? wf.floor_z_m : 0,
+    hasSession: !!s,
+  };
+}
+
+function sceneCams(st) {
   const ex = st && st.extrinsic;
-  const sess = st && st.session;
-  const wf = (sess && sess.board && sess.board.world_frame) || null;
-  const bw = (wf && wf.board_extent_x_m) || 0.36;
-  const bh = (wf && wf.board_extent_y_m) || 0.27;
-
-  const xs = [-bw / 2, bw / 2], ys = [-bh / 2, bh / 2];
-  const cams = [];
+  const intr = (st && st.intrinsics) || {};
+  const size = (st && st.session && st.session.image_size) || [1280, 720];
+  const out = [];
   if (ex && ex.cameras) {
     Object.entries(ex.cameras).forEach(([k, c]) => {
-      const pos = c.centre_m || [0, 0, 0];
-      cams.push({ k, x: pos[0], y: pos[1], z: pos[2], ax: c.optical_axis || [0, 0, -1],
-                  rms: c.reprojection_rms_px, corr: c.correspondence,
-                  h: c.height_above_floor_m });
-      xs.push(pos[0]); ys.push(pos[1]);
+      const f = (intr[k] && intr[k].focal_px) || [900, 900];
+      out.push({
+        k, C: c.centre_m || [0, 0, 0], R: c.R_cam_to_world || null,
+        fx: f[0] || 900, fy: f[1] || 900,
+        imgW: size[0] || 1280, imgH: size[1] || 720,
+        rms: c.reprojection_rms_px,
+        height: c.height_above_floor_m,
+      });
     });
   }
-  const minX = Math.min(...xs), maxX = Math.max(...xs);
-  const minY = Math.min(...ys), maxY = Math.max(...ys);
-  const spanX = Math.max(maxX - minX, 0.6), spanY = Math.max(maxY - minY, 0.6);
-  const pad = 52;
-  const sc = Math.min((W - 2 * pad) / spanX, (H - 2 * pad) / spanY);
-  const cx = (minX + maxX) / 2, cy = (minY + maxY) / 2;
-  const toC = (x, y) => [W / 2 + (x - cx) * sc, H / 2 - (y - cy) * sc];
+  return out;
+}
 
-  // 1m 网格
-  g.strokeStyle = '#f0f3f7'; g.lineWidth = 1;
-  const step = 0.5;
-  const gx0 = Math.floor(minX / step) * step, gx1 = Math.ceil(maxX / step) * step;
-  const gy0 = Math.floor(minY / step) * step, gy1 = Math.ceil(maxY / step) * step;
-  for (let x = gx0; x <= gx1 + 1e-9; x += step) {
-    const a = toC(x, gy0), b = toC(x, gy1);
-    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+function sceneBounds(cams, board) {
+  let r = Math.max(board.sx, board.sy) * 0.75;
+  cams.forEach(c => { r = Math.max(r, vLen(c.C)); });
+  return Math.max(0.6, r);
+}
+
+function resetScene(st) {
+  const board = sceneBoard(st), cams = sceneCams(st);
+  const r = sceneBounds(cams, board);
+  scene.target = [0, 0, 0.15];
+  if (cams.length) {
+    const avg = [0, 0, 0];
+    cams.forEach(c => { avg[0] += c.C[0]; avg[1] += c.C[1]; avg[2] += c.C[2]; });
+    avg[0] /= cams.length; avg[1] /= cams.length; avg[2] /= cams.length;
+    scene.target = [avg[0] * 0.5, avg[1] * 0.5, Math.max(0.1, avg[2] * 0.35)];
   }
-  for (let y = gy0; y <= gy1 + 1e-9; y += step) {
-    const a = toC(gx0, y), b = toC(gx1, y);
-    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+  scene.dist = clampNum(r * 2.4, 1.2, 14);
+  scene.az = -2.2;
+  scene.el = 0.56;
+}
+
+function buildSceneView(W, H) {
+  const cp = Math.cos(scene.el), sp = Math.sin(scene.el);
+  const eye = [
+    scene.target[0] + scene.dist * cp * Math.cos(scene.az),
+    scene.target[1] + scene.dist * cp * Math.sin(scene.az),
+    scene.target[2] + scene.dist * sp,
+  ];
+  const forward = vNorm(vSub(scene.target, eye));
+  let right, up;
+  if (Math.abs(forward[2]) > 0.9999) {      // 俯视：屏幕 X 向右、Y 向上
+    right = [1, 0, 0]; up = [0, 1, 0];
+  } else {
+    right = vNorm(vCross([0, 0, 1], forward));
+    up = vCross(forward, right);
+  }
+  const focal = (H / 2) / Math.tan(45 * Math.PI / 360);   // 45° 垂直视场
+  const project = (p) => {
+    const d = vSub(p, eye);
+    const z = vDot(d, forward);
+    if (z <= 1e-4) return null;
+    return { x: W / 2 + focal * vDot(d, right) / z,
+             y: H / 2 - focal * vDot(d, up) / z, z };
+  };
+  return { eye, forward, right, up, focal, W, H, project };
+}
+
+function line3(ctx, view, a, b, color, width, dash) {
+  const p = view.project(a), q = view.project(b);
+  if (!p || !q) return;
+  ctx.save();
+  ctx.strokeStyle = color; ctx.lineWidth = width || 1;
+  if (dash) ctx.setLineDash(dash);
+  ctx.beginPath(); ctx.moveTo(p.x, p.y); ctx.lineTo(q.x, q.y); ctx.stroke();
+  ctx.restore();
+}
+
+function quad3(ctx, view, pts, fill, stroke, width) {
+  const ps = pts.map(view.project);
+  if (ps.some(p => !p)) return;
+  ctx.beginPath();
+  ctx.moveTo(ps[0].x, ps[0].y);
+  for (let i = 1; i < ps.length; i++) ctx.lineTo(ps[i].x, ps[i].y);
+  ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = width || 1; ctx.stroke(); }
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y);
+  ctx.arcTo(x + w, y, x + w, y + h, r);
+  ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r);
+  ctx.arcTo(x, y, x + w, y, r);
+  ctx.closePath();
+}
+
+function drawText3(ctx, view, p, lines, color) {
+  const q = view.project(p);
+  if (!q) return;
+  const x = clampNum(q.x + 12, 6, view.W - 200);
+  const y = clampNum(q.y - 12, 8, view.H - 46);
+  ctx.save();
+  ctx.font = '11px ui-monospace, Consolas, monospace';
+  let w = 0;
+  lines.forEach(l => { w = Math.max(w, ctx.measureText(l).width); });
+  const pad = 5, lh = 13.5;
+  roundRectPath(ctx, x, y, w + pad * 2, lines.length * lh + pad * 2 - 2, 5);
+  ctx.fillStyle = 'rgba(13, 17, 23, 0.86)';
+  ctx.fill();
+  ctx.strokeStyle = color; ctx.globalAlpha = 0.55; ctx.stroke(); ctx.globalAlpha = 1;
+  ctx.fillStyle = color;
+  lines.forEach((l, i) => ctx.fillText(l, x + pad, y + pad + 10.5 + i * lh));
+  ctx.restore();
+}
+
+function drawCamera3(ctx, view, cam) {
+  const color = cam.k === '0' ? '#4f8cff' : '#c084fc';
+  const xA = cam.R ? [cam.R[0][0], cam.R[1][0], cam.R[2][0]] : [1, 0, 0];
+  const yA = cam.R ? [cam.R[0][1], cam.R[1][1], cam.R[2][1]] : [0, 1, 0];
+  const zA = cam.R ? [cam.R[0][2], cam.R[1][2], cam.R[2][2]] : [0, 0, -1];
+  const d = 0.28;
+  const tanX = (cam.imgW / 2) / cam.fx;
+  const tanY = (cam.imgH / 2) / cam.fy;
+  const corner = (sx, sy) => vAdd(cam.C, vAdd(vAdd(
+      vMul(xA, sx * tanX * d), vMul(yA, sy * tanY * d)), vMul(zA, d)));
+  const c1 = corner(-1, -1), c2 = corner(1, -1), c3 = corner(1, 1), c4 = corner(-1, 1);
+
+  // 视锥体：四条射线 + 远端矩形，方向/宽高比来自真实外参与内参
+  [c1, c2, c3, c4].forEach(c => line3(ctx, view, cam.C, c, color, 1.15));
+  quad3(ctx, view, [c1, c2, c3, c4], 'rgba(200, 210, 225, 0.05)', color, 1.2);
+
+  // 相机本体：光心处一个与像平面平行的小方框 + 光轴短线段
+  const b1 = vAdd(cam.C, vAdd(vMul(xA, 0.035), vMul(yA, 0.025)));
+  const b2 = vAdd(cam.C, vAdd(vMul(xA, -0.035), vMul(yA, 0.025)));
+  const b3 = vAdd(cam.C, vAdd(vMul(xA, -0.035), vMul(yA, -0.025)));
+  const b4 = vAdd(cam.C, vAdd(vMul(xA, 0.035), vMul(yA, -0.025)));
+  quad3(ctx, view, [b1, b2, b3, b4], color, '#0d1117', 1);
+  line3(ctx, view, cam.C, vAdd(cam.C, vMul(zA, -0.06)), color, 2);
+
+  const C = cam.C || [0, 0, 0];
+  const height = (cam.height === null || cam.height === undefined) ? 0 : cam.height;
+  const rms = (cam.rms === null || cam.rms === undefined) ? '—' : cam.rms;
+  drawText3(ctx, view, cam.C, [
+    `cam${cam.k}  [${C.map(v => v.toFixed(3)).join(', ')}] m`,
+    `离地 ${height.toFixed(3)} m · 重投影 ${rms} px`,
+  ], color);
+}
+
+function drawScene3D(st) {
+  scene.lastStatus = st;
+  const cv = el('c-scene');
+  if (!cv) return;
+  const rect = cv.getBoundingClientRect();
+  if (rect.width < 10 || rect.height < 10) return;   // 面板收起时不绘制
+  const W = Math.max(320, rect.width || 640);
+  const H = Math.max(260, rect.height || 430);
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
+    cv.width = Math.round(W * dpr);
+    cv.height = Math.round(H * dpr);
+  }
+  const ctx = cv.getContext('2d');
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, W, H);
+
+  const board = sceneBoard(st);
+  const cams = sceneCams(st);
+  const key = cams.map(c => c.C.map(v => v.toFixed(3)).join(',')).join('|');
+  if (key && key !== scene.autoKey && !scene.userMoved) {
+    resetScene(st); scene.autoKey = key;
+  }
+  if (!key) scene.autoKey = '';
+  const view = buildSceneView(W, H);
+  scene.view = view;
+
+  // 背景
+  const bg = ctx.createLinearGradient(0, 0, 0, H);
+  bg.addColorStop(0, '#111722'); bg.addColorStop(1, '#0a0d13');
+  ctx.fillStyle = bg; ctx.fillRect(0, 0, W, H);
+
+  // 水平地面网格（位于 floor_z）
+  const extent = clampNum(sceneBounds(cams, board) * 1.25, 1.0, 4.0);
+  const step = extent > 1.8 ? 0.5 : 0.25;
+  const n = Math.ceil(extent / step);
+  const zf = board.floorZ;
+  for (let i = -n; i <= n; i++) {
+    const world = i * step;
+    const major = Math.abs(world - Math.round(world)) < 1e-9;
+    const col = major ? '#334155' : '#1e293b';
+    line3(ctx, view, [-extent, world, zf], [extent, world, zf], col, major ? 1.0 : 0.7);
+    line3(ctx, view, [world, -extent, zf], [world, extent, zf], col, major ? 1.0 : 0.7);
   }
 
-  // 标定板
-  const p0 = toC(-bw / 2, -bh / 2), p1 = toC(bw / 2, bh / 2);
-  g.fillStyle = '#eef2f7'; g.strokeStyle = '#9aa3b2'; g.lineWidth = 1.5;
-  g.fillRect(p0[0], p1[1], p1[0] - p0[0], p0[1] - p1[1]);
-  g.strokeRect(p0[0], p1[1], p1[0] - p0[0], p0[1] - p1[1]);
-  // 板内 12×9 方格纹理示意
-  g.strokeStyle = '#dfe6ee'; g.lineWidth = 0.6;
-  for (let i = 1; i < 12; i++) {
-    const x = -bw / 2 + (bw / 12) * i;
-    const a = toC(x, -bh / 2), b = toC(x, bh / 2);
-    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
+  // 棋盘格：12×9 方格，贴在 Z=0 的图案表面（世界原点在图案中心）
+  const sx = board.sx, sy = board.sy;
+  const nx = board.squares[0], ny = board.squares[1];
+  const cw = sx / nx, ch = sy / ny;
+  quad3(ctx, view, [[-sx / 2, -sy / 2, 0], [sx / 2, -sy / 2, 0],
+                    [sx / 2, sy / 2, 0], [-sx / 2, sy / 2, 0]], '#161b24');
+  for (let i = 0; i < nx; i++) {
+    for (let j = 0; j < ny; j++) {
+      const x0 = -sx / 2 + i * cw, y0 = -sy / 2 + j * ch;
+      quad3(ctx, view, [[x0, y0, 0], [x0 + cw, y0, 0],
+                        [x0 + cw, y0 + ch, 0], [x0, y0 + ch, 0]],
+            (i + j) % 2 === 0 ? '#d7dce3' : '#2a303a');
+    }
   }
-  for (let j = 1; j < 9; j++) {
-    const y = -bh / 2 + (bh / 9) * j;
-    const a = toC(-bw / 2, y), b = toC(bw / 2, y);
-    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
-  }
+  quad3(ctx, view, [[-sx / 2, -sy / 2, 0], [sx / 2, -sy / 2, 0],
+                    [sx / 2, sy / 2, 0], [-sx / 2, sy / 2, 0]], null, '#8b98a8', 1.2);
 
-  // 世界原点 + X/Y 轴
-  const o = toC(0, 0);
-  const axl = Math.max(bw, bh) * 0.55;
-  [[axl, 0, '#dc2626', 'X'], [0, axl, '#16a34a', 'Y']].forEach(([dx, dy, col, nm]) => {
-    const q = toC(dx, dy);
-    g.strokeStyle = col; g.lineWidth = 2;
-    g.beginPath(); g.moveTo(o[0], o[1]); g.lineTo(q[0], q[1]); g.stroke();
-    g.fillStyle = col; g.font = '600 12px Consolas, monospace';
-    g.fillText(nm, q[0] + 4, q[1] - 4);
+  // 世界坐标轴：X 红 / Y 绿 / Z 蓝
+  const axisLen = Math.max(0.16, Math.min(sx, sy) * 0.65);
+  [
+    { p: [axisLen, 0, 0], c: '#ef4444', n: 'X' },
+    { p: [0, axisLen, 0], c: '#22c55e', n: 'Y' },
+    { p: [0, 0, axisLen], c: '#3b82f6', n: 'Z' },
+  ].forEach(a => {
+    line3(ctx, view, [0, 0, 0], a.p, a.c, 2.4);
+    const q = view.project(a.p);
+    if (q) {
+      ctx.save(); ctx.fillStyle = a.c;
+      ctx.font = '600 12px ui-monospace, Consolas, monospace';
+      ctx.fillText(a.n, q.x + 5, q.y - 4); ctx.restore();
+    }
   });
-  g.fillStyle = '#eab308';
-  g.beginPath(); g.arc(o[0], o[1], 4, 0, Math.PI * 2); g.fill();
-  g.fillStyle = '#6b7280'; g.font = '11px Consolas, monospace';
-  g.fillText('O', o[0] + 6, o[1] + 14);
+  const oq = view.project([0, 0, 0]);
+  if (oq) {
+    ctx.save();
+    ctx.fillStyle = '#facc15';
+    ctx.beginPath(); ctx.arc(oq.x, oq.y, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = '#e2e8f0'; ctx.font = '10px ui-monospace, Consolas, monospace';
+    ctx.fillText('O', oq.x + 6, oq.y + 12);
+    ctx.restore();
+  }
 
   // 基线
   if (cams.length === 2) {
-    const a = toC(cams[0].x, cams[0].y), b = toC(cams[1].x, cams[1].y);
-    g.strokeStyle = '#94a3b8'; g.setLineDash([5, 4]); g.lineWidth = 1.2;
-    g.beginPath(); g.moveTo(a[0], a[1]); g.lineTo(b[0], b[1]); g.stroke();
-    g.setLineDash([]);
-    if (ex.baseline_m) {
-      g.fillStyle = '#64748b'; g.font = '11px Consolas, monospace';
-      g.fillText((ex.baseline_m * 1000).toFixed(0) + ' mm',
-                 (a[0] + b[0]) / 2 + 6, (a[1] + b[1]) / 2 - 6);
-    }
+    line3(ctx, view, cams[0].C, cams[1].C, '#94a3b8', 1.4, [6, 5]);
+    const mid = vMul(vAdd(cams[0].C, cams[1].C), 0.5);
+    drawText3(ctx, view, mid, [
+      `基线 ${(vLen(vSub(cams[1].C, cams[0].C)) * 1000).toFixed(1)} mm`], '#cbd5e1');
   }
 
-  // 相机：三角形指向光轴在 X-Y 上的投影
-  cams.forEach((c) => {
-    const p = toC(c.x, c.y);
-    let dx = c.ax[0], dy = c.ax[1];
-    const n = Math.hypot(dx, dy) || 1;
-    dx /= n; dy /= n;
-    const ang = Math.atan2(-dy, dx);         // 画布 y 向下
-    g.save();
-    g.translate(p[0], p[1]); g.rotate(ang);
-    g.fillStyle = c.k === '0' ? '#2563eb' : '#7c3aed';
-    g.beginPath(); g.moveTo(12, 0); g.lineTo(-8, 7); g.lineTo(-8, -7); g.closePath(); g.fill();
-    g.restore();
-    g.fillStyle = '#1f2328'; g.font = '600 12px Consolas, monospace';
-    g.fillText('cam' + c.k + '  z=' + (c.h || 0).toFixed(2) + 'm', p[0] + 12, p[1] - 8);
-    if (c.rms != null) {
-      g.fillStyle = '#6b7280'; g.font = '10px Consolas, monospace';
-      g.fillText(c.rms.toFixed(3) + 'px', p[0] + 12, p[1] + 4);
-    }
-  });
+  // 相机与视锥体（远的先画）
+  cams.slice().sort((a, b) => {
+    const pa = view.project(a.C), pb = view.project(b.C);
+    return (pb ? pb.z : 0) - (pa ? pa.z : 0);
+  }).forEach(c => drawCamera3(ctx, view, c));
 
-  // 图例
-  g.fillStyle = '#6b7280'; g.font = '11px Microsoft YaHei, sans-serif';
-  g.fillText('俯视 X-Y 平面（Z 向上）· 0.5 m 网格', 10, H - 10);
-  if (!ex) {
-    g.fillStyle = '#b45309'; g.font = '12px Microsoft YaHei, sans-serif';
-    g.fillText('尚未解出外参：先采固定板图像并点「解外参 solvePnP」', 10, 18);
+  // 图例 / 等待提示
+  ctx.save();
+  ctx.font = '11px "Microsoft YaHei", sans-serif';
+  ctx.fillStyle = '#7c8da6';
+  ctx.fillText('世界系 Z 向上 · 棋盘格 12×9 · 左键旋转 / 滚轮缩放 / 右键平移',
+               12, H - 12);
+  if (!cams.length) {
+    ctx.font = '12px "Microsoft YaHei", sans-serif';
+    ctx.fillStyle = '#fbbf24';
+    ctx.fillText(board.hasSession
+      ? '尚未求得外参：先「采集双相机图片」，再「解外参 solvePnP」'
+      : '尚未打开标定会话：当前显示默认 360×270 mm 棋盘格占位',
+      12, 22);
   }
+  ctx.restore();
 }
+
+// ---- 三维视图交互 ----
+(function bindScene() {
+  const cv = el('c-scene');
+  if (!cv) return;
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+  cv.addEventListener('pointerdown', e => {
+    e.preventDefault();
+    cv.setPointerCapture(e.pointerId);
+    scene.drag = (e.button === 2) ? 'pan' : 'orbit';
+    scene.lastX = e.clientX; scene.lastY = e.clientY;
+  });
+  cv.addEventListener('pointermove', e => {
+    if (!scene.drag) return;
+    const dx = e.clientX - scene.lastX, dy = e.clientY - scene.lastY;
+    scene.lastX = e.clientX; scene.lastY = e.clientY;
+    scene.userMoved = true;
+    if (scene.drag === 'orbit') {
+      scene.az -= dx * 0.008;
+      scene.el = clampNum(scene.el - dy * 0.008, 0.02, Math.PI / 2 - 0.001);
+    } else {
+      const v = scene.view;
+      if (v) {
+        const H = v.H || 430;
+        const k = 2 * scene.dist * Math.tan(45 * Math.PI / 360) / H;
+        scene.target = vAdd(scene.target,
+          vAdd(vMul(v.right, -dx * k), vMul(v.up, dy * k)));
+      }
+    }
+    drawScene3D(scene.lastStatus);
+  });
+  const endDrag = () => { scene.drag = null; };
+  cv.addEventListener('pointerup', endDrag);
+  cv.addEventListener('pointercancel', endDrag);
+  cv.addEventListener('pointerleave', e => { if (scene.drag && e.buttons === 0) endDrag(); });
+  cv.addEventListener('wheel', e => {
+    e.preventDefault();
+    scene.dist = clampNum(scene.dist * Math.exp(e.deltaY * 0.001), 0.35, 20);
+    scene.userMoved = true;
+    drawScene3D(scene.lastStatus);
+  }, { passive: false });
+  el('c-reset-view').onclick = () => {
+    resetScene(scene.lastStatus); scene.userMoved = false;
+    drawScene3D(scene.lastStatus);
+  };
+  el('c-top-view').onclick = () => {
+    // 从世界 Z 正方向俯视（屏幕上 X 向右、Y 向上）
+    scene.az = 0; scene.el = Math.PI / 2 - 0.0008;
+    scene.userMoved = true;
+    drawScene3D(scene.lastStatus);
+  };
+  window.addEventListener('resize', () => drawScene3D(scene.lastStatus));
+})();
 
 
 async function refreshCalib() {
@@ -1056,19 +1454,27 @@ async function refreshCalib() {
     const st = await api('/api/calib/status');
     const s = st.session;
     const tag = el('c-sess');
+    const byp = (s && s.stats && s.stats.by_phase) || {};
     if (!s) {
       tag.textContent = '未打开会话';
       tag.className = 'badge';
+      el('c-n0').textContent = '0';
+      el('c-n1').textContent = '0';
+      el('c-nx0').textContent = '0';
+      el('c-nx1').textContent = '0';
+      el('c-np').textContent = '0';
     } else {
       tag.textContent = `${s.board.cols}×${s.board.rows} @ ${s.board.square_mm}mm · `
-                      + `${s.stats.total} 样本 · ${s.stats.stereo_valid} 帧对`;
+                      + `${s.stats.total} 样本`;
       tag.className = 'badge ok';
-      el('c-n0').textContent = (s.stats.single_valid['0'] || 0);
-      el('c-n1').textContent = (s.stats.single_valid['1'] || 0);
-      el('c-np').textContent = s.stats.stereo_valid;
-      const byp = s.stats.by_phase || {};
-      el('c-nx0').textContent = ((byp.extrinsic || {})['0'] || 0);
-      el('c-nx1').textContent = ((byp.extrinsic || {})['1'] || 0);
+      // 各阶段独立计数：内参 / 外参 / 验证，互不混算
+      const intr = byp.intrinsic || {};
+      const extr = byp.extrinsic || {};
+      el('c-n0').textContent = (intr['0'] || 0);
+      el('c-n1').textContent = (intr['1'] || 0);
+      el('c-nx0').textContent = (extr['0'] || 0);
+      el('c-nx1').textContent = (extr['1'] || 0);
+      el('c-np').textContent = (byp.validation_pairs || 0);
     }
     const i0 = st.intrinsics && st.intrinsics['0'];
     const i1 = st.intrinsics && st.intrinsics['1'];
@@ -1076,30 +1482,29 @@ async function refreshCalib() {
     it.textContent = (i0 && i1)
       ? `内参 RMS ${i0.rms_px} / ${i1.rms_px}px`
       : (i0 ? `内参 仅相机0 (${i0.rms_px}px)` : '内参 —');
-    it.className = 'badge ' + (i0 && i1 ? 'ok' : (i0 || i1 ? '' : ''));
-
-    const ex = st.stereo;
-    const etg = el('c-stereo-tag');
-    etg.textContent = ex
-      ? `双目标定 ${(ex.baseline_m * 1000).toFixed(1)}mm · ${ex.rms_px}px`
-      : '双目标定 —';
-    etg.className = 'badge ' + (ex ? 'ok' : '');
+    it.className = 'badge ' + (i0 && i1 ? 'ok' : '');
 
     const exr = st.extrinsic;
     const xtag = el('c-extag');
     if (exr) {
-      const okDir = exr.orientation_confirmed === true;
+      const okDir = exr.orientation_confirmed === true && !cConfirmSuppressed;
       xtag.textContent = `外参 基线 ${(exr.baseline_m * 1000).toFixed(1)}mm · `
                        + `自洽 ${(exr.consistency_max_mm).toFixed(1)}mm`
                        + (okDir ? ' · 方向已确认' : ' · 方向未确认');
       xtag.className = 'badge ' + (okDir ? 'ok' : 'err');
-      if (!el('c-confirmed').checked && okDir) el('c-confirmed').checked = true;
+      if (okDir && !cConfirmSuppressed) el('c-confirmed').checked = true;
     } else {
       xtag.textContent = '外参 —';
       xtag.className = 'badge';
     }
-    drawMap(st);
-  } catch (e) { /* 后端未连上时不打扰主界面 */ drawMap(null); }
+
+    renderValidation(st.validation || null);
+    drawScene3D(st);
+  } catch (e) {
+    /* 后端未连上时不打扰主界面 */
+    renderValidation(null);
+    drawScene3D(null);
+  }
 }
 
 setInterval(refreshCalib, 2000);

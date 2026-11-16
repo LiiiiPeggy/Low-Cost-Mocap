@@ -41,8 +41,8 @@ from calibration.board import BoardSpec, to_jsonable
 from calibration.intrinsic import D_from, K_from
 from calibration import stereo as st
 
-MIN_FRAMES = 3            # 单台相机至少几张图才能判外参稳定性
-RECOMMENDED_FRAMES = 8    # 建议张数（同一块固定板，多拍几张看抖动）
+MIN_FRAMES = 1            # 固定板 + 固定相机：一张图就足以 solvePnP
+RECOMMENDED_FRAMES = 3    # 可选多采几组观察位姿抖动，不强制
 
 
 # ---------------------------------------------------------------------------
@@ -425,18 +425,25 @@ def solve_rig(frames: dict, spec: BoardSpec, K0, D0, K1, D1, *,
         if p["points_in_front"] < 1.0:
             warn.append("相机 %d 有角点落在后方，位姿不可信" % cam)
 
-    # 帧间抖动：同一个静止位姿，多张图的差异反映检测/内参的随机性
+    # 帧间抖动：同一个静止位姿，多张图的差异反映检测/内参的随机性。
+    # 只有 1 帧时不输出“标准差 0”这种误导性数字，明确标成 None。
     jitter = {}
     for cam, plist in enumerate(poses):
         centres = np.array([p["camera_centre_world"] for _, p in plist])
-        jitter[str(cam)] = {
+        entry = {
             "frames": len(plist),
             "used_frame_index": plist[0][0],
-            "centre_std_m": round(float(np.linalg.norm(centres.std(axis=0))), 6),
-            "centre_range_m": round(float(np.max(np.linalg.norm(
-                centres - centres.mean(axis=0), axis=1))), 6),
             "reproj_rms_px": [round(p["reprojection"]["rms_px"], 4) for _, p in plist],
         }
+        if len(plist) >= 2:
+            entry["centre_std_m"] = round(float(np.linalg.norm(centres.std(axis=0))), 6)
+            entry["centre_range_m"] = round(float(np.max(np.linalg.norm(
+                centres - centres.mean(axis=0), axis=1))), 6)
+        else:
+            entry["centre_std_m"] = None
+            entry["centre_range_m"] = None
+            entry["note"] = "只有 1 帧，不计算帧间抖动；重复采集可观察稳定性"
+        jitter[str(cam)] = entry
 
     K0a = np.asarray(K0, np.float64)
     K1a = np.asarray(K1, np.float64)
@@ -547,7 +554,9 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
                     pairs.append((k, k + spec.cols))
         d = np.array([np.linalg.norm(Xw[i] - Xw[j]) for i, j in pairs])
         sp_err = d - spacing
-        all_sp.extend(np.abs(sp_err).tolist())
+        # sp_err 的单位是米；汇总字段名是 *_mm，这里必须先换算，否则汇总值会
+        # 比逐位置结果小 1000 倍（历史 bug：mean/p95/max 都是米却标成毫米）。
+        all_sp.extend((np.abs(sp_err) * 1000.0).tolist())
 
         # 平面度：对 Z 做最小二乘（世界系里板面是 Z=0 平面，但验证时板被挪动了，
         # 所以这里改为检查"重建点是否共面"——用 SVD 拟合平面）
@@ -604,6 +613,7 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
             "p95": round(float(np.percentile(all_sp, 95)), 4),
             "max": round(float(np.max(all_sp)), 4),
             "expected_spacing_mm": round(spec.square_mm, 3),
+            "unit": "mm",
         },
         "centre_z_range_m": [
             round(float(centres_arr[:, 2].min()), 4),

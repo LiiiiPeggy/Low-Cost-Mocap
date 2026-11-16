@@ -52,7 +52,7 @@ def calib_session_create():
             session_id=b.get("session_id"),
             pixel_format=str(b.get("format", "")),
             note=str(b.get("note", "")),
-            surface_height_m=float(b.get("surface_height_mm", 0.0)) / 1000.0,
+            surface_height_m=float(b.get("surface_height_mm", 5.0)) / 1000.0,
             root=b.get("root") or None,
         ))
     except Exception as exc:
@@ -204,10 +204,20 @@ def calib_capture_stereo():
 # ---------------------------------------------------------------------------
 @bp.post("/api/calib/capture/extrinsic")
 def calib_capture_extrinsic():
-    """外参阶段：棋盘格固定在中央地面，按一次存一张（不做姿态判重）。"""
+    """外参阶段单相机采集（预留/兼容）；网页使用下面的双相机同帧接口。"""
     b = _body()
     try:
         return jsonify(service().capture_extrinsic(int(b.get("camera", 0))))
+    except Exception as exc:
+        return _fail(exc, 409)
+
+
+@bp.post("/api/calib/capture/extrinsic-pair")
+def calib_capture_extrinsic_pair():
+    """一次采一对同步帧，分别记入相机 0/1 的 extrinsic 阶段。"""
+    b = _body()
+    try:
+        return jsonify(service().capture_extrinsic_pair(force=bool(b.get("force", False))))
     except Exception as exc:
         return _fail(exc, 409)
 
@@ -244,12 +254,22 @@ def calib_extrinsic_overlay():
 
 @bp.post("/api/calib/validate/rig")
 def calib_validate_rig():
-    """独立验证：板挪到多个位置/高度后的三角化精度。"""
+    """重新计算：复用已保存的 validation 帧对，不重新采集图像。"""
     b = _body()
     try:
         return jsonify(service().validate_rig(holdout=bool(b.get("holdout", False))))
     except Exception as exc:
         return _fail(exc)
+
+
+@bp.post("/api/calib/validate/capture")
+def calib_capture_and_validate():
+    """采集并验证三维精度：取一对新同步帧入库，然后立即用已有内外参验证。"""
+    b = _body()
+    try:
+        return jsonify(service().capture_and_validate(force=bool(b.get("force", False))))
+    except Exception as exc:
+        return _fail(exc, 409)
 
 
 @bp.get("/api/calib/live")
@@ -288,7 +308,8 @@ def calib_coverage():
             return jsonify({"error": "没有打开的会话"}), 400
         cam = int(request.args.get("camera", 0))
         dets = []
-        for s in sess.single_samples(cam):
+        # 覆盖率只看内参阶段，不能混入外参/验证图像
+        for s in sess.single_samples(cam, phase="intrinsic"):
             d = s.detections.get(str(cam)) or {}
             det = board_mod.Detection(ok=True,
                                       corners=_corners(d.get("corners")),

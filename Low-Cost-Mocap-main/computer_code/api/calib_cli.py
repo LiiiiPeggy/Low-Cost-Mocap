@@ -3,17 +3,17 @@
 在 ``Low-Cost-Mocap-main/computer_code`` 目录下运行::
 
     python api/calib_cli.py list
-    python api/calib_cli.py new --cols 9 --rows 6 --square-mm 25 --cameras 0 1
+    python api/calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 5
     python api/calib_cli.py capture-single --camera 0 --count 20 --interval 1.5
-    python api/calib_cli.py capture-stereo --count 15 --interval 2.0
+    python api/calib_cli.py capture-stereo --count 3 --interval 2.0
     python api/calib_cli.py detect --session captures/calibration/20261113_120000
     python api/calib_cli.py intrinsic --session <dir>
     python api/calib_cli.py stereo    --session <dir>
-    python api/calib_cli.py validate  --session <dir> --holdout 0.3
+    python api/calib_cli.py validate-rig --session <dir> --holdout
     python api/calib_cli.py save      --session <dir>
     python api/calib_cli.py info
 
-``intrinsic / stereo / validate / save / detect`` **不需要相机在线**：它们只读
+``intrinsic / stereo / validate-rig / save / detect`` **不需要相机在线**：它们只读
 会话目录里的原始 PNG 和 samples.json，可以换一台机器离线重算。
 """
 
@@ -34,7 +34,10 @@ import cv2  # noqa: E402
 import calibration.routes  # noqa: E402,F401  （确保包可导入，同时注册路由模块）
 from calibration import board as B  # noqa: E402
 from calibration.dataset import Session  # noqa: E402
-from calibration.service import DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, service  # noqa: E402
+from calibration.service import (  # noqa: E402
+    DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, project_relative, resolve_path,
+    service,
+)
 
 # 相机线程只存在于跑着 preview_server 的那个进程里，所以采集默认走 HTTP。
 DEFAULT_API = os.environ.get("MOCAP_CALIB_API", "http://127.0.0.1:3002")
@@ -48,9 +51,10 @@ def _die(msg: str, code: int = 1):
 def _session(root: str) -> Session:
     if not root:
         _die("需要 --session <会话目录>")
-    if not os.path.isdir(root):
-        _die("会话目录不存在：%s" % root)
-    return Session.load(root)
+    path = resolve_path(root)
+    if not os.path.isdir(path):
+        _die("会话目录不存在：%s" % path)
+    return Session.load(path)
 
 
 def _print_intrinsic(res: dict) -> None:
@@ -67,6 +71,10 @@ def _print_intrinsic(res: dict) -> None:
         cov = d.get("radius_coverage") or {}
         if cov:
             print("  角点半径覆盖 = %.0f%%（画面半对角）" % (100 * cov.get("ratio", 0)))
+        grid = d.get("coverage") or {}
+        if grid:
+            print("  区域覆盖率 = %.0f%%（6×6 网格，%d 个角点命中）"
+                  % (100 * grid.get("covered_ratio", 0), grid.get("corner_hits", 0)))
         for w in d.get("warnings", []):
             print("  ! %s" % w)
         bad = (d.get("outlier_suggestion") or {}).get("exclude") or []
@@ -114,9 +122,9 @@ def _print_stereo(res: dict) -> None:
 # 子命令
 # ---------------------------------------------------------------------------
 def cmd_list(args) -> int:
-    root = args.root or DEFAULT_SESSION_ROOT
+    root = resolve_path(args.root) if args.root else DEFAULT_SESSION_ROOT
     if not os.path.isdir(root):
-        print("没有标定目录：%s" % root)
+        print("没有标定目录：%s" % project_relative(root))
         return 0
     rows = []
     for name in sorted(os.listdir(root)):
@@ -168,9 +176,12 @@ def _print_rig(rig: dict) -> None:
     print("  三角化自洽（对已知世界点）：rms %.4f mm  max %.4f mm"
           % (cons["rms_m"] * 1000, cons["max_m"] * 1000))
     for k, st in rig.get("stability", {}).items():
-        print("  相机 %s 帧间抖动：中心标准差 %.4f mm  最大偏离 %.4f mm（用第 %s 帧）"
-              % (k, st["centre_std_m"] * 1000, st["centre_range_m"] * 1000,
-                 st.get("used_frame_index")))
+        if st.get("centre_std_m") is None:
+            print("  相机 %s 帧间抖动：%s" % (k, st.get("note") or "样本不足"))
+        else:
+            print("  相机 %s 帧间抖动：中心标准差 %.4f mm  最大偏离 %.4f mm（用第 %s 帧）"
+                  % (k, st["centre_std_m"] * 1000, st["centre_range_m"] * 1000,
+                     st.get("used_frame_index")))
     for w in rig.get("warnings", []):
         print("  ! %s" % w)
     print("  · %s" % rig.get("caveat", ""))
@@ -275,7 +286,7 @@ def _api_call(path: str, payload=None, base: str | None = None, timeout: float =
 
 
 def _load_session_over_http(args) -> None:
-    root = os.path.abspath(args.session) if args.session else ""
+    root = resolve_path(args.session) if args.session else ""
     if not root or not os.path.isdir(root):
         _die("需要 --session <会话目录>（calib_cli.py list 可查看已有会话）")
     _api_call("/api/calib/session/load", {"root": root}, base=args.api)
@@ -301,6 +312,8 @@ def _capture_loop(args, *, stereo: bool) -> int:
             continue
         suffix = ("  Δt=%s ms" % r.get("dt_ms")) if stereo else ""
         print("[%2d/%2d] %s%s" % (k + 1, args.count, r.get("message", ""), suffix))
+        if r.get("warning"):
+            print("  ! %s" % r["warning"])
         ok += 1 if r.get("ok") else 0
         if k + 1 < args.count:
             time.sleep(args.interval)
@@ -326,6 +339,8 @@ def cmd_capture_single(args) -> int:
             time.sleep(args.interval)
             continue
         print("[%2d/%2d] %s" % (k + 1, args.count, r["message"]))
+        if r.get("warning"):
+            print("  ! %s" % r["warning"])
         ok += 1 if r["ok"] else 0
         if k + 1 < args.count:
             time.sleep(args.interval)
@@ -510,12 +525,12 @@ def cmd_save(args) -> int:
 
 
 def cmd_info(args) -> int:
-    path = args.result or DEFAULT_RESULT_PATH
+    path = resolve_path(args.result or DEFAULT_RESULT_PATH)
     if not os.path.isfile(path):
         _die("没有标定结果文件：%s" % path)
     with open(path, encoding="utf-8") as fh:
         d = json.load(fh)
-    print("文件：%s" % path)
+    print("文件：%s" % project_relative(path))
     print("标定时间：%s   schema：%s v%s"
           % (d.get("created"), d.get("schema"), d.get("version")))
     b = d.get("board", {})
@@ -575,8 +590,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--cols", type=int, default=B.DEFAULT_COLS, help="内角点列数（12 格 → 11）")
     sp.add_argument("--rows", type=int, default=B.DEFAULT_ROWS, help="内角点行数（9 格 → 8）")
     sp.add_argument("--square-mm", type=float, default=B.DEFAULT_SQUARE_MM, help="方格边长 mm")
-    sp.add_argument("--surface-height-mm", type=float, default=0.0,
-                    help="板面高于地面的高度 mm（用于地面基准换算）")
+    sp.add_argument("--surface-height-mm", type=float, default=5.0,
+                    help="板面高于地面的高度 mm（默认 5，用于地面基准换算）")
     sp.add_argument("--cameras", type=int, nargs="+", default=[0, 1])
     sp.add_argument("--id", default=None, help="会话名（默认时间戳）")
     sp.add_argument("--format", default="", help="采集格式记录（NV12/MJPG）")
