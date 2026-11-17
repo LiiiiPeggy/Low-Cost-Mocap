@@ -204,9 +204,9 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
   注意**看不出**来也要确认：合成案例中单侧反向会把基线从 2032 mm 变成 1635 mm，而三角化
   自洽残差只有约 0.6 mm，指标不会报警。两台相机可以各自独立翻转 180°。
 - 结果自动保存：内参 → `captures/calibration/intrinsics.json`，外参 →
-  `captures/calibration/world_extrinsics.json`，均可从网页重新载入。只有「两台内参 + 已确认外参」
-  才会额外生成兼容文件 `api/calibration/calibration.json`（schema v2，供旧下游读取）。
-  旧 `camera-params.json` **未改动**。
+  `captures/calibration/world_extrinsics.json`，均可从网页重新载入；这两份新格式结果已纳入 Git。
+  只有「两台内参 + 已确认外参」才会额外生成兼容文件 `api/calibration/calibration.json`
+  （schema v2，供旧下游读取）。原始采集图仍在 `captures/` 下并被忽略；旧 `camera-params.json` **未改动**。
 - 默认板面高 **3 mm**；数据目录为 `computer_code/captures/calibration/<session_id>/`。
 - 下游取参数：`calibration.service.load_calibration()` + `stereo_matrices(data, scaled_size=...)`，
   或 `GET /api/calib/matrices?size=640x360`。

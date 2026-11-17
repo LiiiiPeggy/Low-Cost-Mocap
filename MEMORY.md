@@ -68,4 +68,4 @@
 - 外参图“没计入有效样本”：看“采集双相机图片”旁的提示徽标；旧 0.8% 门限会拒绝地面小板（0.4–0.5%），改门限后需重启服务。
 - 双目外参方向看似反转：不要靠降低 RMS“自动修正”；逐台看世界轴叠加和相机位置，人工确认 180°。
 - 原 Windows Git 曾因证书撤销检查报 `CRYPT_E_NO_REVOCATION_CHECK`；本仓库局部配置 `http.schannelCheckRevoke=false`，不是全局建议。
-- `upstream/`、厂商 DirectShow SDK、`captures/`、截图/日志/`__pycache__` 不纳入版本控制；本地存在不代表已推送。
+- `upstream/`、厂商 DirectShow SDK、截图/日志/`__pycache__` 不纳入版本控制。`captures/` 默认忽略，例外是已跟踪的 `captures/calibration/intrinsics.json` 与 `world_extrinsics.json`（新格式标定结果）；其他本地采集结果仍不代表已推送。

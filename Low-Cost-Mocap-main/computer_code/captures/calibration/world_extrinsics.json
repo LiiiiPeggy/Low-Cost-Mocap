@@ -1,0 +1,516 @@
+{
+  "method": "solvePnP (IPPE candidates + LM refine) per camera against one fixed board",
+  "board": {
+    "cols": 11,
+    "rows": 8,
+    "inner_corners": 88,
+    "square_mm": 30.0,
+    "square_m": 0.03,
+    "squares": [
+      12,
+      9
+    ],
+    "surface_height_m": 0.003,
+    "object_point_order": "row-major, index = row*cols+col, origin at pattern centre, Z=0",
+    "world_frame": {
+      "origin": "board pattern centre (geometric centre of the inner-corner grid)",
+      "origin_on_pattern_plane": true,
+      "x_axis": "along the 12-square long edge (cols direction)",
+      "y_axis": "along the 9-square short edge (rows direction)",
+      "z_axis": "pattern normal, out of the printed face; up when the board lies flat",
+      "handedness": "right-handed, Z = X x Y",
+      "unit": "m",
+      "index_order": "row-major: index = row * cols + col",
+      "board_extent_x_m": 0.36,
+      "board_extent_y_m": 0.27,
+      "surface_height_m": 0.003,
+      "floor_z_m": -0.003,
+      "floor_note": "地面平面为 Z = -surface_height_m；要地面基准坐标请把 Z 加上 surface_height_m"
+    }
+  },
+  "flip180": false,
+  "flip_cam": {
+    "0": false,
+    "1": false
+  },
+  "orientation_confirmed": true,
+  "orientation_ok": true,
+  "cameras": {
+    "0": {
+      "correspondence": "row",
+      "correspondence_alternatives": [
+        "col"
+      ],
+      "orientation_ambiguous": true,
+      "flip180": false,
+      "R": [
+        [
+          -0.03309715805399305,
+          -0.9994434862914154,
+          0.004158826566510454
+        ],
+        [
+          -0.6233204693186196,
+          0.017388554187646288,
+          -0.7817731325081971
+        ],
+        [
+          0.7812657490618444,
+          -0.028466750656241102,
+          -0.6235490946588813
+        ]
+      ],
+      "t": [
+        -0.293854424539843,
+        0.08341656894426908,
+        1.972064153964476
+      ],
+      "rvec": [
+        1.6643888311394865,
+        -1.7169748107305964,
+        0.8310230255118654
+      ],
+      "tvec": [
+        -0.293854424539843,
+        0.08341656894426908,
+        1.972064153964476
+      ],
+      "reprojection": {
+        "rms_px": 0.1855,
+        "mean_px": 0.1622,
+        "median_px": 0.1382,
+        "max_px": 0.4569,
+        "worst_corner": {
+          "index": 66,
+          "px": 0.4569
+        }
+      },
+      "ippe_candidates": [
+        {
+          "reproj_px": 0.1311,
+          "camera_z_m": 1.2961,
+          "points_in_front": 1.0,
+          "plausible": true
+        },
+        {
+          "reproj_px": 1.4714,
+          "camera_z_m": 1.2849,
+          "points_in_front": 1.0,
+          "plausible": true
+        }
+      ],
+      "candidate_selection": "先按“相机 Z>0 且角点全在前方”筛，再比重投影",
+      "refined": true,
+      "camera_centre_world": [
+        -1.4984366698756384,
+        -0.23900312550447547,
+        1.296113739807892
+      ],
+      "height_above_pattern_m": 1.296114,
+      "height_above_floor_m": 1.299114,
+      "distance_to_pattern_centre_m": 1.995582,
+      "optical_axis_world": [
+        0.7812657490618444,
+        -0.028466750656241102,
+        -0.6235490946588813
+      ],
+      "points_in_front": 1.0,
+      "rotation": {
+        "orthogonality_error": 0.0,
+        "determinant": 1.0,
+        "rotation_angle_deg": 145.0477,
+        "rotation_axis": [
+          0.657456,
+          -0.678228,
+          0.328265
+        ],
+        "valid": true
+      },
+      "warnings": [],
+      "cam_to_world": {
+        "R_wc": [
+          [
+            -0.03309715805399305,
+            -0.6233204693186196,
+            0.7812657490618444
+          ],
+          [
+            -0.9994434862914154,
+            0.017388554187646288,
+            -0.028466750656241102
+          ],
+          [
+            0.004158826566510454,
+            -0.7817731325081971,
+            -0.6235490946588813
+          ]
+        ],
+        "t_wc": [
+          -1.4984366698756384,
+          -0.23900312550447547,
+          1.296113739807892
+        ],
+        "convention": "X_world = R_wc @ X_cam + t_wc"
+      }
+    },
+    "1": {
+      "correspondence": "row",
+      "correspondence_alternatives": [
+        "col"
+      ],
+      "orientation_ambiguous": true,
+      "flip180": false,
+      "R": [
+        [
+          0.002077785109025232,
+          -0.9000491061671334,
+          -0.43578353490785454
+        ],
+        [
+          -0.4796581568270604,
+          0.3814841962376768,
+          -0.7901884968854969
+        ],
+        [
+          0.8774529818732786,
+          0.21066896902163407,
+          -0.4309232531356991
+        ]
+      ],
+      "t": [
+        -0.17828486051206974,
+        0.5601218026221964,
+        1.9973292051032943
+      ],
+      "rvec": [
+        1.2464754988166677,
+        -1.635514744185277,
+        0.523558085068331
+      ],
+      "tvec": [
+        -0.17828486051206974,
+        0.5601218026221964,
+        1.9973292051032943
+      ],
+      "reprojection": {
+        "rms_px": 0.1122,
+        "mean_px": 0.0905,
+        "median_px": 0.08,
+        "max_px": 0.375,
+        "worst_corner": {
+          "index": 74,
+          "px": 0.375
+        }
+      },
+      "ippe_candidates": [
+        {
+          "reproj_px": 0.0793,
+          "camera_z_m": 1.2255,
+          "points_in_front": 1.0,
+          "plausible": true
+        },
+        {
+          "reproj_px": 1.2106,
+          "camera_z_m": 1.2164,
+          "points_in_front": 1.0,
+          "plausible": true
+        }
+      ],
+      "candidate_selection": "先按“相机 Z>0 且角点全在前方”筛，再比重投影",
+      "refined": true,
+      "camera_centre_world": [
+        -1.4835250377277207,
+        -0.7949180294514586,
+        1.2256037971983764
+      ],
+      "height_above_pattern_m": 1.225604,
+      "height_above_floor_m": 1.228604,
+      "distance_to_pattern_centre_m": 2.082029,
+      "optical_axis_world": [
+        0.8774529818732786,
+        0.21066896902163407,
+        -0.4309232531356991
+      ],
+      "points_in_front": 1.0,
+      "rotation": {
+        "orthogonality_error": 0.0,
+        "determinant": 1.0,
+        "rotation_angle_deg": 121.5795,
+        "rotation_axis": [
+          0.587417,
+          -0.770756,
+          0.246733
+        ],
+        "valid": true
+      },
+      "warnings": [],
+      "cam_to_world": {
+        "R_wc": [
+          [
+            0.002077785109025232,
+            -0.4796581568270604,
+            0.8774529818732786
+          ],
+          [
+            -0.9000491061671334,
+            0.3814841962376768,
+            0.21066896902163407
+          ],
+          [
+            -0.43578353490785454,
+            -0.7901884968854969,
+            -0.4309232531356991
+          ]
+        ],
+        "t_wc": [
+          -1.4835250377277207,
+          -0.7949180294514586,
+          1.2256037971983764
+        ],
+        "convention": "X_world = R_wc @ X_cam + t_wc"
+      }
+    }
+  },
+  "relative": {
+    "R_10": [
+      [
+        0.8976670995767738,
+        0.32373818053697806,
+        0.2989772044822643
+      ],
+      [
+        -0.36868283013786834,
+        0.9233623425260755,
+        0.10712121716210232
+      ],
+      [
+        -0.24138506395167542,
+        -0.20638695420826775,
+        0.9482287044978548
+      ]
+    ],
+    "T_10": [
+      -0.5311087676062227,
+      0.16350909073401798,
+      0.07364538973778001
+    ],
+    "E": [
+      [
+        -0.012316861608380171,
+        -0.10174752280647961,
+        0.14715502949325168
+      ],
+      [
+        -0.062092680430809497,
+        -0.08577209642090947,
+        0.5256308714015091
+      ],
+      [
+        0.04903395231845614,
+        -0.5433399713285055,
+        -0.10577850848653632
+      ]
+    ],
+    "convention": "X_cam1 = R_10 @ X_cam0 + T_10",
+    "T_unit": "m",
+    "baseline_m": 0.560567,
+    "baseline_vector_c0_to_c1_m": [
+      0.014911632147917686,
+      -0.5559149039469832,
+      -0.07050994260951549
+    ],
+    "rotation_angle_deg": 27.7941,
+    "camera0_centre_m": [
+      -1.4984366698756384,
+      -0.23900312550447547,
+      1.296113739807892
+    ],
+    "camera1_centre_m": [
+      -1.4835250377277207,
+      -0.7949180294514586,
+      1.2256037971983764
+    ],
+    "rotation": {
+      "orthogonality_error": 0.0,
+      "determinant": 1.0,
+      "rotation_angle_deg": 27.7941,
+      "rotation_axis": [
+        -0.336169,
+        0.579421,
+        -0.74247
+      ],
+      "valid": true
+    },
+    "F": [
+      [
+        -2.9416007091564512e-08,
+        -2.420085300300643e-07,
+        0.0003388346092294763
+      ],
+      [
+        -1.4816330309224556e-07,
+        -2.038306258845112e-07,
+        0.0009867367368352978
+      ],
+      [
+        0.0001472126030107272,
+        -0.0006071435592187559,
+        -0.40619943527670826
+      ]
+    ]
+  },
+  "convention": "X_cam1 = R_10 @ X_cam0 + T_10",
+  "T_unit": "m",
+  "baseline_m": 0.560567,
+  "consistency": {
+    "rms_m": 0.001569,
+    "mean_m": 0.001258,
+    "max_m": 0.004337,
+    "blunder": false,
+    "worst_corner": {
+      "index": 28,
+      "m": 0.004337
+    },
+    "definition": "三角化角点与已知世界坐标的三维偏差（棋盘格为基准）"
+  },
+  "stability": {
+    "0": {
+      "frames": 1,
+      "used_frame_index": 0,
+      "reproj_rms_px": [
+        0.1855
+      ],
+      "centre_std_m": null,
+      "centre_range_m": null,
+      "note": "只有 1 帧，不计算帧间抖动；重复采集可观察稳定性"
+    },
+    "1": {
+      "frames": 1,
+      "used_frame_index": 0,
+      "reproj_rms_px": [
+        0.1122
+      ],
+      "centre_std_m": null,
+      "centre_range_m": null,
+      "note": "只有 1 帧，不计算帧间抖动；重复采集可观察稳定性"
+    }
+  },
+  "warnings": [
+    "外参图覆盖率偏低：s0001、s0002。单张固定板仍可求解，但位姿/深度精度会下降；条件允许时请把板移近或更正对相机后重采"
+  ],
+  "corner_correspondence": {
+    "flip_cam": {
+      "0": false,
+      "1": false
+    },
+    "class_0": "row",
+    "class_1": "row",
+    "confirmed": true,
+    "meaning": "class 是自动选定的格点对应（保证相机在图案正面一侧）；flip_cam 是在其之上再绕板法向 180°",
+    "how_to_verify": "把世界系 X/Y 轴投影回图像（GET /api/calib/extrinsic/overlay?camera=0/1&flip180=0/1），确认两台相机的 X 轴都沿 12 格长边",
+    "geometric_note": "矩形角点阵列有 D2 四重对称：4 种对应重投影误差逐位相同，三角化一致性残差也都约 0.6mm，几何上不可区分；只能人工确认"
+  },
+  "caveat": "三角化自洽性只能发现「板动了 / 检测错」，无法判断 180°；三维精度请用 validate_rig 的独立数据（多个位置/高度）检验",
+  "created": "2026-11-16T17:50:17",
+  "computed_at": "2026-11-16T17:50:17",
+  "camera_pair": [
+    0,
+    1
+  ],
+  "frames": {
+    "0": [
+      "s0001"
+    ],
+    "1": [
+      "s0002"
+    ]
+  },
+  "intrinsic_rms_px": {
+    "0": 0.2259,
+    "1": 0.077
+  },
+  "world_frame": {
+    "origin": "board pattern centre (geometric centre of the inner-corner grid)",
+    "origin_on_pattern_plane": true,
+    "x_axis": "along the 12-square long edge (cols direction)",
+    "y_axis": "along the 9-square short edge (rows direction)",
+    "z_axis": "pattern normal, out of the printed face; up when the board lies flat",
+    "handedness": "right-handed, Z = X x Y",
+    "unit": "m",
+    "index_order": "row-major: index = row * cols + col",
+    "board_extent_x_m": 0.36,
+    "board_extent_y_m": 0.27,
+    "surface_height_m": 0.003,
+    "floor_z_m": -0.003,
+    "floor_note": "地面平面为 Z = -surface_height_m；要地面基准坐标请把 Z 加上 surface_height_m"
+  },
+  "intrinsics": {
+    "0": {
+      "K": [
+        [
+          649.3562004648494,
+          0.0,
+          641.2092374129707
+        ],
+        [
+          0.0,
+          652.0183559250339,
+          379.156336842372
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.3189949079408434,
+        0.11284300566468475,
+        0.0013393949973201653,
+        0.0029364168107736213,
+        -0.01915249938997763
+      ],
+      "image_size": [
+        1280,
+        720
+      ],
+      "rms_px": 0.2259
+    },
+    "1": {
+      "K": [
+        [
+          644.812352250606,
+          0.0,
+          632.8076015287809
+        ],
+        [
+          0.0,
+          645.381875425456,
+          358.295799066055
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.3524231970336563,
+        0.1579863539711033,
+        0.00021770432685744689,
+        -0.0004403695764700307,
+        -0.03879913547922472
+      ],
+      "image_size": [
+        1280,
+        720
+      ],
+      "rms_px": 0.077
+    }
+  },
+  "source": "computed",
+  "source_session": "captures/calibration/20261116_174926",
+  "schema": "lowcost-mocap/world-extrinsics",
+  "version": 1,
+  "updated": "2026-11-16T17:50:17"
+}

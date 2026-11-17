@@ -33,6 +33,7 @@ python -m led.selftest
 
 - **内参**：`computer_code/captures/calibration/intrinsics.json`（2026-11-16 17:34，`source=migrated`，源会话 `20261116_104419`）。两台各 8 张，RMS **0.2259 / 0.077 px**，1280×720。
 - **外参**：`computer_code/captures/calibration/world_extrinsics.json`（2026-11-16 17:50，源会话 `20261116_174926`）。`orientation_confirmed=true`，基线 **560.567 mm**；每台仅 1 帧，带“外参图覆盖率偏低（s0001、s0002）”警告。
+- 以上两份新格式结果已纳入 Git 跟踪；原始采集图与 `led_params.json` 仍被 `captures/` 忽略。
 - **旧版兼容文件已删除**：`api/calibration/calibration.json` 是旧结果再保存（2026-11-16 18:23，session `20261116_182336`，`validation=null`），2026-11-17 按项目决定删除，不再作为标定结果来源。运行时只有在“两台内参 + 已确认外参”时才重新生成该兼容文件。
 - **早期实机会话**：`computer_code/captures/calibration/20261116_152637`，两台各 8 张内参图；`s0017`–`s0022` 是旧 0.8% 门限下被拒的外参样本（覆盖率 0.39–0.48%，原图已保存）。
 - 结论：**尚无“固定安装 + 人工方向确认 + 独立多位置验证”闭环的可信外参/基线**。旧 `camera-params.json` 未改写，`helpers.py` 仍按 PS3 Eye 假设，未接入当前标定输出。

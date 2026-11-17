@@ -1,0 +1,106 @@
+{
+  "schema": "lowcost-mocap/intrinsics",
+  "version": 1,
+  "created": "2026-11-16T10:58:00",
+  "updated": "2026-11-16T17:34:11",
+  "cameras": {
+    "0": {
+      "index": 0,
+      "camera": 0,
+      "device": "LRCP G720P",
+      "K": [
+        [
+          649.3562004648494,
+          0.0,
+          641.2092374129707
+        ],
+        [
+          0.0,
+          652.0183559250339,
+          379.156336842372
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.3189949079408434,
+        0.11284300566468475,
+        0.0013393949973201653,
+        0.0029364168107736213,
+        -0.01915249938997763
+      ],
+      "rms_px": 0.2259,
+      "image_size": [
+        1280,
+        720
+      ],
+      "num_views": 8,
+      "focal_px": [
+        649.3562,
+        652.0184
+      ],
+      "principal_point_px": [
+        641.2092,
+        379.1563
+      ],
+      "coverage_ratio": null,
+      "coverage": null,
+      "created": "2026-11-16T10:51:46",
+      "source": "migrated",
+      "source_session": "captures/calibration/20261116_104419",
+      "migrated_from": "api/calibration/calibration.json"
+    },
+    "1": {
+      "index": 1,
+      "camera": 1,
+      "device": "LRCP G720P",
+      "K": [
+        [
+          644.812352250606,
+          0.0,
+          632.8076015287809
+        ],
+        [
+          0.0,
+          645.381875425456,
+          358.295799066055
+        ],
+        [
+          0.0,
+          0.0,
+          1.0
+        ]
+      ],
+      "D": [
+        -0.3524231970336563,
+        0.1579863539711033,
+        0.00021770432685744689,
+        -0.0004403695764700307,
+        -0.03879913547922472
+      ],
+      "rms_px": 0.077,
+      "image_size": [
+        1280,
+        720
+      ],
+      "num_views": 8,
+      "focal_px": [
+        644.8124,
+        645.3819
+      ],
+      "principal_point_px": [
+        632.8076,
+        358.2958
+      ],
+      "coverage_ratio": null,
+      "coverage": null,
+      "created": "2026-11-16T10:51:46",
+      "source": "migrated",
+      "source_session": "captures/calibration/20261116_104419",
+      "migrated_from": "api/calibration/calibration.json"
+    }
+  }
+}
