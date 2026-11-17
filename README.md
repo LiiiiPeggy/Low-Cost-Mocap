@@ -1,8 +1,8 @@
 # Low-Cost-Mocap
 
 低成本红外光学动捕方案。本仓库在原项目 [jyjblrd/Low-Cost-Mocap](https://github.com/jyjblrd/Low-Cost-Mocap)
-（ESP32 红外标记 + 基站 + 上位机解算）基础上，补充了 **USB 红外相机的取帧与可视化工具**，
-以及相机选型、Astra Pro 适配等调研笔记。
+（ESP32 红外标记 + 基站 + 上位机解算）基础上，补充了 **USB 红外相机取帧、双相机采集与同步、
+标定和 LED 定位工具**。
 
 ## 目录结构
 
@@ -19,7 +19,7 @@
 | `Low-Cost-Mocap-main/computer_code/src/components/CameraPreview.tsx` | React 双路预览面板 |
 | `AGENTS.md` / `PROGRESS.md` / `MEMORY.md` / `PROCESS.md` | AI Agent 公共工作规则与项目记忆 |
 | `docs/calibration.md` | **标定使用说明、坐标约定、精度指标、局限** |
-| `docs/` | 调研笔记：方案总结、Astra Pro 适配、配图 |
+| `docs/` | 方案调研笔记与配图 |
 | `image_driver/` | 相机厂商资料（说明书 PDF、AmCap 工具、DirectShow SDK 文档） |
 | `Notes.md` | 物料清单 |
 | `docs/environment.yml` | 当前实机 Conda 环境导出（含 channels、Conda/pip 依赖与版本） |
@@ -269,7 +269,7 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
 - **极线诊断视图**：不依赖最终 matches；两台相机有候选点即绘制另一路每个候选的极线，同色标记来源，距离表显示最小极线距离与 OK/FAIL，支持水平/倾斜/近竖直极线裁剪。匹配门槛不变。
 - **信息布局**：相机编号、候选/匹配数量、状态、ROI、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
 - **限制**：`L0/L1/L2` 是临时编号；三个 LED 完全相同，120° 对称未解，**不输出唯一航向或 6DoF**。
-- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、三边容差 10 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
+- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、极线 5 px、三边容差 10 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
 - **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|overlay_pair|diagnose|debug/save`，以及 `/api/cameras/controls`。
 - **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；控件已移动到“红外 LED 检测与定位”模块内，相机 0/1 独立。设置按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开/服务重启后自动恢复并读回验证；不再每 5 秒轮询设备属性。装机时用实际 850 nm LED 确认亮度与检测阈值。
 
