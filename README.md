@@ -146,7 +146,7 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 | `MOCAP_SYNC_WINDOW` | `300` | 统计窗口（对数） |
 | `MOCAP_SYNC_RECENT` | `16` | 内存里保留可保存的最近对数 |
 
-网页顶部同步条实时显示：配对率、`|Δt|` 均值 / P95 / 最大、丢弃数、缓存深度，并可一键「保存同步对」。
+网页顶部同步条实时显示：**累计配对率**与**最近 300 个配对/丢弃事件**的配对率、两路丢弃数、`|Δt|` 均值 / P95 / 最大、缓存深度，并可一键「保存同步对」。`/api/sync/status` 另外返回每路 FPS、最近帧间隔 mean/P95/max；这样能区分历史累计问题与当前实时状态。
 保存目录默认 `captures/sync/sync_<时间戳>/`。
 
 ### 双相机内参 / 外参标定（固定棋盘格 + 世界系）
@@ -169,10 +169,10 @@ Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`�
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code
 python api\preview_server.py --indices 0 1
-:: 浏览器打开 http://127.0.0.1:3002/preview → 右上角「标定面板」
+:: 浏览器打开 http://127.0.0.1:3002/preview（标定面板默认展开，会话自动复用/创建）
 ```
 
-面板内：新建会话（11×8 / 30mm）→ 板移动采 30–40 张内参图 →「内参标定」查看 K/D/RMS/覆盖率
+面板内：页面自动打开 11×8 / 30mm 会话（已有则复用）→ 板移动采 30–40 张内参图 →「内参标定」查看 K/D/RMS/覆盖率
 → 板固定到中心地面 →「采集双相机图片」取同步帧对（可重复若干次）→「解外参 solvePnP」
 → 可视化模式切到「世界坐标轴」逐台确认 X 轴沿 12 格长边（不对就勾对应相机的「反向 180°」，
 确认后勾「已确认世界坐标轴方向」）→ 板挪到 3 个不同位置/高度 →「采集并验证三维精度」。
@@ -232,7 +232,9 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
 | GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
 | GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数、ROI、调试保存与三维定位 |
-| GET/POST | `/api/cameras/controls` | UVC 曝光/自动曝光/增益范围、当前值与设置 |
+| GET/POST | `/api/cameras/controls` | UVC 曝光/自动曝光/增益范围、当前值、设置与读回验证；POST `/controls/restore` 恢复保存值 |
+| GET | `/api/led/overlay_pair` · `/api/led/diagnose` | 同一同步帧对的双相机叠加图；分阶段极线/三角化诊断 |
+| POST | `/api/calib/session/ensure` | 页面初始化幂等会话：已有复用，没有才创建 |
 
 **自检（无相机可跑）**
 
@@ -240,14 +242,14 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
 python -m calibration.selftest   :: 136/136
-python -m led.selftest           :: 41/41
+python -m led.selftest           :: 50/50
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
 同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、兼容文件、
 LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
-ROI、极线/三角化、33 mm 三边、卡尔曼跟踪、调试帧保存与接口。最近一次（2026-11-17）：
-**136/136 + 41/41 通过**。
+ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存与接口。
+最近一次（2026-11-17）：**136/136 + 50/50 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
@@ -256,11 +258,14 @@ ROI、极线/三角化、33 mm 三边、卡尔曼跟踪、调试帧保存与接�
 
 - **二维检测**：阈值 + 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值拆分粘连光斑，拆分块至少占父亮区 15%；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心；分别输出原始连通域和筛选候选。
 - **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边约 33 mm、两相机三点绕向一致。
+- **相机映射**：两台相机同名，USB/重启后枚举顺序可能互换。LED 服务同时评估 `live0→calib0/live1→calib1` 和反向映射，按正深度 + 33 mm 三角选择并锁定；状态和调试 JSON 会显示当前映射。
 - **ROI**：每台相机可设归一化手动 ROI；匹配后动态跟踪 ROI（+80 px），连续失败 12 帧清除并全图重搜；ROI 不足 3 点自动全图回退。
+- **极线诊断视图**：不依赖最终 matches；两台相机有候选点即绘制另一路每个候选的极线，同色标记来源，距离表显示最小极线距离与 OK/FAIL，支持水平/倾斜/近竖直极线裁剪。匹配门槛不变。
+- **信息布局**：相机编号、候选/匹配数量、状态、ROI、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
 - **限制**：`L0/L1/L2` 是临时编号；三个 LED 完全相同，120° 对称未解，**不输出唯一航向或 6DoF**。
-- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px，可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
-- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|debug/save`，以及 `/api/cameras/controls`。
-- **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益可由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；网页每台相机卡片内独立控制。装机时用实际 850 nm LED 确认亮度与检测阈值。
+- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、三边容差 10 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
+- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|overlay_pair|diagnose|debug/save`，以及 `/api/cameras/controls`。
+- **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；控件已移动到“红外 LED 检测与定位”模块内，相机 0/1 独立。设置按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开/服务重启后自动恢复并读回验证；不再每 5 秒轮询设备属性。装机时用实际 850 nm LED 确认亮度与检测阈值。
 
 完整说明见 [docs/calibration.md](docs/calibration.md) §6.4。
 
@@ -277,7 +282,7 @@ ROI、极线/三角化、33 mm 三边、卡尔曼跟踪、调试帧保存与接�
 | 保存原始帧 | 1280×720 **uint8 单通道** PNG（无拉伸、无伪彩色） |
 | 原后端 `api/index.py` | 缺 `pyserial` / `ruckig` 时可启动，`/api/cameras` 正常，`socket.io` 握手正常 |
 
-**帧同步实测（阈值 20 ms，60 s 连续运行）**
+**帧同步实测（阈值 20 ms；历史 60 s 连续运行，另见 2026-11-17 LED 运行统计）**
 
 | 项目 | 结果 |
 |---|---|
@@ -289,6 +294,7 @@ ROI、极线/三角化、33 mm 三边、卡尔曼跟踪、调试帧保存与接�
 | 阈值 10 ms 对照实验 | 区间配对率降到 **71–82%**，每 5 s 丢 25–30 帧；恢复 20 ms 立刻回到 100% |
 | 保存同步对 | 6 对 → 12 张 1280×720 uint8 PNG + 6 个 JSON + manifest（4.3 MB） |
 | 停止 → 重启 | `pairs` 清零后 8 s 内重新累积 240 对（30/s），seq 归零自愈正常 |
+| 2026-11-17 LED 运行 | 两路 30 fps；帧间隔 mean 33.3 ms、P95 约 47–48 ms；最近 300 事件配对率 94–100%，丢弃两路基本对称（如 16/16）；累计值含启动/控制切换暂态 |
 
 > 注意：30.01 对/秒 与 100% 配对率说明**配对算法没有丢帧**，不代表**曝光同步**。
 > 真实曝光时间差 = 报告 Δt + 两路交付延迟之差，这个差值未知且非常数。

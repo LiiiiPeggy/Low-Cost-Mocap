@@ -54,19 +54,25 @@
 
 - `api/led/` 复用 `camera_manager`、`sync.SyncService`、`CalibrationService` 和现有三维视图。
 - 检测：可选高斯模糊 → 阈值 → 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值 + 最近峰值分配（watershed 简化）拆粘连，拆分块至少占父亮区 15%；完全饱和/不可分亮区标 unresolved/overexposed，**不伪造三点**；强度加权亚像素中心；同时返回原始连通域与筛选后候选。
-- 默认阈值 200、面积 3–800 px²、峰距 6 px；极线/重投影/三角容差 4/4/8；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；存 `captures/calibration/led_params.json`。**`max_area=10` 会把真实 LED 当“面积过大”拒绝，是实机 matched=0 的直接原因之一**；已重置为默认值。
+- 默认阈值 200、面积 3–800 px²、峰距 6 px；极线/重投影/三角容差 4/4/10；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；存 `captures/calibration/led_params.json`。**`max_area=10` 会把真实 LED 当“面积过大”拒绝，是实机 matched=0 的历史原因之一**；当前默认已重置。
 - 支持手动归一化 ROI（每相机独立）、匹配后动态跟踪 ROI（+80 px，失败 12 帧清除并全图重搜）、ROI 不足 3 点自动全图回退。
+- **实机双目 matched=0 的根因是相机枚举顺序与标定编号互换**：实时 cam0 实际对应标定 cam1。LED 服务现在同时评估 `live0→calib0/live1→calib1` 和反向映射，按正深度+重投影+33 mm 三角选择并锁定；状态/诊断/调试 JSON 显示映射。不要把映射固定成某个值，重启/换 USB 口可能变化。
 - `F` 由标定 R/t 计算；原始点只去畸变一次；`P = K[R|t]` 三角化直接得世界系米制坐标；检查相机前方、重投影、33 mm 三边 + 两相机三点绕向。`L0/L1/L2` 是**临时编号**，120° 对称未解，**不输出唯一航向或 6DoF**。
 - 9 状态卡尔曼按 `rec.created_mono` 真实时间传播；同一 `pair_seq` 只处理一次，参数变化允许对最新帧重算一次。
-- 标记灯统一 **850 nm**。LRCP G720P 的 UVC 曝光/自动曝光/增益可由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，**不需要第二路取流、不打断 MF**；本机范围曝光 -13..-1（log2 s）、增益 0..63（仅手动）。旧的 `helpers.py`/pseyepy 通路未使用。
-- “保存调试帧”输出 `captures/led_debug/<时间戳>/` 的原始 PNG、二值 PNG、叠加 JPG、`detections.json`、`state.json`，用于实机离线复现。当前 LED 自检 **41/41**（合成/假相机）；实机 33 mm 与跟踪仍需实测。
+- 标记灯统一 **850 nm**。LRCP G720P 的 UVC 曝光/自动曝光/增益可由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，**不需要第二路取流、不打断 MF**；本机范围曝光 -13..-1（log2 s）、增益 0..63（仅手动）。设置按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重开/服务重启自动恢复并验证；控件已移到 LED 模块，每 5 秒轮询已移除。旧的 `helpers.py`/pseyepy 通路未使用。
+- 同步 `/api/sync/status` 同时给出累计与最近 300 事件的配对率/丢弃数，以及每路 FPS、帧间隔 mean/P95/max；本机帧间隔均值 33.3 ms、P95 可到约 48 ms，启动/控制切换后的短暂丢帧不要用清零统计掩盖。
+- 双相机叠加图改为 `/api/led/overlay_pair` 一次取同一 `pair_seq` 快照，避免前端分别刷新导致 cam0/cam1 显示不同 pair；`/api/led/diagnose` 输出两种映射的原始/理想像素、3×3 极线距离和各阶段计数。
+- 极线视图不依赖 matches：候选点即可画另一路极线，同色标记来源，距离表显示最小距离与 OK/FAIL；`_clip_line` 处理水平/倾斜/近竖直极线。
+- 叠加图相机信息整体移到底部右侧，按输出尺寸/文字宽度动态右对齐并使用半透明深色背景；左下角图例保留，所有视图/局部放大复用同一信息面板函数。
+- “保存调试帧”输出 `captures/led_debug/<时间戳>/` 的原始 PNG、二值 PNG、叠加 JPG、`detections.json`、`diagnosis.json`、`state.json`；文件与诊断来自同一 pair。当前 LED 自检 **50/50**（合成/假相机）；实机 33 mm 与跟踪仍需实测。
+- 本机实测：正确映射后 cam1 曝光 -10 + 阈值 210 覆盖，三边约 32.6–35.2 mm、重投影约 1.3 px；cam1 -11 时检测出 5 个候选但匹配能选出真实三点（三边 32.4/34.2/34.0）。这些是当前场景数据，不是通用默认值。
 
 ## 工程与运维
 
 - 版本一致性：`GET /api/version` 返回 Git SHA / 分支 / dirty / 启动时间；页面右上角显示 `v<sha> [· dirty] [· 分支]`，检测到重启或 SHA 变化只提示刷新，不自动刷新。前端始终同源，已移除 3001/3002 端口回退。
 - 改过 Python 后必须重启 `preview_server.py`；静态页更新后需硬刷新。`/preview` 已加 `Cache-Control: no-store`。
 - 浏览器黑屏但后端显示 30 fps：确认 `/api/camera/<i>/stream` 确实被请求；首帧超时/解码失败会降级为 snapshot 轮询。
-- 点“新建/打开会话”无反应：先看右上角是否有真实版本号和按钮旁“就绪”徽标；没有通常是旧标签页，关闭重开。仍无反应时查 F12 Console 与 `POST /api/calib/session`。
+- 页面默认展开标定面板并在初始化时自动复用/创建会话；原“标定面板/新建打开会话/收起”按钮已移除，多标签页调用 `/api/calib/session/ensure` 幂等。初始化失败看 `c-act` 与 F12 Console。
 - 外参图“没计入有效样本”：看“采集双相机图片”旁的提示徽标；旧 0.8% 门限会拒绝地面小板（0.4–0.5%），改门限后需重启服务。
 - 双目外参方向看似反转：不要靠降低 RMS“自动修正”；逐台看世界轴叠加和相机位置，人工确认 180°。
 - 原 Windows Git 曾因证书撤销检查报 `CRYPT_E_NO_REVOCATION_CHECK`；本仓库局部配置 `http.schannelCheckRevoke=false`，不是全局建议。

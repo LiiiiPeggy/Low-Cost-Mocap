@@ -128,6 +128,41 @@ def led_overlay():
         return _fail(exc, 500)
 
 
+@bp.get("/api/led/overlay_pair")
+def led_overlay_pair():
+    """同一同步帧对的两台相机叠加图（JSON + base64 JPEG）。"""
+    try:
+        view = request.args.get("view", "detect")
+        scale = float(request.args.get("scale", 0.6))
+        quality = int(request.args.get("quality", 75))
+        zoom = float(request.args.get("zoom", 1.0))
+        data = service().overlay_pair(view=view, scale=scale,
+                                      quality=quality, zoom=zoom)
+        resp = jsonify(data)
+        resp.headers["Cache-Control"] = "no-store"
+        if data.get("pair"):
+            resp.headers["X-LED-Pair-Seq"] = str(data["pair"].get("pair_seq"))
+        return resp
+    except RuntimeError as exc:
+        return _fail(exc, 409)
+    except ValueError as exc:
+        return _fail(exc, 400)
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
+@bp.get("/api/led/diagnose")
+def led_diagnose():
+    try:
+        resp = jsonify(service().diagnose())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except RuntimeError as exc:
+        return _fail(exc, 409)
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
 @bp.post("/api/led/debug/save")
 def led_debug_save():
     try:

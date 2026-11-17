@@ -336,6 +336,22 @@ class CalibrationService:
         self._restore_results(sess)
         return self.status()
 
+    def ensure_session(self, *, cols: int, rows: int, square_mm: float,
+                       cameras=None, pixel_format: str = "",
+                       surface_height_m: float = 0.003) -> dict:
+        """幂等打开：已有会话直接复用；没有才创建。
+
+        多个浏览器标签页同时初始化时，RLock 把“检查 + 创建”串行化，避免
+        重复创建会话或清空已有内外参结果。
+        """
+        with self._lock:
+            if self._session is not None:
+                return self.status()
+            return self.open_session(
+                cols=cols, rows=rows, square_mm=square_mm,
+                cameras=cameras, pixel_format=pixel_format,
+                surface_height_m=surface_height_m)
+
     def reload_session(self, root: str) -> dict:
         """载入会话目录，并恢复该目录里已保存的求解结果（如果有）。"""
         sess = Session.load(resolve_path(root))

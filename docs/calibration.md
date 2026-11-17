@@ -49,12 +49,16 @@ Z 轴   = 板面法向，指向图案正面外侧；板正面朝上平放时 = �
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code
 python api\preview_server.py --indices 0 1
-:: 浏览器打开 http://127.0.0.1:3002/preview → 右上角「标定面板」
+:: 浏览器打开 http://127.0.0.1:3002/preview（标定面板默认展开）
 ```
 
-面板里 5 步：
+面板默认展开，页面初始化会自动检查会话：已有有效会话直接复用，没有才按
+内角点 `11 × 8`、方格 `30` mm、板面高 `3` mm 创建；多标签页/刷新不会重复创建，
+也不会清空已载入的内外参。原「新建 / 打开会话」「收起」「标定面板」按钮已移除。
 
-1. **新建 / 打开会话**：内角点 `11 × 8`、方格 `30` mm、板面高默认 `3` mm（按实际改）。
+面板 5 步：
+
+1. **会话**：页面加载时自动完成（见上）。
 2. **内参**：让板在**两台相机前移动**，各采 30–40 张（角度/距离/位置都要变，尽量铺到画面四角）
    → 「内参标定」。成功后**自动保存**：
    - 会话：`captures/calibration/<session>/result_intrinsic.json`
@@ -78,14 +82,14 @@ python api\preview_server.py --indices 0 1
    「重新计算」复用已保存的验证帧对，不再采集图像。
 
 6. **红外 LED 检测与三维定位**（标定完成后的第二阶段）：确认双相机 streaming、内外参
-   已载入且方向已确认。先在每台相机卡片里用 **曝光/自动曝光/增益** 把三个 LED 分开
+   已载入且方向已确认。先在“红外 LED 检测与定位”模块内的 **相机曝光/增益** 把三个 LED 分开
    （避免完全饱和成一块；曝光值越小曝光越短）→ 在“红外 LED 检测与定位”区点
    **开始二维检测** → 把可视化模式切到 **红外 LED 检测可视化**，先用 **原始灰度**
    看真实光斑，再切 **二值化/最终检测叠加** 调整阈值/面积/峰值间距/光斑分离/形状过滤；
    必要时填写两台相机的**归一化手动 ROI**（0–1），或打开 **动态跟踪 ROI**；用 2×/4×
    **局部放大** 检查粘连 → 两台相机各稳定出现 3 个黄色候选后点 **开始三维定位** →
    在现有三维视图中查看三点、三角形、几何中心与轨迹 → 匹配异常时点 **保存调试帧**，
-   把原始图/二值图/JSON 存到 `captures/led_debug/<时间戳>/` → 结束时点
+   把原始图/二值图/检测/诊断 JSON 存到 `captures/led_debug/<时间戳>/` → 结束时点
    **停止三维定位 / 停止二维检测**。参数保存在
    `captures/calibration/led_params.json`。
 
@@ -285,7 +289,7 @@ CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/in
 
 **参数**：默认灰度阈值 200、最小/最大面积 3/800 px²、最小峰值间距 6 px、光斑分离开启、
 拆分最小面积比 0.15、最小 solidity 0.35、最小填充率 0.20、最大长宽比 5、最大候选数 24、
-模糊核 3×3；另有极线 4 px、重投影 4 px、三角形边长容差 8 mm。两台相机共用默认值，
+模糊核 3×3；另有极线 4 px、重投影 4 px、三角形边长容差 10 mm（实机质心噪声下先给 10 mm，诊断会输出实际三边与误差）。两台相机共用默认值，
 可对阈值/最小面积/最大面积/最小峰值间距/光斑分离做相机 0/1 覆盖（留空=共用）。
 参数保存到 `captures/calibration/led_params.json`，支持恢复默认；修改后对最新同步帧
 重算一次。**注意**：`max_area=10` 这类过小值会把真实 LED 亮区当成“面积过大”拒绝，
@@ -304,6 +308,13 @@ CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/in
 候选对先按极线/重投影过滤，再做三组合枚举（最多 64 个候选对），不会对 24 个候选
 做无约束的笛卡尔积三角化。
 
+**相机映射（关键）**：两台 LRCP G720P 名称完全相同，USB 枚举顺序可能在重启/换口后
+互换。若把实时 cam0 的图配到标定 cam1 的 K/D/R/t，极线距离会达到几十~几百像素，
+三角化落到相机后方，表现就是“各有 3 个候选但 0 个匹配”。LED 服务现在同时构造
+`live0→calib0/live1→calib1` 和反向映射，对两种映射分别做完整极线/三角化，按
+“正深度 + 重投影通过 + 33 mm 三边”选择并锁定；状态、`/api/led/diagnose` 和调试 JSON
+都会显示当前映射。映射是设备枚举顺序问题，不改标定文件本身。
+
 **等边三角形**：三个 LED 完全相同，120° 对称无法仅凭几何消除；输出的 L0/L1/L2 只是
 **临时显示编号**，利用时间连续性保持稳定，`labels_are_temporary=true`。本版本不输出
 唯一航向或完整 6DoF。
@@ -313,13 +324,25 @@ CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/in
 0.6 s / 8 帧为 `lost` 并清除当前点，不把旧位置当作有效测量。
 
 **二维可视化**：复用标定面板已有的两路图像。可视化模式新增“红外 LED 检测可视化”，
-显示方式可选最终检测叠加/二值化/原始灰度/去畸变+极线；原始连通域为小蓝色十字、
+显示方式可选最终检测叠加/二值化/原始灰度/去畸变+候选极线诊断；原始连通域为小蓝色十字、
 通过筛选的候选为黄色空心圆、成功匹配为绿色实心点并只给这 3 个点写 L0/L1/L2、
 被拒绝亮区为细红框。这样不会再用 12 个黄色文字圆圈互相遮挡。支持 1×/2×/4× 局部放大
-（以匹配点或 ROI 为中心）；显示数量、ROI 模式、过曝/粘连提示和帧对 Δt。只有该模式
-请求 `/api/led/overlay`，不会同时执行棋盘格检测。定位运行时可点“保存调试帧”，把两台
-相机的原始 PNG、二值 PNG、检测叠加 JPG、`detections.json`、`state.json` 写到
-`captures/led_debug/<时间戳>/`，用于离线复现。
+（以匹配点或 ROI 为中心）；相机编号/原始候选数/筛选候选数/匹配数/状态/ROI/帧对/Δt
+固定显示在**右下角**，按实际输出尺寸和文字宽度动态右对齐，并带半透明深色背景；左下角
+保留颜色图例，两者不会重叠。原始灰度、二值化、最终检测和极线视图布局一致，放大后也
+按输出尺寸重新计算。只有该模式
+请求 `/api/led/overlay_pair`（一次返回同一 `pair_seq` 的两台相机图）或单路 `/api/led/overlay`，
+不会同时执行棋盘格检测；这样不会再出现 cam0 显示 pair 9464、cam1 显示 9466 的显示错位。
+
+**极线视图不依赖 matches**：只要两台相机有候选点且内外参有效，就把另一台相机每个候选点
+对应的极线画到当前去畸变图像上；每条极线/来源候选点使用同一种颜色，当前候选点按自身颜色
+标记。左上角距离表列出每个候选点到所有极线的**最小距离**，绿色 `OK` 表示 ≤ 当前极线阈值，
+橙色 `FAIL` 表示超阈值；`matched=0` 时也能直接看到候选关系为什么没配上。直线裁剪同时处理
+水平、倾斜和接近竖直的极线，不会因为 `b≈0` 缺失。该视图只用可视化数据，不改变极线/三角化/
+重投影/33 mm 的筛选条件。
+定位运行时可点“匹配诊断”查看原始/去畸变像素、3×3 极线距离、各阶段通过数和最佳三边；
+点“保存调试帧”把两台相机的原始 PNG、二值 PNG、检测叠加 JPG、`detections.json`、
+`diagnosis.json`、`state.json` 写到 `captures/led_debug/<时间戳>/`，用于离线复现。
 
 **三维可视化**：复用现有 Z 向上 Canvas 场景，增加三个 LED 点、三角形连线、几何中心、
 中心 X/Y/Z 标签、历史轨迹和有效性状态；鼠标视角状态不会被定位刷新重置。
@@ -331,23 +354,27 @@ CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/in
 **接口**（返回 JSON，叠加图为 JPEG）：
 
 ```text
-GET  /api/led/state          当前检测/定位状态、LED、三边、中心、速度、轨迹、ROI
+GET  /api/led/state          当前检测/定位状态、LED、三边、中心、速度、轨迹、ROI、相机映射
 GET  /api/led/params         默认值/共用值/相机覆盖/有效参数/ROI/保存路径
-POST /api/led/params         保存参数（body: {params, overrides, rois, roi_tracking}）
+POST /api/led/params         保存参数（body: {params, overrides, rois, roi_tracking, camera_map}）
 POST /api/led/params/reset   恢复默认（含 ROI）
 POST /api/led/detect/start|stop
 POST /api/led/locate/start|stop
 GET  /api/led/overlay?camera=0&view=detect|binary|raw|epipolar&zoom=1|2|4
-POST /api/led/debug/save     保存当前同步帧的原始图/二值图/检测 JSON
+GET  /api/led/overlay_pair   同一 pair_seq 的双相机叠加图（JSON + base64 JPEG）
+GET  /api/led/diagnose       分阶段匹配诊断（两种相机映射）
+POST /api/led/debug/save     保存原始图/二值图/检测/诊断 JSON
 ```
 
 **曝光/增益**：本机 LRCP G720P 是标准 UVC 设备，DirectShow 的 `IAMCameraControl` /
 `IAMVideoProcAmp` 实测可读可写，而且**不需要启动第二路取流**：创建 filter、
 QueryInterface 后直接 GetRange/Get/Set，Media Foundation 的 SourceReader 继续推流
-（已验证设置后 `streaming` 不中断）。网页每台相机卡片内有独立曝光/增益控制：
+（已验证设置后 `streaming` 不中断）。控件已从相机预览卡片移到“红外 LED 检测与定位”模块内，两台相机独立：
 曝光范围 **-13..-1**（log2 秒，约 0.12–500 ms，步长 1，支持自动曝光），
 增益 **0..63**（设备只支持手动）。每次设置都读回设备值，失败会显示错误，不会假装
-成功。`GET/POST /api/cameras/controls` 返回范围、当前值、自动/手动能力和读回结果。
+成功。`GET/POST /api/cameras/controls` 返回范围、当前值、自动/手动能力和读回结果；成功设置
+按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开或服务
+重启时自动恢复并读回验证（暂停/自动模式也会恢复），不再每 5 秒轮询设备属性。
 旧的 `helpers.py`（pseyepy exposure/gain）仍未使用。
 
 ### 6.5 网页版本与刷新
@@ -357,13 +384,14 @@ QueryInterface 后直接 GetRange/Get/Set，Media Foundation 的 SourceReader �
 - 页面每 2 s 检查一次版本；若 `git_sha` 或 `started_at` 变化（服务重启/更新），显示
   “服务已更新，请刷新页面”与刷新按钮，**不会自动刷新**。
 - API 始终同源；移除了 3001/3002 端口自动回退，普通 400/404/500 原样显示。
-- `/preview`、`/api/version`、`/api/led/state`、`/api/led/overlay` 使用 `no-store`；
-  标定面板收起时暂停标定状态轮询；LED 状态在面板打开时 4 Hz，后台标签页降频；
+- `/preview`、`/api/version`、`/api/led/state`、`/api/led/overlay_pair` 使用 `no-store`；
+  标定面板默认展开、页面初始化自动复用/创建会话；LED 状态 4 Hz，后台标签页降频；
   同步帧/参数变化才重新处理，避免重复三角化。
 
-LED 专项自检：`python -m led.selftest`，**41/41 通过**（合成光斑、粘连分离、过曝拒绝、
+LED 专项自检：`python -m led.selftest`，**50/50 通过**（合成光斑、粘连分离、过曝拒绝、
 细长反光过滤、ROI 坐标偏移、极线匹配、33 mm 三角化、缺失/几何不一致、绕向一致性、
-卡尔曼预测/丢失、服务帧去重、局部放大、调试帧保存、参数/ROI/单相机覆盖）。
+自动相机映射、卡尔曼预测/丢失、服务帧去重、同 pair 叠加图、matched=0 极线、水平/垂直
+极线裁剪、局部放大、调试帧保存、参数/ROI/单相机覆盖）。
 标定自检：**136/136 通过**（包含 LED UI/参数接口与版本接口检查）。
 
 ---
@@ -376,7 +404,8 @@ LED 专项自检：`python -m led.selftest`，**41/41 通过**（合成光斑、
 captures/calibration/
   intrinsics.json             最新有效内参（跨会话，两台相机合并保存）
   world_extrinsics.json       最新有效世界系外参（跨会话，含方向确认状态）
-  led_params.json             红外 LED 检测参数（共用 + 相机覆盖 + ROI）
+  led_params.json             红外 LED 检测参数（共用 + 相机覆盖 + ROI + 相机映射）
+  camera_controls.json        每台 USB 设备上次成功设置的曝光/自动曝光/增益
   <会话>/
     session.json              板规格（含 world_frame）、相机、分辨率、坐标约定
     samples.json              每条样本：phase、角点、质量、有效性、失败原因、Δt
@@ -392,6 +421,7 @@ captures/led_debug/<时间戳>/   “保存调试帧”输出
   cam0_binary.png / cam1_binary.png    当前参数下的二值图
   cam0_detect.jpg / cam1_detect.jpg    检测叠加图
   detections.json                      检测候选/拒绝原因/参数/ROI/帧对
+  diagnosis.json                       两种相机映射的原始/理想像素、极线矩阵、阶段计数
   state.json                           服务完整状态（跟踪、三边、轨迹）
 ```
 
@@ -456,6 +486,7 @@ K0, D0, K1, D1, R, T = stereo_matrices(data)    # 或 scaled_size=(640, 360)
 |---|---|---|
 | GET | `/api/calib/status` | 会话、样本计数（按 phase）、内外参状态、相机位姿摘要 |
 | POST | `/api/calib/session` | 新建/打开会话（`cols/rows/square_mm/surface_height_mm`） |
+| POST | `/api/calib/session/ensure` | 页面初始化幂等会话：已有复用，没有才创建（多标签页串行化） |
 | POST | `/api/calib/capture/single` | 采一张单相机图（默认 intrinsic，判重 + 质量门限） |
 | POST | `/api/calib/capture/extrinsic` | 采一张外参图（单相机兼容接口，固定板不判重） |
 | POST | `/api/calib/capture/extrinsic-pair` | **采集双相机图片**：一对同步帧分别写入两台相机的 `extrinsic` 阶段 |
@@ -473,7 +504,9 @@ K0, D0, K1, D1, R, T = stereo_matrices(data)    # 或 scaled_size=(640, 360)
 | POST | `/api/calib/save` | 写 `calibration.json` |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取矩阵 |
 | GET | `/api/version` | 真实 Git 短 SHA、分支、dirty、启动时间 |
-| GET/POST | `/api/cameras/controls` | 读/写 UVC 曝光、自动曝光、增益（见 6.4） |
+| GET/POST | `/api/cameras/controls` | 读/写 UVC 曝光、自动曝光、增益；按设备路径保存/恢复（见 6.4） |
+| POST | `/api/cameras/controls/restore` | 手动恢复每台设备上次保存的曝光/增益 |
+| GET | `/api/led/overlay_pair` · `/api/led/diagnose` | 同一帧对双相机叠加图 / 分阶段匹配诊断 |
 | * | `/api/led/*` | 红外检测/定位状态、参数、启停、叠加图、调试保存（见 6.4） |
 
 ---
@@ -491,7 +524,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 检测与求解，最后与真值比对。
 
 最近一次标定自检：**136/136 通过**（`--quick` 与完整模式均通过）；LED 专项自检
-`python -m led.selftest`：**41/41 通过**。合成数据（两台相机距板心
+`python -m led.selftest`：**50/50 通过**。合成数据（两台相机距板心
 ~1.8 m、基线 2032.78 mm）的代表性量级：
 
 | 项目 | 结果 |
@@ -576,6 +609,17 @@ python -m calibration.selftest --keep     :: 保留渲染图
     无效滑块。增益在本机只支持手动，自动增益不可用。
 14. **运动目标仍受软件同步限制**：LED 定位使用同步帧对，但两机曝光时刻仍有半帧级
     不确定度；静止或低速目标可用，高速运动必须另行评估或做硬件同步。
+15. **相机枚举顺序不是身份**：两台相机同名，重启/换 USB 口后实时 0/1 可能与标定
+    0/1 互换。LED 服务会自动判别并锁定映射；如果两路都没有足够正深度/重投影候选，
+    会保留上一映射并报 `lost/insufficient_detections`，不会在两个错误编号间跳变。
+16. **同步统计分“累计”和“最近 300 事件”**：启动/相机重开、DirectShow 控制刚设置后
+    可能有短暂丢帧，累计值会保留历史；实时状态请看 `recent` 和每路帧间隔。
+    本机帧间隔均值约 33.3 ms、P95 可到 ~48 ms（USB 调度抖动），20 ms 配对阈值下
+    偶发丢帧属于流式配对行为，不代表曝光设置失败；不要靠清零统计或放宽阈值掩盖。
+17. **自动会话不会清空结果**：页面初始化调用 `/api/calib/session/ensure`，已有会话
+    直接复用；没有才创建。服务重启后内存里的会话/结果会重新建立，最新内外参仍在
+    `intrinsics.json` / `world_extrinsics.json`，需要点“载入内参 / 载入世界坐标系外参”
+    恢复；载入外参会按既有逻辑更新兼容 `calibration.json`。
 
 ---
 

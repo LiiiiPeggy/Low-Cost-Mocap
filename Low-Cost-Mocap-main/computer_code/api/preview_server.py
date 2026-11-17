@@ -40,7 +40,6 @@ def build_app() -> Flask:
     def index():
         return ('<meta charset="utf-8"><h3>IR camera preview server</h3>'
                 '<p>预览页面：<a href="/preview">/preview</a>　'
-                '标定页面：<a href="/calibration">/calibration</a>　'
                 '状态接口：<a href="/api/cameras">/api/cameras</a></p>')
 
     return app

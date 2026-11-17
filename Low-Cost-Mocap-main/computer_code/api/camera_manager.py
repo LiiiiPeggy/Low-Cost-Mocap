@@ -124,11 +124,15 @@ class CameraWorker:
         self._fps_count = 0
         self._fps_t0 = time.perf_counter()
         self._frames_total = 0
+        self._last_frame_mono: float | None = None
+        self._intervals_ms: deque[float] = deque(maxlen=120)
 
         self.state = "idle"          # idle / opening / streaming / error / stopped
         self.error: str | None = None
         self.format_info: str | None = None
         self.device_name: str | None = None
+        self.device_link: str | None = None
+        self.control_restore: dict | None = None
         self._opened_at: float | None = None
 
     # -- 生命周期 ---------------------------------------------------------
@@ -174,7 +178,18 @@ class CameraWorker:
                 self.error = None
                 self.format_info = cam.info
                 self.device_name = self._device_name()
+                self.device_link = self._device_link()
                 self._opened_at = time.time()
+                # 按设备实例路径恢复上一次成功设置的曝光/增益；即使 USB
+                # 枚举顺序变化，也不会把 cam0 的参数写到 cam1。
+                try:
+                    import camera_controls
+                    self.control_restore = camera_controls.restore_controls(
+                        self.index, self.device_link)
+                except BaseException as exc:
+                    self.control_restore = {
+                        "ok": False,
+                        "error": "%s: %s" % (type(exc).__name__, exc)}
                 backoff = 0.5
 
                 while not self._stop_evt.is_set():
@@ -221,9 +236,24 @@ class CameraWorker:
             pass
         return None
 
+    def _device_link(self) -> str | None:
+        try:
+            for i, _friendly, link in irc.list_devices():
+                if i == self.index:
+                    return link
+        except BaseException:
+            pass
+        return None
+
     def _publish(self, gray: np.ndarray, mf_ts: int) -> None:
         now_wall = time.time()
         now_mono = time.perf_counter()
+        with self._cond:
+            if self._last_frame_mono is not None:
+                dt_ms = (now_mono - self._last_frame_mono) * 1000.0
+                if 0.0 < dt_ms < 2000.0:
+                    self._intervals_ms.append(dt_ms)
+            self._last_frame_mono = now_mono
         # NV12/YUY2 的 Y 平面是跨步视图（[:, ::2]），会连带持有整块 1.38MB 的
         # NV12 buffer。转成连续数组后：缓存 45 帧只占 45*0.92MB，
         # 且 cv2 编码/写盘不用再做隐式转换（对已连续的 MJPG 则是零拷贝）。
@@ -301,14 +331,32 @@ class CameraWorker:
 
     def status(self) -> dict:
         frame = self.latest()
+        with self._cond:
+            intervals = list(self._intervals_ms)
+        if intervals:
+            arr = np.asarray(intervals, np.float64)
+            interval = {
+                "mean_ms": round(float(arr.mean()), 2),
+                "p95_ms": round(float(np.percentile(arr, 95)), 2),
+                "max_ms": round(float(arr.max()), 2),
+                "min_ms": round(float(arr.min()), 2),
+                "samples": int(arr.size),
+                "delivered_fps": round(1000.0 / float(arr.mean()), 2)
+                if arr.mean() > 0 else None,
+            }
+        else:
+            interval = None
         return {
             "index": self.index,
             "name": self.device_name,
+            "device_link": self.device_link,
+            "control_restore": self.control_restore,
             "state": self.state,
             "error": self.error,
             "format": self.format_info,
             "requested": dict(self.requested),
             "fps": round(self._fps, 1),
+            "frame_interval_ms": interval,
             "frames_total": self._frames_total,
             "buffered": self.buffered,
             "frame": frame.meta() if frame else None,

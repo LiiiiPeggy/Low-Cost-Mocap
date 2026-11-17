@@ -116,6 +116,12 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                       % (len(leds0), len(leds1)),
             "matches": [], "leds": [], "raw_center": None,
             "detected_counts": [len(leds0), len(leds1)],
+            "diagnostics": {
+                "camera_map": calib.get("camera_map"),
+                "detected_counts": [len(leds0), len(leds1)],
+                "stage": "detection",
+                "reason": "每台相机至少需要 3 个候选点",
+            },
         }
 
     K0 = np.asarray(calib["K0"], np.float64)
@@ -140,39 +146,114 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
     rep_tol = float(params["reprojection_tol_px"])
     tol_m = float(params["triangle_tol_mm"]) / 1000.0
 
-    candidates = []
+    # 全量诊断：即使最终 0 匹配，也保留每个阶段的输入/结果，供网页和
+    # debug JSON 离线复现。大候选集时 pair_records 只保留前 64 条，矩阵完整。
+    diag = {
+        "camera_map": calib.get("camera_map"),
+        "calibration_ids": calib.get("calibration_ids"),
+        "detected_counts": [len(leds0), len(leds1)],
+        "raw_points_0": [[round(float(v), 3) for v in p] for p in pts0],
+        "raw_points_1": [[round(float(v), 3) for v in p] for p in pts1],
+        "ideal_points_0": [[round(float(v), 3) for v in p] for p in ip0],
+        "ideal_points_1": [[round(float(v), 3) for v in p] for p in ip1],
+        "R10": [[round(float(v), 8) for v in row] for row in R10],
+        "T10": [round(float(v), 8) for v in T10],
+        "F": [[round(float(v), 8) for v in row] for row in F],
+        "epipolar_tol_px": epi_tol,
+        "reprojection_tol_px": rep_tol,
+        "triangle_tol_mm": params["triangle_tol_mm"],
+        "epipolar_distances": [],
+        "epipolar_pass": 0,
+        "depth_pass": 0,
+        "reprojection_pass": 0,
+        "candidate_count": 0,
+        "triangle_combinations": 0,
+        "valid_triangles": 0,
+        "best_edges_mm": None,
+        "best_edge_errors_mm": None,
+        "best_reprojection_px": None,
+        "best_epipolar_px": None,
+        "best_triangle_indices": None,
+        "pairs": [],
+    }
+    epi_matrix = []
+    pair_infos = []
     for i in range(len(leds0)):
+        row = []
         for j in range(len(leds1)):
             epi, d0, d1 = _epipolar_distance(ip0[i], ip1[j], F)
-            if epi > epi_tol:
-                continue
-            Xh = cv2.triangulatePoints(P0, P1,
-                                       ip0[i].reshape(2, 1),
-                                       ip1[j].reshape(2, 1))
-            w = float(Xh[3, 0])
-            if abs(w) < 1e-12:
-                continue
-            Xw = (Xh[:3, 0] / w).astype(np.float64)
-            if not np.all(np.isfinite(Xw)):
-                continue
-            z0 = float((R0 @ Xw + t0)[2])
-            z1 = float((R1 @ Xw + t1)[2])
-            if z0 <= 0.1 or z1 <= 0.1:
-                continue
-            e0 = float(np.linalg.norm(_project_world(Xw, K0, D0, R0, t0) - pts0[i]))
-            e1 = float(np.linalg.norm(_project_world(Xw, K1, D1, R1, t1) - pts1[j]))
-            if max(e0, e1) > rep_tol:
-                continue
-            candidates.append({
-                "i0": i, "i1": j,
-                "xyz": Xw.tolist(),
-                "epipolar_px": round(epi, 4),
-                "epipolar_0_px": round(d0, 4),
-                "epipolar_1_px": round(d1, 4),
-                "reproj_0_px": round(e0, 4),
-                "reproj_1_px": round(e1, 4),
-                "score": epi + e0 + e1,
-            })
+            row.append(round(float(epi), 3))
+            info = {"i0": i, "i1": j, "epipolar_px": epi,
+                    "epipolar_0_px": d0, "epipolar_1_px": d1}
+            pair_infos.append(info)
+            if epi <= epi_tol:
+                diag["epipolar_pass"] += 1
+        epi_matrix.append(row)
+    diag["epipolar_distances"] = epi_matrix
+
+    candidates = []
+    for info in pair_infos:
+        i, j, epi = info["i0"], info["i1"], info["epipolar_px"]
+        rec = {
+            "i0": i, "i1": j,
+            "epipolar_px": round(float(epi), 3),
+            "epipolar_0_px": round(float(info["epipolar_0_px"]), 3),
+            "epipolar_1_px": round(float(info["epipolar_1_px"]), 3),
+            "passed_epipolar": bool(epi <= epi_tol),
+            "xyz": None, "z0": None, "z1": None,
+            "reproj_0_px": None, "reproj_1_px": None,
+            "passed_depth": False, "passed_reprojection": False,
+        }
+        if epi > epi_tol:
+            if len(diag["pairs"]) < 64:
+                diag["pairs"].append(rec)
+            continue
+        Xh = cv2.triangulatePoints(P0, P1,
+                                   ip0[i].reshape(2, 1),
+                                   ip1[j].reshape(2, 1))
+        w = float(Xh[3, 0])
+        if abs(w) < 1e-12:
+            if len(diag["pairs"]) < 64:
+                diag["pairs"].append(rec)
+            continue
+        Xw = (Xh[:3, 0] / w).astype(np.float64)
+        if not np.all(np.isfinite(Xw)):
+            if len(diag["pairs"]) < 64:
+                diag["pairs"].append(rec)
+            continue
+        z0 = float((R0 @ Xw + t0)[2])
+        z1 = float((R1 @ Xw + t1)[2])
+        rec.update({"xyz": [round(float(v), 6) for v in Xw],
+                    "z0": round(z0, 6), "z1": round(z1, 6)})
+        if z0 <= 0.1 or z1 <= 0.1:
+            if len(diag["pairs"]) < 64:
+                diag["pairs"].append(rec)
+            continue
+        rec["passed_depth"] = True
+        diag["depth_pass"] += 1
+        e0 = float(np.linalg.norm(_project_world(Xw, K0, D0, R0, t0) - pts0[i]))
+        e1 = float(np.linalg.norm(_project_world(Xw, K1, D1, R1, t1) - pts1[j]))
+        rec["reproj_0_px"] = round(e0, 3)
+        rec["reproj_1_px"] = round(e1, 3)
+        if max(e0, e1) > rep_tol:
+            if len(diag["pairs"]) < 64:
+                diag["pairs"].append(rec)
+            continue
+        rec["passed_reprojection"] = True
+        diag["reprojection_pass"] += 1
+        candidates.append({
+            "i0": i, "i1": j,
+            "xyz": Xw.tolist(),
+            "epipolar_px": round(epi, 4),
+            "epipolar_0_px": round(float(info["epipolar_0_px"]), 4),
+            "epipolar_1_px": round(float(info["epipolar_1_px"]), 4),
+            "reproj_0_px": round(e0, 4),
+            "reproj_1_px": round(e1, 4),
+            "score": epi + e0 + e1,
+        })
+        if len(diag["pairs"]) < 64:
+            diag["pairs"].append(rec)
+    diag["candidate_count"] = len(candidates)
 
     if len(candidates) < 3:
         return {
@@ -182,6 +263,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
             "matches": [], "leds": [], "raw_center": None,
             "detected_counts": [len(leds0), len(leds1)],
             "candidate_count": len(candidates),
+            "diagnostics": diag,
         }
 
     candidates.sort(key=lambda c: c["score"])
@@ -209,6 +291,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         orient1 = _signed_area(pts1[[ca["i1"], cb["i1"], cc["i1"]]])
         orient_ok = (abs(orient0) < 1e-9 or abs(orient1) < 1e-9
                      or (orient0 > 0) == (orient1 > 0))
+        diag["triangle_combinations"] += 1
         cand = {
             "indices": (a, b, c),
             "points": tri,
@@ -227,6 +310,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
             if best_bad is None or max_err < best_bad[0]:
                 best_bad = (max_err, cand)
             continue
+        diag["valid_triangles"] += 1
         # 边长误差为主，重投影/极线为辅；有历史时轻微偏向预测中心。
         # 边缘误差的离散度也计入，避免“两条 33 mm、一条 25 mm”这种组合。
         edge_std = float(edges.std())
@@ -248,6 +332,15 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
 
     if best is None:
         bad = best_bad[1] if best_bad else None
+        if bad is not None:
+            diag.update({
+                "best_edges_mm": [round(float(v * 1000), 3) for v in bad["edges"]],
+                "best_edge_errors_mm": [round(float(v * 1000), 3)
+                                        for v in bad["errs"]],
+                "best_reprojection_px": round(bad["mean_reproj"], 3),
+                "best_epipolar_px": round(bad["mean_epi"], 3),
+                "best_triangle_indices": list(bad["indices"]),
+            })
         return {
             "ok": False, "status": "geometry_mismatch",
             "reason": "没有三点组合满足 %.1f mm 等边三角形（容差 %.1f mm）"
@@ -261,6 +354,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                                          for v in bad["errs"]],
             "best_orientation_consistent": (None if bad is None
                                             else bad["orientation_consistent"]),
+            "diagnostics": diag,
         }
 
     second_score = None if second is None else second[0]
@@ -292,6 +386,14 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                 "reproj_0_px": c["reproj_0_px"],
                 "reproj_1_px": c["reproj_1_px"]}
                for k, c in enumerate(ordered_cands)]
+    diag.update({
+        "best_edges_mm": [round(float(v * 1000), 3) for v in chosen["edges"]],
+        "best_edge_errors_mm": [round(float(v * 1000), 3)
+                                for v in chosen["errs"]],
+        "best_reprojection_px": round(chosen["mean_reproj"], 3),
+        "best_epipolar_px": round(chosen["mean_epi"], 3),
+        "best_triangle_indices": list(chosen["indices"]),
+    })
     return {
         "ok": True,
         "status": "ok",
@@ -313,6 +415,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         "label_assignment": assignment,
         "detected_counts": [len(leds0), len(leds1)],
         "candidate_count": len(candidates),
+        "diagnostics": diag,
     }
 
 

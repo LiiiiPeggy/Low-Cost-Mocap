@@ -116,11 +116,47 @@ def cameras_controls_get():
                    else _parse_indices(None))
     except (TypeError, ValueError):
         return jsonify({"error": "camera 必须是逗号分隔的整数索引"}), 400
-    controls = [camera_controls.get_controls(i) for i in indices]
+    controls = []
+    for i in indices:
+        worker = manager().worker(i)
+        link = worker.device_link if worker else None
+        item = camera_controls.get_controls(i, link)
+        item["mf_device_link"] = link
+        if link and item.get("device_key"):
+            item["device_match"] = (camera_controls.device_key(link)
+                                    == camera_controls.device_key(
+                                        item.get("device_key")))
+        else:
+            item["device_match"] = None
+        controls.append(item)
     resp = jsonify({"controls": controls, "indices": indices,
                     "note": "曝光为 DirectShow 对数时间 log2(s)；增益为设备索引"})
     resp.headers["Cache-Control"] = "no-store"
     return resp
+
+
+def _runtime_snapshot() -> dict:
+    """曝光设置前后用于对比的轻量运行状态。"""
+    try:
+        sync = sync_service().status()
+    except Exception:
+        sync = {}
+    st = manager().status()
+    return {
+        "cameras": [{
+            "index": c.get("index"),
+            "state": c.get("state"),
+            "fps": c.get("fps"),
+            "frame_interval_ms": c.get("frame_interval_ms"),
+        } for c in st.get("cameras", [])],
+        "sync": {
+            "pair_rate": sync.get("pair_rate"),
+            "recent": sync.get("recent"),
+            "dt_ms": sync.get("dt_ms"),
+            "dropped": sync.get("dropped"),
+            "produced": sync.get("produced"),
+        },
+    }
 
 
 @bp.post("/api/cameras/controls")
@@ -146,16 +182,51 @@ def cameras_controls_set():
         return jsonify({"error": "exposure/gain 必须是数字，auto_exposure 必须是布尔值"}), 400
     if exposure is None and auto_exposure is None and gain is None:
         return jsonify({"error": "至少提供 exposure、auto_exposure、gain 之一"}), 400
+    worker = manager().worker(index)
+    link = worker.device_link if worker else None
+    before = _runtime_snapshot()
     try:
         result = camera_controls.set_controls(
-            index, exposure=exposure, auto_exposure=auto_exposure, gain=gain)
+            index, exposure=exposure, auto_exposure=auto_exposure, gain=gain,
+            device_link=link)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+    # 给同步/帧间隔统计一点时间反映设置后的状态（不修改任何统计）
+    time.sleep(0.25)
+    after = _runtime_snapshot()
+    result["before"] = before
+    result["after"] = after
+    result["mf_device_link"] = link
+    if link and result.get("device_key"):
+        result["device_match"] = (camera_controls.device_key(link)
+                                  == camera_controls.device_key(
+                                      result.get("device_key")))
     if not result.get("ok"):
         return jsonify(result), 409
     resp = jsonify(result)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@bp.post("/api/cameras/controls/restore")
+def cameras_controls_restore():
+    """手动恢复两台相机上次保存的曝光/增益（启动时也会自动恢复）。"""
+    body = request.get_json(silent=True) or {}
+    raw = body.get("indices")
+    try:
+        indices = (_parse_indices(raw) if raw not in (None, "")
+                   else _parse_indices(None))
+    except (TypeError, ValueError):
+        return jsonify({"error": "indices 必须是整数数组"}), 400
+    links = {}
+    for i in indices:
+        w = manager().worker(i)
+        if w and w.device_link:
+            links[str(i)] = w.device_link
+    results = camera_controls.restore_all(indices, links)
+    resp = jsonify({"ok": True, "results": results, "indices": indices})
     resp.headers["Cache-Control"] = "no-store"
     return resp
 

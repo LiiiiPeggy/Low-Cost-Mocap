@@ -20,6 +20,7 @@ import time
 import cv2
 import numpy as np
 
+from camera_controls import device_key as ctrl_device_key
 from led.detector import default_params, detect_leds, validate_params
 from led.geometry import match_and_triangulate
 from led.tracker import LedKalmanTracker
@@ -208,6 +209,16 @@ def test_geometry():
         check("两台相机三点绕向一致",
               res.get("orientation_consistent") is True,
               res.get("orientation_consistent"))
+        dg = res.get("diagnostics") or {}
+        check("匹配诊断包含原始/理想像素、极线矩阵和阶段计数",
+              dg.get("raw_points_0") and dg.get("ideal_points_0")
+              and dg.get("epipolar_distances")
+              and dg.get("epipolar_pass", 0) >= 3
+              and dg.get("depth_pass", 0) >= 3
+              and dg.get("reprojection_pass", 0) >= 3,
+              "epi=%s depth=%s rep=%s pairs=%s" % (
+                  dg.get("epipolar_pass"), dg.get("depth_pass"),
+                  dg.get("reprojection_pass"), dg.get("candidate_count")))
 
     rng = np.random.default_rng(7)
     noise = rng.normal(0, 0.25, p0.shape)
@@ -259,8 +270,73 @@ def test_geometry():
           res_bad.get("status"))
 
 
+def test_camera_mapping():
+    print("\n[3] 相机枚举顺序 <-> 标定编号自动映射")
+    from led.service import _build_calibration, _choose_mapping, _clip_line
+    K, D, R0, t0, R1, t1 = _rig()
+    world = _triangle()
+    p0 = project(world, K, D, R0, t0)
+    p1 = project(world, K, D, R1, t1)
+    snapshot = {
+        "intrinsics": {
+            "0": {"K": K.tolist(), "D": D.tolist(),
+                  "image_size": [1280, 720]},
+            "1": {"K": K.tolist(), "D": D.tolist(),
+                  "image_size": [1280, 720]},
+        },
+        "extrinsic": {
+            "orientation_confirmed": True,
+            "cameras": {
+                "0": {"R": R0.tolist(), "t": t0.tolist()},
+                "1": {"R": R1.tolist(), "t": t1.tolist()},
+            },
+            "board": {}, "world_frame": {},
+            "source": "selftest", "created": "test",
+        },
+        "board": {}, "image_size": [1280, 720],
+    }
+    ds_path = (r"\\?\usb#vid_bc15&pid_2e1b&mi_00#6&5332b2&0&0000"
+               r"#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global")
+    mf_path = (r"\\?\usb#vid_bc15&pid_2e1b&mi_00#6&5332b2&0&0000"
+               r"#{e5323777-f976-4f5b-9b55-b94699c46e44}\global")
+    check("DirectShow/MF 设备实例 key 归一化一致",
+          ctrl_device_key(ds_path) == ctrl_device_key(mf_path),
+          ctrl_device_key(ds_path))
+    vert = _clip_line(1.0, 0.0, -100.0, 1280, 720)
+    horiz = _clip_line(0.0, 1.0, -200.0, 1280, 720)
+    diag = _clip_line(0.6, 0.8, -300.0, 1280, 720)
+    check("极线裁剪：水平/竖直/倾斜都不缺失",
+          vert is not None and horiz is not None and diag is not None
+          and len({p[0] for p in vert}) == 1
+          and len({p[1] for p in horiz}) == 1,
+          "vert=%s horiz=%s diag=%s" % (vert, horiz, diag))
+    c01 = _build_calibration(snapshot, (0, 1))
+    c10 = _build_calibration(snapshot, (1, 0))
+    params = default_params()
+    params.update({"epipolar_tol_px": 4.0, "reprojection_tol_px": 4.0,
+                   "triangle_tol_mm": 8.0})
+    # 物理顺序与标定一致
+    r_id = match_and_triangulate(_dets(p0), _dets(p1), c01, params)
+    r_sw = match_and_triangulate(_dets(p0), _dets(p1), c10, params)
+    key, chosen = _choose_mapping({"0,1": r_id, "1,0": r_sw})
+    check("身份映射时选择实时0->标定0", key == "0,1" and chosen.get("ok"),
+          "chosen=%s id=%s swap=%s" % (key, r_id.get("ok"), r_sw.get("ok")))
+    # 物理顺序互换：实时 cam0 实际是标定 cam1
+    r_id2 = match_and_triangulate(_dets(p1), _dets(p0), c01, params)
+    r_sw2 = match_and_triangulate(_dets(p1), _dets(p0), c10, params)
+    key2, chosen2 = _choose_mapping({"0,1": r_id2, "1,0": r_sw2})
+    check("相机互换时自动选择实时0->标定1",
+          key2 == "1,0" and chosen2.get("ok"),
+          "chosen=%s id=%s swap=%s" % (key2, r_id2.get("ok"),
+                                       r_sw2.get("ok")))
+    if chosen2.get("ok"):
+        check("自动映射后三边仍为 33 mm",
+              max(abs(v - 33.0) for v in chosen2["edges_mm"]) < 0.5,
+              chosen2["edges_mm"])
+
+
 def test_tracker():
-    print("\n[3] 三维卡尔曼跟踪 / 短时预测 / 丢失")
+    print("\n[4] 三维卡尔曼跟踪 / 短时预测 / 丢失")
     tr = LedKalmanTracker()
     t = 100.0
     last = None
@@ -282,7 +358,7 @@ def test_tracker():
 
 def test_service_pipeline():
     """用假相机/假同步/假标定验证后台服务：去重、跟踪、叠加图。"""
-    print("\n[4] 后台服务：同步帧去重 / 三维状态 / 叠加图")
+    print("\n[5] 后台服务：同步帧去重 / 三维状态 / 叠加图")
     tmp = tempfile.mkdtemp(prefix="led_service_test_")
     old_env = os.environ.get("MOCAP_CALIB_DIR")
     os.environ["MOCAP_CALIB_DIR"] = tmp
@@ -434,6 +510,33 @@ def test_service_pipeline():
                 check("局部放大叠加图可生成",
                       len(data_z) > 1000 and info_z.get("zoom") == 2.0,
                       "bytes=%d zoom=%s" % (len(data_z), info_z.get("zoom")))
+                pair_imgs = svc.overlay_pair(view="detect")
+                cur = svc.state()
+                check("双相机叠加图来自同一 pair_seq",
+                      bool(pair_imgs.get("pair"))
+                      and all(pair_imgs["images"].get(k) for k in ("0", "1"))
+                      and pair_imgs.get("pair", {}).get("pair_seq") ==
+                      cur.get("pair", {}).get("pair_seq"),
+                      (pair_imgs.get("pair") or {}).get("pair_seq"))
+                dg = svc.diagnose()
+                check("匹配诊断接口返回原始/理想像素与阶段计数",
+                      bool(dg.get("diagnostics"))
+                      and "mappings" in dg["diagnostics"],
+                      list((dg.get("diagnostics") or {}).get("mappings", {})))
+                with svc._lock:
+                    saved_matches = list(svc._state.get("matches") or [])
+                    svc._state["matches"] = []
+                try:
+                    epi_data, epi_info = svc.overlay(0, view="epipolar", zoom=4)
+                finally:
+                    with svc._lock:
+                        svc._state["matches"] = saved_matches
+                check("matched=0 时极线视图仍能生成",
+                      len(epi_data) > 1000
+                      and epi_info.get("view") == "epipolar"
+                      and epi_info.get("matched") == 0,
+                      "bytes=%d matched=%s" % (len(epi_data),
+                                               epi_info.get("matched")))
                 dbg = svc.save_debug()
                 check("实机调试帧保存（原始图/二值图/JSON）",
                       os.path.isdir(dbg["abs_path"])
@@ -475,6 +578,7 @@ def test_service_pipeline():
 def main() -> int:
     test_detector()
     test_geometry()
+    test_camera_mapping()
     test_tracker()
     test_service_pipeline()
     print("\n" + "=" * 62)

@@ -59,6 +59,23 @@ def calib_session_create():
         return _fail(exc)
 
 
+@bp.post("/api/calib/session/ensure")
+def calib_session_ensure():
+    """页面初始化用：已有会话复用，没有才创建；多标签页幂等。"""
+    b = _body()
+    try:
+        return jsonify(service().ensure_session(
+            cols=int(b.get("cols", board_mod.DEFAULT_COLS)),
+            rows=int(b.get("rows", board_mod.DEFAULT_ROWS)),
+            square_mm=float(b.get("square_mm", board_mod.DEFAULT_SQUARE_MM)),
+            cameras=b.get("cameras") or [0, 1],
+            pixel_format=str(b.get("format", "")),
+            surface_height_m=float(b.get("surface_height_mm", 3.0)) / 1000.0,
+        ))
+    except Exception as exc:
+        return _fail(exc)
+
+
 @bp.post("/api/calib/session/load")
 def calib_session_load():
     """离线重算：把已采集的会话目录重新载入（不需要相机在线）。"""

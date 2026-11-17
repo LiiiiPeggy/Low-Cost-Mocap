@@ -117,6 +117,8 @@ class SyncService:
         self._dropped_a = 0
         self._dropped_b = 0
         self._recent: deque[PairRecord] = deque(maxlen=int(recent))
+        # 最近 300 个配对/丢弃事件，用于区分历史累计与当前实时状态
+        self._recent_events: deque[str] = deque(maxlen=300)
 
         # 配对率基线：同步启动那一刻两路各已产出多少帧
         self._base_a: int | None = None
@@ -147,6 +149,7 @@ class SyncService:
             self._dropped_a = 0
             self._dropped_b = 0
             self._recent.clear()
+            self._recent_events.clear()
             self._base_a = None
             self._base_b = None
 
@@ -233,7 +236,10 @@ class SyncService:
         # 一路停流：另一路的积压帧不可能再配上，按丢弃计，避免配对率虚高
         if i < len(A) and (now - lb.mono_ts) > self.stall_s:
             with self._lock:
-                self._dropped_a += len(A) - i
+                cnt = len(A) - i
+                self._dropped_a += cnt
+                for _ in range(cnt):
+                    self._recent_events.append("drop_a")
                 self._last_a = A[-1].seq
             i = len(A)
         elif i:
@@ -242,7 +248,10 @@ class SyncService:
 
         if j < len(B) and (now - la.mono_ts) > self.stall_s:
             with self._lock:
-                self._dropped_b += len(B) - j
+                cnt = len(B) - j
+                self._dropped_b += cnt
+                for _ in range(cnt):
+                    self._recent_events.append("drop_b")
                 self._last_b = B[-1].seq
             j = len(B)
         elif j:
@@ -255,6 +264,7 @@ class SyncService:
             self._pairs_total += 1
             self._dt_ms.append(abs(dt_ms))
             self._dt_signed.append(dt_ms)
+            self._recent_events.append("pair")
             self._last_pair_mono = time.perf_counter()
             self._recent.append(PairRecord(
                 pair_seq=self._pairs_total, dt_ms=dt_ms,
@@ -267,6 +277,19 @@ class SyncService:
                 self._dropped_a += 1
             else:
                 self._dropped_b += 1
+            self._recent_events.append("drop_a" if which == "a" else "drop_b")
+
+    def _drop_many(self, which: str, count: int) -> None:
+        if count <= 0:
+            return
+        with self._lock:
+            if which == "a":
+                self._dropped_a += count
+            else:
+                self._dropped_b += count
+            for _ in range(count):
+                self._recent_events.append(
+                    "drop_a" if which == "a" else "drop_b")
 
     # -- 读取 -------------------------------------------------------------
     def status(self) -> dict:
@@ -283,6 +306,7 @@ class SyncService:
             base_a, base_b = self._base_a, self._base_b
             last_pair = self._last_pair_mono
             recent = list(self._recent)
+            recent_events = list(self._recent_events)
 
         produced_a = (wa.frames_total - base_a) if (wa and base_a is not None) else 0
         produced_b = (wb.frames_total - base_b) if (wb and base_b is not None) else 0
@@ -301,6 +325,32 @@ class SyncService:
             "signed_mean": float(signed.mean()) if signed.size else None,
         }
         now = time.perf_counter()
+        rp = recent_events.count("pair")
+        rda = recent_events.count("drop_a")
+        rdb = recent_events.count("drop_b")
+        rden = max(rp + rda, rp + rdb)
+        recent_stats = {
+            "events": len(recent_events),
+            "pairs": rp,
+            "dropped": {"a": rda, "b": rdb},
+            "pair_rate": round(rp / rden, 4) if rden else None,
+            "definition": "最近 300 个配对/丢弃事件；与累计值分开显示",
+            "dt_ms": {k: (round(v, 3) if v is not None else None)
+                      for k, v in stats.items()},
+        }
+        camera_stats = {}
+        for idx, worker in ((self.idx_a, wa), (self.idx_b, wb)):
+            if worker is None:
+                camera_stats[str(idx)] = None
+                continue
+            st = worker.status()
+            camera_stats[str(idx)] = {
+                "state": st.get("state"),
+                "fps": st.get("fps"),
+                "frame_interval_ms": st.get("frame_interval_ms"),
+                "frames_total": st.get("frames_total"),
+                "buffered": st.get("buffered"),
+            }
         return {
             "running": self.alive,
             "error": self._error,
@@ -313,6 +363,8 @@ class SyncService:
             "dt_ms": {k: (round(v, 3) if v is not None else None) for k, v in stats.items()},
             "pair_rate": round(pairs_total / denom, 4) if denom else None,
             "pair_rate_definition": "配对成功数 / 已消费帧数（配对+丢弃），两路取较大者",
+            "recent": recent_stats,
+            "camera_stats": camera_stats,
             "produced": {"a": produced_a, "b": produced_b},
             "consumed": {"a": consumed_a, "b": consumed_b},
             "dropped": {"a": dropped_a, "b": dropped_b},

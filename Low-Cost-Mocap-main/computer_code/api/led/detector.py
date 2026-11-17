@@ -43,7 +43,7 @@ DEFAULT_PARAMS = {
     "saturation_value": 250,      # 视为饱和的像素值
     "epipolar_tol_px": 4.0,       # 双相机极线距离阈值（去畸变理想像素）
     "reprojection_tol_px": 4.0,   # 三角化点的重投影误差阈值
-    "triangle_tol_mm": 8.0,       # 33 mm 等边三角形的边长容差
+    "triangle_tol_mm": 10.0,      # 33 mm 等边三角形的边长容差；实机质心噪声下先给 10mm
 }
 
 # 每个数值参数的允许范围；用于 API 校验，避免误输入把检测拖死。
