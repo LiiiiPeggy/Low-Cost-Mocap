@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
 import shutil
@@ -641,12 +642,180 @@ def test_service_pipeline():
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def test_recorder():
+    """连续录制：同步帧对图像、诊断配对、未处理帧和线程收尾。"""
+    print("\n[6] 连续调试录制：同步帧对 / 诊断配对 / 收尾")
+    import led.recorder as LR
+    from camera_manager import Frame
+    from sync import PairRecord
+
+    tmp = tempfile.mkdtemp(prefix="led_recording_test_")
+
+    class FakeSync:
+        def __init__(self):
+            self.pairs = []
+
+        def recent_pairs(self, count=1):
+            return list(self.pairs)[-max(1, int(count)):]
+
+    fake = FakeSync()
+    orig = LR.sync_service
+    LR.sync_service = lambda: fake
+    rec = rec2 = None
+    try:
+        rec = LR.LedRecorder(poll_s=0.002, queue_size=8)
+        st = rec.start({"processing": True,
+                        "params": {"threshold": 150}}, tmp)
+        check("开始录制创建 session.json",
+              st.get("recording") is True
+              and os.path.isfile(os.path.join(st["abs_path"], "session.json")),
+              st.get("directory"))
+
+        def diag(status, reason=""):
+            return {
+                "status": status, "valid": status == "tracking",
+                "reason": reason,
+                "detections": {"0": {"count": 3}, "1": {"count": 3}},
+                "matches": [], "leds": [], "raw_center": [0.0, 0.0, 1.0],
+                "filtered_center": [0.0, 0.0, 1.0],
+                "edges_mm": [34.0, 79.0, 79.0], "edge_errors_mm": [0, 0, 0],
+                "diagnostics": {"epipolar_pass": 3, "depth_pass": 3,
+                                "reprojection_pass": 3},
+            }
+        rec.note_result(1, diag("tracking"),
+                        {"epipolar_distances": [[0.5, 1.2]],
+                         "raw_points_0": [[10.0, 20.0]]})
+        rec.note_result(2, diag("lost", "几何不一致"))
+        t0 = time.perf_counter()
+        for i in range(100):
+            rec.note_result(1000 + i, diag("predicted"))
+        note_ms = (time.perf_counter() - t0) * 1000.0
+        check("登记诊断不执行 PNG 编码且调用开销低", note_ms < 1000.0,
+              "%.1f ms/100 次" % note_ms)
+
+        def frame(img, seq):
+            return Frame(gray=img, seq=seq, mf_ts=seq * 333333,
+                         host_ts=time.time(), mono_ts=time.perf_counter())
+
+        for i in range(3):
+            img0 = np.full((48, 64), 40 + i, np.uint8)
+            img1 = np.full((48, 64), 80 + i, np.uint8)
+            fake.pairs.append(PairRecord(
+                pair_seq=i + 1, dt_ms=0.3,
+                frame_a=frame(img0, i + 1), frame_b=frame(img1, i + 1),
+                created_mono=time.perf_counter()))
+
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if rec.status().get("saved_pairs", 0) >= 3:
+                break
+            time.sleep(0.02)
+        stopped = rec.stop()
+        check("停止录制后线程和文件正常关闭",
+              stopped.get("recording") is False
+              and stopped.get("status") == "stopped"
+              and not rec._capture_thread.is_alive()
+              and not rec._writer_thread.is_alive()
+              and rec._frames_fh is None,
+              "%s saved=%s" % (stopped.get("status"),
+                               stopped.get("saved_pairs")))
+
+        outdir = stopped["abs_path"]
+        frames_path = os.path.join(outdir, "frames.jsonl")
+        lines = []
+        if os.path.isfile(frames_path):
+            with open(frames_path, encoding="utf-8") as fh:
+                lines = [json.loads(line) for line in fh if line.strip()]
+        check("每对同步帧都有 PNG 和 JSON 行", len(lines) == 3,
+              "lines=%d saved=%s" % (len(lines),
+                                     stopped.get("saved_pairs")))
+        if len(lines) == 3:
+            pairs_ok = [x.get("pair", {}).get("pair_seq") for x in lines] \
+                == [1, 2, 3]
+            images_ok = all(
+                os.path.isfile(os.path.join(outdir, x["images"][cam]))
+                for x in lines for cam in ("0", "1"))
+            names_ok = all(
+                x["images"]["0"] == "frames/%06d_cam0.png" % x["index"]
+                and x["images"]["1"] == "frames/%06d_cam1.png" % x["index"]
+                for x in lines)
+            check("PNG 文件名与 JSON 帧号一一对应",
+                  pairs_ok and images_ok and names_ok,
+                  [(x.get("index"), x.get("pair", {}).get("pair_seq"))
+                   for x in lines])
+            statuses = [x.get("led_status") for x in lines]
+            check("定位成功/失败/未处理帧均记录",
+                  statuses == ["tracking", "lost", "not_processed"]
+                  and lines[0].get("led", {}).get("status") == "tracking"
+                  and lines[0].get("led", {}).get("diagnostics", {}).get(
+                      "epipolar_distances") == [[0.5, 1.2]]
+                  and lines[1].get("led", {}).get("reason") == "几何不一致"
+                  and lines[2].get("led") is None,
+                  statuses)
+        with open(os.path.join(outdir, "session.json"), encoding="utf-8") as fh:
+            session = json.load(fh)
+        check("session.json 保存结束统计与参数",
+              session.get("status") == "stopped"
+              and session.get("stats", {}).get("saved_pairs") == 3
+              and session.get("params", {}).get("threshold") == 150,
+              session.get("stats"))
+        check("页面刷新可恢复录制状态",
+              stopped.get("directory", "").endswith(
+                  os.path.basename(outdir))
+              and stopped.get("saved_pairs") == 3
+              and stopped.get("elapsed_s") is not None,
+              stopped.get("directory"))
+
+        # 写盘故意变慢时有界队列应丢帧计数，而不是阻塞采集/定位线程。
+        fake2 = FakeSync()
+        LR.sync_service = lambda: fake2
+        rec2 = LR.LedRecorder(poll_s=0.002, queue_size=2)
+        original_write = rec2._write_record
+
+        def slow_write(item):
+            time.sleep(0.08)
+            original_write(item)
+
+        rec2._write_record = slow_write
+        rec2.start({"processing": False}, os.path.join(tmp, "slow"))
+        for i in range(20):
+            fake2.pairs.append(PairRecord(
+                pair_seq=i + 1, dt_ms=0.2,
+                frame_a=frame(np.full((48, 64), i, np.uint8), i + 1),
+                frame_b=frame(np.full((48, 64), i + 20, np.uint8), i + 1),
+                created_mono=time.perf_counter()))
+            time.sleep(0.002)
+        deadline = time.time() + 2.0
+        while time.time() < deadline:
+            st2 = rec2.status()
+            if st2.get("dropped_queue_full", 0) > 0:
+                break
+            time.sleep(0.02)
+        st2 = rec2.status()
+        check("有界队列满时记录丢帧且不阻塞采集",
+              st2.get("pairs_seen", 0) >= 20
+              and st2.get("dropped_queue_full", 0) > 0,
+              "seen=%s dropped=%s" % (st2.get("pairs_seen"),
+                                      st2.get("dropped_queue_full")))
+        rec2.stop()
+    finally:
+        for item in (rec, rec2):
+            if item is not None:
+                try:
+                    item.stop()
+                except Exception:
+                    pass
+        LR.sync_service = orig
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> int:
     test_detector()
     test_geometry()
     test_camera_mapping()
     test_tracker()
     test_service_pipeline()
+    test_recorder()
     print("\n" + "=" * 62)
     passed = sum(1 for _, ok, _ in RESULT if ok)
     failed = [(n, d) for n, ok, d in RESULT if not ok]

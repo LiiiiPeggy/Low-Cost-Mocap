@@ -222,7 +222,7 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | POST | `/api/calib/save` | 写当前会话 `calibration.json`；可选 `path` 额外导出 |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
 | GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
-| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数、ROI、调试保存与三维定位 |
+| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` · `/record/start` 等 | LED 检测、参数、ROI、调试保存、连续录制与三维定位 |
 | GET/POST | `/api/cameras/controls` | UVC 曝光/自动曝光/增益范围、当前值、设置与读回验证；POST `/controls/restore` 恢复保存值 |
 | GET | `/api/led/overlay_pair` · `/api/led/diagnose` | 同一同步帧对的双相机叠加图；分阶段极线/三角化诊断 |
 | POST | `/api/calib/session/ensure` | 页面初始化幂等会话：已有复用，没有才创建 |
@@ -233,14 +233,14 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
 python -m calibration.selftest   :: 141/141
-python -m led.selftest           :: 60/60
+python -m led.selftest           :: 69/69
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
 同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、会话结果、
 LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
-ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存与接口。
-最近一次（2026-11-17）：**141/141 + 60/60 通过**。
+ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存、连续录制与接口。
+最近一次（2026-11-17）：**141/141 + 69/69 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
@@ -254,9 +254,10 @@ ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟�
 - **极线诊断视图**：不依赖最终 matches；两台相机有候选点即绘制另一路每个候选的极线，同色标记来源，距离表显示最小极线距离与 OK/FAIL，支持水平/倾斜/近竖直极线裁剪。匹配门槛不变。
 - **信息布局**：相机编号、候选/匹配数量、状态、ROI、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
 - **三维方向**：有效跟踪时，从灯板几何中心沿“短边中点 → L0”画橙色箭头；预测/丢失状态不画。该方向不是机器人航向角。相机模型与视锥体绘制尺寸为原来的 50%，相机坐标和基线不变。
+- **连续调试录制**：在“保存调试帧”旁点 **开始录制/停止录制**。录制线程只轮询现有 `sync_service().recent_pairs()`（不新开相机、不重复同步），写盘线程保存每个同步帧对的两张 1280×720 原始灰度 PNG 和对应诊断 JSONL；未经过 LED 处理的帧仍保存图像并标记 `not_processed`。输出到 `captures/led_recordings/YYYYMMDD_HHMMSS/`（`session.json`、`frames.jsonl`、`frames/000001_cam0.png` 等）。页面显示录制时长、已保存帧组、丢帧数和目录，刷新后从 `/api/led/state` 恢复真实状态。PNG 用压缩等级 1；本机用实机调试帧按 29.9 组/秒回放压测，队列为空、无丢帧。
 - **限制**：L1/L2 是短边端点，物理身份不唯一；L0 由两条 79 mm 边唯一确定。**不输出唯一航向或完整 6DoF**。
 - **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、极线 5 px、三边容差 20 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
-- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|overlay_pair|diagnose|debug/save`，以及 `/api/cameras/controls`。
+- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|overlay_pair|diagnose|debug/save|record/start|stop|status`，以及 `/api/cameras/controls`。
 - **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；控件已移动到“红外 LED 检测与定位”模块内，相机 0/1 独立。设置按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开/服务重启后自动恢复并读回验证；不再每 5 秒轮询设备属性。装机时用实际 850 nm LED 确认亮度与检测阈值。
 
 完整说明见 [docs/calibration.md](docs/calibration.md) §6.4。

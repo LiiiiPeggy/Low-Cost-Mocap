@@ -24,6 +24,7 @@ import camera_preview  # noqa: E402
 import calibration.routes as calibration_routes  # noqa: E402
 import led.routes as led_routes  # noqa: E402
 from camera_manager import manager  # noqa: E402
+from led.recorder import recorder as led_recorder  # noqa: E402
 from sync import sync_service  # noqa: E402
 
 
@@ -84,6 +85,10 @@ def main(argv=None) -> int:
         app.run(host=args.host, port=args.port, debug=args.debug, threaded=True,
                 use_reloader=False)
     finally:
+        try:
+            led_recorder().stop()
+        except Exception as exc:
+            print("[警告] 停止 LED 录制失败：%s" % exc, file=sys.stderr)
         m.shutdown()
         print("\n相机已释放")
     return 0

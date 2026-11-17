@@ -163,6 +163,36 @@ def led_diagnose():
         return _fail(exc, 500)
 
 
+@bp.post("/api/led/record/start")
+def led_record_start():
+    try:
+        return jsonify(service().start_recording())
+    except RuntimeError as exc:
+        return _fail(exc, 409)
+    except ValueError as exc:
+        return _fail(exc, 400)
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
+@bp.post("/api/led/record/stop")
+def led_record_stop():
+    try:
+        return jsonify(service().stop_recording())
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
+@bp.get("/api/led/record/status")
+def led_record_status():
+    try:
+        resp = jsonify(service().recording_state())
+        resp.headers["Cache-Control"] = "no-store"
+        return resp
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
 @bp.post("/api/led/debug/save")
 def led_debug_save():
     try:

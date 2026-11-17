@@ -346,6 +346,14 @@
         <span id="l-state" class="badge">未启动</span>
       </div>
       <div class="row">
+        <b>连续调试录制</b>
+        <button id="l-record-start" class="primary">开始录制</button>
+        <button id="l-record-stop" disabled>停止录制</button>
+        <span id="l-record-state" class="badge">未录制</span>
+        <span id="l-record-info" class="hintline">—</span>
+        <span class="hintline">保存同步帧对原始灰度 PNG + 定位诊断；目录 captures/led_recordings/</span>
+      </div>
+      <div class="row">
         <label>显示
           <select id="l-view">
             <option value="detect">最终检测叠加</option>
@@ -1669,7 +1677,54 @@ function ledStatusName(s) {
   return LED_STATUS_NAMES[s.status] || s.status || '—';
 }
 
+function fmtLedDuration(sec) {
+  const total = Math.max(0, Math.floor(+(sec || 0)));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  return (h ? h + ':' : '') + String(m).padStart(2, '0') + ':'
+    + String(s).padStart(2, '0');
+}
+
+function renderLedRecording(r) {
+  const tag = el('l-record-state');
+  const info = el('l-record-info');
+  if (!tag || !info) return;
+  const active = !!(r && r.recording);
+  const status = (r && r.status) || 'idle';
+  const label = active ? '录制中'
+    : (status === 'error' ? '录制错误'
+      : (status === 'stopped' ? '已停止' : '未录制'));
+  tag.textContent = label;
+  tag.className = 'badge ' + (active ? 'ok'
+    : (status === 'error' ? 'err' : (status === 'stopped' ? 'warn' : '')));
+  if (r && r.directory) {
+    const fps = (v) => (v === null || v === undefined) ? '—' : v;
+    info.textContent = '已录制 ' + fmtLedDuration(r.elapsed_s)
+      + ' · 帧组 ' + (r.saved_pairs || 0)
+      + ' · 丢帧 ' + (r.dropped_pairs || 0)
+      + ' · 同步 ' + fps(r.sync_fps) + '/s'
+      + ' · LED ' + fps(r.led_fps) + '/s'
+      + ' · 保存 ' + fps(r.saved_fps) + '/s'
+      + (r.error ? (' · 错误：' + r.error) : '')
+      + ' · ' + r.directory;
+    info.title = '同步 ' + (r.sync_fps === null || r.sync_fps === undefined
+      ? '—' : r.sync_fps) + ' 组/s · LED 处理 '
+      + (r.led_fps === null || r.led_fps === undefined ? '—' : r.led_fps)
+      + ' 帧/s · 写盘 '
+      + (r.saved_fps === null || r.saved_fps === undefined ? '—' : r.saved_fps)
+      + ' 组/s'
+      + (r.error ? ('\n错误：' + r.error) : '');
+  } else {
+    info.textContent = '—';
+    info.title = (r && r.error) ? ('错误：' + r.error) : '';
+  }
+  if (el('l-record-start')) el('l-record-start').disabled = active;
+  if (el('l-record-stop')) el('l-record-stop').disabled = !active;
+}
+
 function renderLedState(s) {
+  renderLedRecording(s && s.recording);
   const tag = el('l-state');
   if (tag) {
     const name = ledStatusName(s);
@@ -1878,6 +1933,30 @@ el('l-debug-save').onclick = async () => {
     cLog('保存调试帧失败：' + e.message);
   } finally { el('l-debug-save').disabled = false; }
 };
+
+async function ledRecordingAction(path, label) {
+  const btn = el(path.endsWith('/start') ? 'l-record-start' : 'l-record-stop');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api(path, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+    cLog(label + '：' + (r.directory || '—')
+      + (r.recording ? '' : ('（帧组 ' + (r.saved_pairs || 0) + '，丢帧 '
+        + (r.dropped_pairs || 0) + '）')));
+    await refreshLed();
+  } catch (e) {
+    cLog(label + '失败：' + e.message);
+  } finally {
+    // 按钮启停由后端 recording 状态统一决定，避免刷新前重复点击。
+    refreshLed();
+  }
+}
+el('l-record-start').onclick = () => ledRecordingAction(
+  '/api/led/record/start', '开始录制');
+el('l-record-stop').onclick = () => ledRecordingAction(
+  '/api/led/record/stop', '停止录制');
 
 setInterval(() => {
   if (document.hidden) {

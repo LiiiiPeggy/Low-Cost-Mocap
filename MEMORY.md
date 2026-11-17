@@ -48,7 +48,7 @@
 - 采集不重开相机，直接从运行中的 `CameraManager` / `SyncService` 取帧；每次要求新序号，最多等待约 1.5 s。验证同步帧对按 `(seq_a, seq_b)` 去重，外参“采集双相机图片”按 `pair_seq` 去重。
 - CLI 默认经 HTTP 复用运行中的 `preview_server.py` 相机；`--local` 才在当前进程采集；服务未运行时 `new` 可本地建会话。
 - 数据默认在 `computer_code/captures/calibration/<session_id>/`；对外写项目相对路径，内部解析为绝对路径（不依赖启动 CWD）；旧绝对路径仍可读。
-- **合成自检通过 ≠ 实机精度**。历史自检：`cd7e991` 77/77、`c353edf` 102/102、当前工作区 calibration 141/141 + LED 60/60（2026-11-17 复跑）。
+- **合成自检通过 ≠ 实机精度**。历史自检：`cd7e991` 77/77、`c353edf` 102/102、当前工作区 calibration 141/141 + LED 69/69（2026-11-17 复跑）。
 
 ## 红外 LED 检测与三角化
 
@@ -65,7 +65,8 @@
 - 双相机叠加图改为 `/api/led/overlay_pair` 一次取同一 `pair_seq` 快照，避免前端分别刷新导致 cam0/cam1 显示不同 pair；`/api/led/diagnose` 输出两种映射的原始/理想像素、3×3 极线距离和各阶段计数。
 - 极线视图不依赖 matches：候选点即可画另一路极线，同色标记来源，距离表显示最小距离与 OK/FAIL；`_clip_line` 处理水平/倾斜/近竖直极线。
 - 叠加图相机信息整体移到底部右侧，按输出尺寸/文字宽度动态右对齐并使用半透明深色背景；左下角图例保留，所有视图/局部放大复用同一信息面板函数。
-- “保存调试帧”输出 `captures/led_debug/<时间戳>/` 的原始 PNG、二值 PNG、叠加 JPG、`detections.json`、`diagnosis.json`、`state.json`；文件与诊断来自同一 pair。当前 LED 自检 **60/60**（合成/假相机）；实机已有三点跟踪成功记录，但尚未完成精度验收。
+- “保存调试帧”输出 `captures/led_debug/<时间戳>/` 的原始 PNG、二值 PNG、叠加 JPG、`detections.json`、`diagnosis.json`、`state.json`；文件与诊断来自同一 pair。当前 LED 自检 **69/69**（合成/假相机）；实机已有三点跟踪成功记录，但尚未完成精度验收。
+- 连续录制只轮询现有 `sync_service().recent_pairs()`，不新开相机/不重复同步；独立写盘线程保存 `captures/led_recordings/<时间戳>/frames.jsonl` 与 `frames/NNNNNN_cam0|1.png`。LED 线程 `note_result(pair_seq, state)` 只登记已有结果，按 pair_seq 对齐；未处理帧标 `not_processed`。本机用实机调试帧按 29.9 组/秒回放压测：90 对全部保存、队列为空、无丢帧；PNG 压缩等级 1。
 - 本机实测：正确映射后 cam1 曝光 -10 + 阈值 210 覆盖，三边约 32.6–35.2 mm、重投影约 1.3 px；cam1 -11 时检测出 5 个候选但匹配能选出真实三点（三边 32.4/34.2/34.0）。这些是当前场景数据，不是通用默认值。
 
 ## 工程与运维

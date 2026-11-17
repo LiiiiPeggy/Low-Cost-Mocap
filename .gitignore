@@ -19,6 +19,7 @@ upstream/
 # ---- 运行产物 ----
 ir_*.png
 *.log
+# 含 calibration/、led_debug/、led_recordings/ 运行产物
 captures/
 _saved_raw/
 _snap.png

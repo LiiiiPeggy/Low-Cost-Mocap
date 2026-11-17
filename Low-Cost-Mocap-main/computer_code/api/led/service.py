@@ -37,6 +37,7 @@ from led.detector import (
 from led.geometry import (
     fundamental_from_pose, ideal_pixels, match_and_triangulate, relative_pose,
 )
+from led.recorder import recorder
 from led.tracker import LedKalmanTracker
 
 DEFAULT_PARAMS_PATH = os.path.join(DEFAULT_SESSION_ROOT, "led_params.json")
@@ -687,6 +688,7 @@ class LedService:
                                     "reason": "等待同步帧对"})
                 self._state["params"] = self._params_state_locked()
             self._start_thread_locked()
+        recorder().set_processing(True)
         return self.state()
 
     def stop_detection(self) -> dict:
@@ -702,6 +704,7 @@ class LedService:
             self._state["status"] = "stopped"
             self._state["reason"] = "二维检测已停止"
             self._state["params"] = self._params_state_locked()
+        recorder().set_processing(False)
         return self.state()
 
     def start_locate(self) -> dict:
@@ -731,6 +734,7 @@ class LedService:
                 "trajectory": [],
                 "calibration": self._calib_summary_locked(),
             })
+        recorder().set_processing(True)
         return self.state()
 
     def stop_locate(self) -> dict:
@@ -748,6 +752,7 @@ class LedService:
                 "expected_edges_mm": None, "board_direction": None,
                 "trajectory": [],
             })
+        recorder().set_processing(bool(self._detect))
         return self.state()
 
     def _start_thread_locked(self) -> None:
@@ -1053,6 +1058,12 @@ class LedService:
                 "last_error": self._last_error,
             }
             self._state = state
+        # 连续录制只登记这一帧已经完成的检测/定位结果，不重算任何东西；
+        # note_result 内部不写盘，实际 PNG/JSONL 由录制写盘线程完成。
+        try:
+            recorder().note_result(rec.pair_seq, state, m.get("diagnostics"))
+        except Exception:
+            pass
 
     def _calib_summary_locked(self, calib=None) -> dict | None:
         calib = calib or self._calib
@@ -1118,7 +1129,15 @@ class LedService:
 
     def state(self) -> dict:
         with self._lock:
-            return copy.deepcopy(self._state)
+            out = copy.deepcopy(self._state)
+        try:
+            out["recording"] = recorder().status()
+        except Exception as exc:
+            out["recording"] = {
+                "ok": False, "recording": False, "status": "error",
+                "error": str(exc).strip().splitlines()[-1],
+            }
+        return out
 
     def calibration_state(self) -> dict:
         with self._lock:
@@ -1185,6 +1204,48 @@ class LedService:
             mode = copy.deepcopy(self._camera_map_mode)
         return payload(state, diag, mode,
                        state.get("camera_map") or diag.get("active_map"))
+
+    # ------------------------------------------------------------------
+    # 连续调试录制
+    # ------------------------------------------------------------------
+    def start_recording(self) -> dict:
+        """开始复用同步帧对的连续录制；不新开相机、不重跑 LED 定位。"""
+        self._check_cameras()
+        with self._lock:
+            session = {
+                "created": _now_iso(),
+                "processing": bool(self._detect or self._locate),
+                "led": {
+                    "detect_enabled": bool(self._detect),
+                    "locate_enabled": bool(self._locate),
+                    "status": self._state.get("status"),
+                },
+                "params": self._params_state_locked(),
+                "calibration": self._calib_summary_locked(),
+                "camera_map": {
+                    "mode": copy.deepcopy(self._camera_map_mode),
+                    "effective": ((self._calib or {}).get("camera_map")),
+                    "confirmed": bool(self._mapping_confirmed),
+                },
+            }
+            try:
+                session["sync_max_dt_ms"] = sync_service().max_dt_ms
+            except Exception:
+                pass
+        try:
+            session["cameras"] = manager().status().get("cameras") or []
+        except Exception:
+            session["cameras"] = []
+        root = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(self._params_path))),
+            "led_recordings")
+        return recorder().start(session, root)
+
+    def stop_recording(self) -> dict:
+        return recorder().stop()
+
+    def recording_state(self) -> dict:
+        return recorder().status()
 
     # ------------------------------------------------------------------
     # 实机调试保存

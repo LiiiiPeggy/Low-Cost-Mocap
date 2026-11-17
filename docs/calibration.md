@@ -91,8 +91,9 @@ python api\preview_server.py --indices 0 1
    必要时填写两台相机的**归一化手动 ROI**（0–1），或打开 **动态跟踪 ROI**；用 2×/4×
    **局部放大** 检查粘连 → 两台相机各稳定出现 3 个黄色候选后点 **开始三维定位** →
    在现有三维视图中查看三点、三角形、几何中心与轨迹 → 匹配异常时点 **保存调试帧**，
-   把原始图/二值图/检测/诊断 JSON 存到 `captures/led_debug/<时间戳>/` → 结束时点
-   **停止三维定位 / 停止二维检测**。参数保存在
+   把原始图/二值图/检测/诊断 JSON 存到 `captures/led_debug/<时间戳>/`；需要分析灯板
+   移动过程中的连续丢失/恢复时，点 **开始录制**，结束再点 **停止录制**（输出见 6.4）→
+   结束时点 **停止三维定位 / 停止二维检测**。参数保存在
    `captures/calibration/led_params.json`。
 
 下方的三维世界视图用真实外参画出两台相机的位置、朝向与视锥体，并显示基线、世界轴、
@@ -350,6 +351,32 @@ L1/L2 是 34 mm 短边的两个端点，物理身份不唯一，只结合时间�
 点“保存调试帧”把两台相机的原始 PNG、二值 PNG、检测叠加 JPG、`detections.json`、
 `diagnosis.json`、`state.json` 写到 `captures/led_debug/<时间戳>/`，用于离线复现。
 
+**连续调试录制**：点“开始录制”后，录制模块用独立采集线程轮询
+`sync_service().recent_pairs()`，按 `pair_seq` 去重，把同步帧对交给一个有界队列；
+写盘线程保存两台相机**原始灰度 PNG**（压缩等级 1），并在对应诊断可用后逐行追加
+`frames.jsonl`。它不重新检测/匹配/三角化，也不新开相机。LED 服务处理完一帧时
+`note_result(pair_seq, state, diagnostics)` 只登记该帧已有状态和完整匹配诊断
+（极线距离矩阵、候选对、重投影、三边），图像与诊断按 `pair_seq` 对齐。
+未被 LED 处理的同步帧对仍保存图像，JSON 中 `led_processed=false`、
+`led_status="not_processed"`，不会借用上一帧结果。
+
+目录结构：
+
+```text
+captures/led_recordings/YYYYMMDD_HHMMSS/
+├── session.json   开始时间、相机信息、参数、相机映射、标定摘要、结束统计
+├── frames.jsonl   每行一个同步帧对；含图像路径、pair 时间戳、led 诊断/未处理标记
+└── frames/
+    ├── 000001_cam0.png
+    ├── 000001_cam1.png
+    └── ...
+```
+
+网页显示已录制时长、已保存帧组、丢帧数、同步/LED/保存帧率和目录；状态来自
+`/api/led/state` 的 `recording` 字段，刷新页面后可恢复。队列满时增加 `dropped`，
+不阻塞定位线程。停止、Ctrl+C 退出或写盘失败时停止线程并更新 `session.json`；
+写盘失败只结束录制并保留 `error` 原因，不影响实时定位。`captures/` 已被 Git 忽略。
+
 **三维可视化**：复用现有 Z 向上 Canvas 场景，增加三个 LED 点、34/79/79 连线、几何中心、
 中心 X/Y/Z 标签、历史轨迹和有效性状态；有效跟踪时从中心沿“短边中点 → L0”画橙色灯板方向箭头，
 预测/丢失状态不画。相机模型和视锥体绘制尺寸为原来的 50%，但相机世界坐标、基线、光轴和
@@ -372,6 +399,8 @@ GET  /api/led/overlay?camera=0&view=detect|binary|raw|epipolar&zoom=1|2|4
 GET  /api/led/overlay_pair   同一 pair_seq 的双相机叠加图（JSON + base64 JPEG）
 GET  /api/led/diagnose       分阶段匹配诊断（两种相机映射）
 POST /api/led/debug/save     保存原始图/二值图/检测/诊断 JSON
+GET  /api/led/record/status  连续录制状态/统计/输出目录
+POST /api/led/record/start|stop  开始/停止连续录制
 ```
 
 **曝光/增益**：本机 LRCP G720P 是标准 UVC 设备，DirectShow 的 `IAMCameraControl` /
@@ -396,10 +425,10 @@ QueryInterface 后直接 GetRange/Get/Set，Media Foundation 的 SourceReader �
   标定面板默认展开、页面初始化自动复用/创建会话；LED 状态 4 Hz，后台标签页降频；
   同步帧/参数变化才重新处理，避免重复三角化。
 
-LED 专项自检：`python -m led.selftest`，**60/60 通过**（合成光斑、粘连分离、过曝拒绝、
+LED 专项自检：`python -m led.selftest`，**69/69 通过**（合成光斑、粘连分离、过曝拒绝、
 细长反光过滤、ROI 坐标偏移、极线匹配、34/79/79 mm 三角化、缺失/几何不一致、绕向一致性、
 自动相机映射、卡尔曼预测/丢失、服务帧去重、同 pair 叠加图、matched=0 极线、水平/垂直
-极线裁剪、局部放大、调试帧保存、参数/ROI/单相机覆盖）。
+极线裁剪、局部放大、调试帧保存、连续录制 PNG/JSON 对齐与线程收尾、参数/ROI/单相机覆盖）。
 标定自检：**141/141 通过**（包含 LED UI/参数接口与版本接口检查）。
 
 ---
@@ -431,6 +460,12 @@ captures/led_debug/<时间戳>/   “保存调试帧”输出
   detections.json                      检测候选/拒绝原因/参数/ROI/帧对
   diagnosis.json                       两种相机映射的原始/理想像素、极线矩阵、阶段计数
   state.json                           服务完整状态（跟踪、三边、轨迹）
+
+captures/led_recordings/<时间戳>/        连续录制输出
+  session.json                         开始/结束时间、相机、参数、映射、标定摘要、统计
+  frames.jsonl                         每个同步帧对一行（PNG 路径、时间戳、LED 诊断）
+  frames/000001_cam0.png               原始灰度；同一帧号对应 cam1 和 JSON 行
+  frames/000001_cam1.png
 ```
 
 `intrinsics.json` 按相机分别保存 K、D、RMS、图像尺寸、有效样本数、覆盖比例、相机标识、
@@ -532,7 +567,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 检测与求解，最后与真值比对。
 
 最近一次标定自检：**141/141 通过**（`--quick` 与完整模式均通过）；LED 专项自检
-`python -m led.selftest`：**60/60 通过**。合成数据（两台相机距板心
+`python -m led.selftest`：**69/69 通过**。合成数据（两台相机距板心
 ~1.8 m、基线 2032.78 mm）的代表性量级：
 
 | 项目 | 结果 |
@@ -575,6 +610,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 - LED 专项：极线匹配、世界系三角化、34/79/79 mm 三边、L0 识别、缺失检测、几何不一致、绕向一致
 - LED 专项：卡尔曼匀速速度/位置、短时预测、超时丢失
 - LED 服务：同一 `pair_seq` 不重复处理、新帧处理、二维叠加图、局部放大、调试帧保存
+- LED 连续录制：开始/停止、PNG 与 JSON 帧号对应、tracking/lost/not_processed、线程和文件关闭
 - LED 参数：共用参数/单相机分离覆盖/ROI/动态跟踪可保存并恢复默认
 - 版本接口返回 Git 版本；页面含版本横幅/刷新按钮；前后端同源且无旧 3001 回退
 
