@@ -20,7 +20,7 @@ import time
 import cv2
 import numpy as np
 
-from led.detector import default_params, detect_leds
+from led.detector import default_params, detect_leds, validate_params
 from led.geometry import match_and_triangulate
 from led.tracker import LedKalmanTracker
 
@@ -79,8 +79,10 @@ def test_detector():
     det = detect_leds(img, p)
     check("三个分离光斑检测到 3 个", det["count"] == 3, det["count"])
     if det["count"] == 3:
-        err = max(math.hypot(d["x"] - x, d["y"] - y) for d, (x, y) in zip(
-            det["leds"], [(400.4, 300.3), (430.0, 300.0), (460.0, 300.0)]))
+        got = sorted([(d["x"], d["y"]) for d in det["leds"]])
+        want = [(400.4, 300.3), (430.0, 300.0), (460.0, 300.0)]
+        err = max(math.hypot(g[0] - w[0], g[1] - w[1])
+                  for g, w in zip(got, want))
         check("亚像素中心误差 < 0.5px", err < 0.5, "max=%.3fpx" % err)
 
     p2 = dict(p); p2["min_peak_distance"] = 3.0
@@ -111,6 +113,50 @@ def test_detector():
           d5["count"] == 1 and bool(d5["overexposed"])
           and any("饱和" in w for w in d5["warnings"]),
           d5["warnings"])
+
+    # 细长灯带/地面反光：形状过滤后不应成为 LED 候选，但原始连通域仍保留
+    refl = np.zeros((720, 1280), np.uint8)
+    refl[280:288, 300:700] = 255
+    d6 = detect_leds(refl, p)
+    check("细长反光被过滤且保留原始候选",
+          d6["count"] == 0 and d6["raw_count"] >= 1
+          and any("细长" in r.get("reason", "") for r in d6["rejected"]),
+          "count=%d raw=%d" % (d6["count"], d6["raw_count"]))
+
+    # ROI：只检测 ROI 内的光斑，但坐标仍是整图坐标
+    two = spots([(300.0, 250.0), (340.0, 250.0)])
+    d7 = detect_leds(two, p, roi=(250, 200, 140, 120))
+    check("ROI 内检测坐标加回整图偏移",
+          d7["count"] == 2
+          and all(280 <= d["x"] <= 360 and 230 <= d["y"] <= 280
+                  for d in d7["leds"])
+          and d7.get("roi") == [250, 200, 140, 120],
+          [(round(d["x"], 1), round(d["y"], 1)) for d in d7["leds"]])
+    d8 = detect_leds(two, p, roi=(500, 400, 120, 100))
+    check("ROI 外光斑不参与检测", d8["count"] == 0, d8["count"])
+
+    # partial=True 只覆盖 min_area 时，不应该拿缺省的 max_area 去比较
+    try:
+        validate_params({"min_area": 50}, partial=True)
+        partial_ok = True
+    except ValueError:
+        partial_ok = False
+    check("单相机覆盖参数可只给 min_area", partial_ok)
+
+    # 实机 matched=0 的直接原因复现：max_area 被调到 10 px² 时，真实 LED
+    # （这里用 sigma=5 的光斑，面积约 37 px²）会被当成“过大且无法分离”拒绝。
+    large_leds = spots([(400.0, 300.0), (440.0, 300.0), (420.0, 330.0)],
+                       sigma=5.0)
+    old = dict(p)
+    old.update({"min_area": 1, "max_area": 10, "max_candidates": 12})
+    d_old = detect_leds(large_leds, old)
+    check("旧 max_area=10 会拒绝真实 LED（实机 matched=0 原因）",
+          d_old["count"] == 0 and d_old["unresolved_count"] >= 3,
+          "count=%d unresolved=%d" % (d_old["count"],
+                                      d_old["unresolved_count"]))
+    d_new = detect_leds(large_leds, default_params())
+    check("新默认 max_area=800 能保留真实 LED",
+          d_new["count"] == 3, d_new["count"])
 
 
 def _rig():
@@ -159,6 +205,9 @@ def test_geometry():
               res["mean_reprojection_px"])
         check("三个 LED 标签是临时编号",
               res.get("labels_are_temporary") is True)
+        check("两台相机三点绕向一致",
+              res.get("orientation_consistent") is True,
+              res.get("orientation_consistent"))
 
     rng = np.random.default_rng(7)
     noise = rng.normal(0, 0.25, p0.shape)
@@ -177,6 +226,18 @@ def test_geometry():
     res_sp = match_and_triangulate(_dets(sp0), _dets(sp1), calib, params)
     check("有无关亮点时仍选出三点三角形", res_sp.get("ok") is True,
           res_sp.get("reason"))
+
+    # 多组反射点：每台相机加 6 个随机点，仍应挑出真实三角形
+    rng2 = np.random.default_rng(11)
+    extra0 = rng2.uniform([50, 50], [1200, 650], (6, 2))
+    extra1 = rng2.uniform([50, 50], [1200, 650], (6, 2))
+    res_many = match_and_triangulate(
+        _dets(np.vstack([p0n, extra0])),
+        _dets(np.vstack([p1n, extra1])), calib, params)
+    check("多个反射候选下仍能选出 33 mm 三角形",
+          res_many.get("ok") is True
+          and max(abs(v - 33.0) for v in res_many["edges_mm"]) < 0.5,
+          None if not res_many.get("ok") else res_many["edges_mm"])
 
     # 少一个 LED
     res_missing = match_and_triangulate(_dets(p0[:2]), _dets(p1[:2]),
@@ -302,7 +363,8 @@ def test_service_pipeline():
         LS.manager = lambda: mgr
         LS.sync_service = lambda: syn
         LS.calibration_service = lambda: cal
-        LS.DEFAULT_PARAMS_PATH = os.path.join(tmp, "led_params.json")
+        LS.DEFAULT_PARAMS_PATH = os.path.join(tmp, "calibration",
+                                               "led_params.json")
         svc = None
         try:
             svc = LS.LedService()
@@ -335,6 +397,22 @@ def test_service_pipeline():
                       state["edges_mm"])
                 check("LED 标签标记为临时编号",
                       state.get("labels_are_temporary") is True)
+                check("服务状态包含 ROI / 动态跟踪信息",
+                      isinstance(state.get("roi"), dict)
+                      and "tracking" in state["roi"]
+                      and state.get("detections", {}).get("0", {}).get("raw_count") is not None,
+                      state.get("roi"))
+                svc._roi_tracking = True
+                svc._roi_track["0"] = [600, 500, 40, 30]
+                roi_track, mode_track = svc._roi_for(0, (720, 1280))
+                check("动态 ROI 向外扩 80px 且裁剪到图像内",
+                      mode_track == "track" and roi_track == [520, 420, 200, 190],
+                      "%s %s" % (mode_track, roi_track))
+                svc._roi_force_full["0"] = True
+                _, mode_full = svc._roi_for(0, (720, 1280))
+                check("匹配失败后允许下一帧全图重搜", mode_full == "full_search",
+                      mode_full)
+                svc._clear_track_rois()
                 before = state["processed_pairs"]
                 time.sleep(0.3)
                 after = svc.state()["processed_pairs"]
@@ -352,6 +430,35 @@ def test_service_pipeline():
                 check("二维叠加图可生成",
                       len(data) > 1000 and info.get("count") is not None,
                       "bytes=%d count=%s" % (len(data), info.get("count")))
+                data_z, info_z = svc.overlay(0, view="detect", zoom=2.0)
+                check("局部放大叠加图可生成",
+                      len(data_z) > 1000 and info_z.get("zoom") == 2.0,
+                      "bytes=%d zoom=%s" % (len(data_z), info_z.get("zoom")))
+                dbg = svc.save_debug()
+                check("实机调试帧保存（原始图/二值图/JSON）",
+                      os.path.isdir(dbg["abs_path"])
+                      and "detections.json" in dbg["files"]
+                      and any(f.endswith("_raw.png") for f in dbg["files"]),
+                      "%s files=%s" % (dbg.get("path"), len(dbg.get("files", []))))
+                upd = svc.update_params({
+                    "params": {"threshold": 190},
+                    "overrides": {"0": {"split_blobs": False},
+                                  "1": {"min_area": 6}},
+                    "rois": {"0": [0.1, 0.1, 0.6, 0.7], "1": None},
+                    "roi_tracking": False,
+                })
+                check("参数/ROI/单相机分离覆盖可保存",
+                      upd["params"]["threshold"] == 190
+                      and upd["overrides"]["0"].get("split_blobs") is False
+                      and upd["overrides"]["1"].get("min_area") == 6
+                      and upd["rois"]["0"] == [0.1, 0.1, 0.6, 0.7]
+                      and upd["roi_tracking"] is False,
+                      upd.get("path"))
+                upd_clear = svc.update_params({"overrides": {}})
+                check("显式空 overrides 可清空相机覆盖",
+                      upd_clear["overrides"] == {"0": {}, "1": {}},
+                      upd_clear["overrides"])
+                svc.reset_params()
         finally:
             if svc is not None:
                 svc.stop_detection()

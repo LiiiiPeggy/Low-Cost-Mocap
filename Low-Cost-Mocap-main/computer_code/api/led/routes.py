@@ -110,17 +110,30 @@ def led_overlay():
         view = request.args.get("view", "detect")
         scale = float(request.args.get("scale", 0.6))
         quality = int(request.args.get("quality", 75))
+        zoom = float(request.args.get("zoom", 1.0))
         data, info = service().overlay(cam, view=view, scale=scale,
-                                       quality=quality)
+                                       quality=quality, zoom=zoom)
         resp = Response(data, mimetype="image/jpeg")
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["X-LED-Count"] = str(info.get("count"))
         resp.headers["X-LED-Matched"] = str(info.get("matched"))
+        resp.headers["X-LED-Raw"] = str(info.get("raw_count"))
+        resp.headers["X-LED-Zoom"] = str(info.get("zoom"))
         return resp
     except RuntimeError as exc:
         return _fail(exc, 409)
     except ValueError as exc:
         return _fail(exc, 400)
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
+@bp.post("/api/led/debug/save")
+def led_debug_save():
+    try:
+        return jsonify(service().save_debug())
+    except RuntimeError as exc:
+        return _fail(exc, 409)
     except Exception as exc:
         return _fail(exc, 500)
 

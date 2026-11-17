@@ -22,6 +22,7 @@ from datetime import datetime
 
 from flask import Blueprint, Response, jsonify, request, send_from_directory
 
+import camera_controls
 from camera_manager import manager
 from sync import sync_service
 from sync import DEFAULT_OUT_DIR as SYNC_OUT_DIR
@@ -102,6 +103,61 @@ def cameras_devices():
         return jsonify({"devices": manager().devices()})
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+
+
+# ---------------------------------------------------------------------------
+# 曝光 / 增益（DirectShow UVC 控制，不打断 MF 取流）
+# ---------------------------------------------------------------------------
+@bp.get("/api/cameras/controls")
+def cameras_controls_get():
+    raw = request.args.get("camera")
+    try:
+        indices = (_parse_indices(raw) if raw not in (None, "")
+                   else _parse_indices(None))
+    except (TypeError, ValueError):
+        return jsonify({"error": "camera 必须是逗号分隔的整数索引"}), 400
+    controls = [camera_controls.get_controls(i) for i in indices]
+    resp = jsonify({"controls": controls, "indices": indices,
+                    "note": "曝光为 DirectShow 对数时间 log2(s)；增益为设备索引"})
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
+
+
+@bp.post("/api/cameras/controls")
+def cameras_controls_set():
+    body = request.get_json(silent=True) or {}
+    try:
+        index = int(body.get("camera", 0))
+    except (TypeError, ValueError):
+        return jsonify({"error": "camera 必须是整数索引"}), 400
+    exposure = body.get("exposure", None)
+    auto_exposure = body.get("auto_exposure", None)
+    gain = body.get("gain", None)
+    try:
+        if exposure is not None:
+            exposure = int(round(float(exposure)))
+        if auto_exposure is not None:
+            if not isinstance(auto_exposure, bool):
+                auto_exposure = str(auto_exposure).strip().lower() in (
+                    "1", "true", "yes", "on", "开")
+        if gain is not None:
+            gain = int(round(float(gain)))
+    except (TypeError, ValueError):
+        return jsonify({"error": "exposure/gain 必须是数字，auto_exposure 必须是布尔值"}), 400
+    if exposure is None and auto_exposure is None and gain is None:
+        return jsonify({"error": "至少提供 exposure、auto_exposure、gain 之一"}), 400
+    try:
+        result = camera_controls.set_controls(
+            index, exposure=exposure, auto_exposure=auto_exposure, gain=gain)
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+    if not result.get("ok"):
+        return jsonify(result), 409
+    resp = jsonify(result)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 # ---------------------------------------------------------------------------

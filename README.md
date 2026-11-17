@@ -231,7 +231,8 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | POST | `/api/calib/save` | 写兼容文件 `calibration.json` |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
 | GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
-| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数与三维定位 |
+| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数、ROI、调试保存与三维定位 |
+| GET/POST | `/api/cameras/controls` | UVC 曝光/自动曝光/增益范围、当前值与设置 |
 
 **自检（无相机可跑）**
 
@@ -239,25 +240,27 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
 python -m calibration.selftest   :: 136/136
-python -m led.selftest           :: 26/26
+python -m led.selftest           :: 41/41
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
 同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、兼容文件、
-LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、极线/三角化、
-33 mm 三边、卡尔曼跟踪与接口。最近一次（2026-11-17）：**136/136 + 26/26 通过**。
+LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
+ROI、极线/三角化、33 mm 三边、卡尔曼跟踪、调试帧保存与接口。最近一次（2026-11-17）：
+**136/136 + 41/41 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
 
 标记灯统一采用 **850 nm 红外 LED**，不再评估 940 nm 方案。模块复用两台相机的同步帧对和已载入的标定参数：
 
-- **二维检测**：阈值 + 连通域/面积/形状过滤；距离变换局部峰值拆分粘连光斑；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心。
-- **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边约 33 mm。
+- **二维检测**：阈值 + 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值拆分粘连光斑，拆分块至少占父亮区 15%；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心；分别输出原始连通域和筛选候选。
+- **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边约 33 mm、两相机三点绕向一致。
+- **ROI**：每台相机可设归一化手动 ROI；匹配后动态跟踪 ROI（+80 px），连续失败 12 帧清除并全图重搜；ROI 不足 3 点自动全图回退。
 - **限制**：`L0/L1/L2` 是临时编号；三个 LED 完全相同，120° 对称未解，**不输出唯一航向或 6DoF**。
-- **参数**：默认阈值 200、面积 3–600 px²、峰距 6 px，可对 cam0/cam1 分别覆盖；保存到 `captures/calibration/led_params.json`。
-- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay`。
-- 当前 Media Foundation 接口没有可靠的运行时 exposure/gain 控制；需固定相机参数或调整 LED 亮度/阈值。装机时用实际 850 nm LED 确认亮度与检测阈值。
+- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px，可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
+- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|debug/save`，以及 `/api/cameras/controls`。
+- **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益可由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；网页每台相机卡片内独立控制。装机时用实际 850 nm LED 确认亮度与检测阈值。
 
 完整说明见 [docs/calibration.md](docs/calibration.md) §6.4。
 

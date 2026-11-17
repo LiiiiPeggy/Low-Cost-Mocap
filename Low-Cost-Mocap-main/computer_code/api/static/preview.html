@@ -201,6 +201,31 @@
     font-size: 12px; background: #fff;
   }
   #led-section .param-note { color: #98a1b0; font-size: 11px; }
+  /* ---- 相机曝光 / 增益 ---- */
+  .panel .cam-controls {
+    display: grid; grid-template-columns: 1fr 1fr; gap: 6px 10px;
+    padding: 8px 14px 10px; border-top: 1px solid var(--line); background: #fbfcfd;
+    font-size: 12px; color: var(--dim);
+  }
+  @media (max-width: 900px) { .panel .cam-controls { grid-template-columns: 1fr; } }
+  .panel .cam-controls label { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; }
+  .panel .cam-controls input[type="number"] {
+    width: 64px; padding: 3px 6px; border: 1px solid var(--line);
+    border-radius: 5px; font-size: 12px; font-variant-numeric: tabular-nums;
+  }
+  .panel .cam-controls .range { color: #98a1b0; font-size: 11px; }
+  .panel .cam-controls .msg { grid-column: 1 / -1; color: #98a1b0; font-size: 11px; }
+  .panel .cam-controls .msg.ok { color: var(--ok); }
+  .panel .cam-controls .msg.err { color: var(--err); }
+  .panel .cam-controls button { padding: 3px 8px; font-size: 12px; border-radius: 5px; }
+  /* ---- LED ROI ---- */
+  #led-section .roi-grid {
+    display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 5px 8px;
+    align-items: center; margin-top: 6px; font-size: 12px; color: var(--dim);
+  }
+  #led-section .roi-grid input[type="number"] { width: 100%; min-width: 58px; }
+  #led-section .roi-grid .head { font-weight: 600; color: var(--fg); }
+  #led-section .led-legend { color: #98a1b0; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -325,20 +350,49 @@
         <span class="sep"></span>
         <button id="l-locate-start" class="primary">开始三维定位</button>
         <button id="l-locate-stop">停止三维定位</button>
+        <button id="l-debug-save">保存调试帧</button>
         <span id="l-state" class="badge">未启动</span>
       </div>
       <div class="row">
         <label>显示
           <select id="l-view">
-            <option value="detect">检测叠加</option>
+            <option value="detect">最终检测叠加</option>
             <option value="binary">二值化</option>
             <option value="raw">原始灰度</option>
             <option value="epipolar">去畸变 + 极线</option>
           </select>
         </label>
-        <span class="hintline">切换到「红外 LED 检测可视化」查看两台相机</span>
+        <label>局部放大
+          <select id="l-zoom">
+            <option value="1">1×（全图）</option>
+            <option value="2">2×</option>
+            <option value="4">4×</option>
+          </select>
+        </label>
+        <span class="hintline">放大以匹配点/ROI 为中心；候选点不再逐个写文字</span>
         <span class="spacer"></span>
-        <span class="hintline">曝光/增益：当前 Media Foundation 接口未提供可靠的运行时控制</span>
+        <span class="hintline">曝光/增益在上方每台相机卡片内控制（DirectShow UVC）</span>
+      </div>
+      <div class="row">
+        <b>手动 ROI</b>
+        <span class="hintline">归一化坐标 0–1（x0 = 像素 x / 1280，y0 = 像素 y / 720）；留空 = 全图。目标运动时匹配成功会更新动态 ROI，丢失后自动全图重搜。</span>
+        <label><input type="checkbox" id="l-roi-track" checked> 动态跟踪 ROI</label>
+        <button id="l-roi-apply">应用 ROI</button>
+        <button id="l-roi-clear">清除 ROI</button>
+        <span id="l-roi-msg" class="badge">—</span>
+      </div>
+      <div class="roi-grid">
+        <span class="head">相机</span><span class="head">x0</span><span class="head">y0</span><span class="head">x1</span><span class="head">y1</span>
+        <span>相机0</span>
+        <input id="l-roi0-x0" type="number" min="0" max="1" step="0.01" placeholder="0">
+        <input id="l-roi0-y0" type="number" min="0" max="1" step="0.01" placeholder="0">
+        <input id="l-roi0-x1" type="number" min="0" max="1" step="0.01" placeholder="1">
+        <input id="l-roi0-y1" type="number" min="0" max="1" step="0.01" placeholder="1">
+        <span>相机1</span>
+        <input id="l-roi1-x0" type="number" min="0" max="1" step="0.01" placeholder="0">
+        <input id="l-roi1-y0" type="number" min="0" max="1" step="0.01" placeholder="0">
+        <input id="l-roi1-x1" type="number" min="0" max="1" step="0.01" placeholder="1">
+        <input id="l-roi1-y1" type="number" min="0" max="1" step="0.01" placeholder="1">
       </div>
       <div class="led-params">
         <table>
@@ -360,7 +414,7 @@
             </tr>
             <tr>
               <td>最大亮区面积 px²</td>
-              <td><input id="l-maxa" type="number" min="2" step="10" value="600"></td>
+              <td><input id="l-maxa" type="number" min="2" step="10" value="800"></td>
               <td><input id="l-maxa-0" type="number" min="2" step="10" placeholder="共用"></td>
               <td><input id="l-maxa-1" type="number" min="2" step="10" placeholder="共用"></td>
             </tr>
@@ -373,7 +427,41 @@
             <tr>
               <td>光斑分离</td>
               <td><label><input type="checkbox" id="l-split" checked> 开启</label></td>
-              <td colspan="2" class="param-note">两台相机共用</td>
+              <td>
+                <select id="l-split-0">
+                  <option value="">共用</option><option value="1">开</option><option value="0">关</option>
+                </select>
+              </td>
+              <td>
+                <select id="l-split-1">
+                  <option value="">共用</option><option value="1">开</option><option value="0">关</option>
+                </select>
+              </td>
+            </tr>
+            <tr>
+              <td>拆分最小面积比</td>
+              <td><input id="l-split-ratio" type="number" min="0.02" max="0.9" step="0.01" value="0.15"></td>
+              <td colspan="2" class="param-note">每个子光斑至少占父亮区的比例；防止单灯被拆碎</td>
+            </tr>
+            <tr>
+              <td>最小 solidity</td>
+              <td><input id="l-solidity" type="number" min="0.02" max="1" step="0.01" value="0.35"></td>
+              <td colspan="2" class="param-note">面积/凸包面积；过滤锯齿、细长反光</td>
+            </tr>
+            <tr>
+              <td>最小填充率</td>
+              <td><input id="l-fill" type="number" min="0.02" max="1" step="0.01" value="0.20"></td>
+              <td colspan="2" class="param-note">面积/外接矩形面积；过滤灯带和地面反光</td>
+            </tr>
+            <tr>
+              <td>最大长宽比</td>
+              <td><input id="l-aspect" type="number" min="1" max="50" step="0.5" value="5"></td>
+              <td colspan="2" class="param-note">最小外接矩形长宽比；越小越严格</td>
+            </tr>
+            <tr>
+              <td>最大候选数</td>
+              <td><input id="l-maxcand" type="number" min="3" max="64" step="1" value="24"></td>
+              <td colspan="2" class="param-note">按亮度/紧凑度排序后截断；不影响原始连通域显示</td>
             </tr>
             <tr>
               <td>预处理模糊核</td>
@@ -390,17 +478,17 @@
             </tr>
             <tr>
               <td>极线距离阈值 px</td>
-              <td><input id="l-epi" type="number" min="0.25" max="30" step="0.25" value="3"></td>
+              <td><input id="l-epi" type="number" min="0.25" max="30" step="0.25" value="4"></td>
               <td colspan="2" class="param-note">匹配参数，两台共用</td>
             </tr>
             <tr>
               <td>重投影阈值 px</td>
-              <td><input id="l-reproj" type="number" min="0.25" max="30" step="0.25" value="3"></td>
+              <td><input id="l-reproj" type="number" min="0.25" max="30" step="0.25" value="4"></td>
               <td colspan="2" class="param-note">匹配参数，两台共用</td>
             </tr>
             <tr>
               <td>三角形边长容差 mm</td>
-              <td><input id="l-tri" type="number" min="1" max="30" step="0.5" value="6"></td>
+              <td><input id="l-tri" type="number" min="1" max="30" step="0.5" value="8"></td>
               <td colspan="2" class="param-note">33 mm 等边三角形</td>
             </tr>
           </tbody>
@@ -461,6 +549,19 @@ function buildPanels() {
         <div><span>滞后</span><b id="lag-${i}">—</b></div>
       </div>
       <div class="err-msg" id="err-${i}"></div>
+      <div class="cam-controls">
+        <label>曝光
+          <input id="ctrl-exp-${i}" type="number" step="1" title="DirectShow 对数曝光 log2(s)">
+          <span class="range" id="ctrl-range-exp-${i}">范围 —</span>
+        </label>
+        <label><input type="checkbox" id="ctrl-auto-${i}"> 自动曝光</label>
+        <label>增益
+          <input id="ctrl-gain-${i}" type="number" step="1" title="DirectShow 增益索引">
+          <span class="range" id="ctrl-range-gain-${i}">范围 —</span>
+        </label>
+        <label><button id="ctrl-apply-${i}">应用曝光/增益</button></label>
+        <span class="msg" id="ctrl-msg-${i}">读取中…</span>
+      </div>
     </section>`).join('');
 }
 buildPanels();
@@ -666,6 +767,111 @@ async function refresh() {
   await refreshSync();
 }
 
+// ---------- 相机曝光 / 增益（DirectShow UVC，不打断 MF 取流） ----------
+const camControlInfo = {};
+let camControlBusy = false;
+
+function setCtrlMsg(cam, text, cls) {
+  const m = el('ctrl-msg-' + cam);
+  if (!m) return;
+  m.textContent = text || '';
+  m.className = 'msg ' + (cls || '');
+}
+
+function populateCameraControls(controls) {
+  (controls || []).forEach(item => {
+    const cam = item.index;
+    if (cam === undefined || !el('ctrl-exp-' + cam)) return;
+    camControlInfo[cam] = item;
+    const exp = item.exposure || {};
+    const gain = item.gain || {};
+    const expEl = el('ctrl-exp-' + cam);
+    const gainEl = el('ctrl-gain-' + cam);
+    const autoEl = el('ctrl-auto-' + cam);
+    if (!item.ok || !exp.supported) {
+      expEl.disabled = true;
+      expEl.value = '';
+      el('ctrl-range-exp-' + cam).textContent = '不支持';
+    } else {
+      expEl.min = exp.min; expEl.max = exp.max; expEl.step = exp.step || 1;
+      if (document.activeElement !== expEl) expEl.value = exp.value;
+      autoEl.checked = !!exp.auto;
+      autoEl.disabled = !exp.auto_supported;
+      expEl.disabled = !!exp.auto || !exp.manual_supported;
+      const ms = exp.value_ms === undefined ? '—' : exp.value_ms;
+      el('ctrl-range-exp-' + cam).textContent =
+        `[${exp.min}..${exp.max}] 步${exp.step} · ${ms} ms`;
+    }
+    if (!item.ok || !gain.supported) {
+      gainEl.disabled = true;
+      gainEl.value = '';
+      el('ctrl-range-gain-' + cam).textContent = '不支持';
+    } else {
+      gainEl.min = gain.min; gainEl.max = gain.max; gainEl.step = gain.step || 1;
+      if (document.activeElement !== gainEl) gainEl.value = gain.value;
+      gainEl.disabled = !gain.manual_supported;
+      el('ctrl-range-gain-' + cam).textContent =
+        `[${gain.min}..${gain.max}] 步${gain.step}` + (gain.auto_supported ? '' : ' · 仅手动');
+    }
+    if (!item.ok) {
+      setCtrlMsg(cam, '读取失败：' + (item.error || '设备未就绪'), 'err');
+    } else {
+      setCtrlMsg(cam, '曝光为 log2(s)，数值越小曝光越短；增益仅手动。', '');
+    }
+  });
+}
+
+async function refreshCameraControls() {
+  if (camControlBusy) return;
+  camControlBusy = true;
+  try {
+    const r = await api('/api/cameras/controls');
+    populateCameraControls(r.controls || []);
+  } catch (e) {
+    CAMERAS.forEach(c => setCtrlMsg(c, '读取失败：' + e.message, 'err'));
+  } finally { camControlBusy = false; }
+}
+
+async function applyCameraControls(cam) {
+  const auto = el('ctrl-auto-' + cam).checked;
+  const exp = numOrNull('ctrl-exp-' + cam);
+  const gain = numOrNull('ctrl-gain-' + cam);
+  const body = { camera: cam };
+  if (auto) {
+    body.auto_exposure = true;
+  } else {
+    body.auto_exposure = false;
+    if (exp !== null) body.exposure = exp;
+  }
+  if (gain !== null) body.gain = gain;
+  setCtrlMsg(cam, '应用中…', '');
+  try {
+    const r = await api('/api/cameras/controls', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body)
+    });
+    populateCameraControls([r]);
+    setCtrlMsg(cam, '已应用：曝光 ' + ((r.exposure || {}).value)
+               + '，增益 ' + ((r.gain || {}).value), 'ok');
+    log(`相机 ${cam} 曝光/增益已更新`);
+  } catch (e) {
+    setCtrlMsg(cam, '应用失败：' + e.message, 'err');
+    log(`相机 ${cam} 曝光/增益应用失败：` + e.message);
+  }
+}
+
+CAMERAS.forEach(cam => {
+  const btn = el('ctrl-apply-' + cam);
+  if (btn) btn.onclick = () => applyCameraControls(cam);
+  const auto = el('ctrl-auto-' + cam);
+  if (auto) auto.onchange = () => {
+    const exp = el('ctrl-exp-' + cam);
+    const info = camControlInfo[cam] || {};
+    const manual = ((info.exposure || {}).manual_supported !== false);
+    exp.disabled = auto.checked || !manual;
+  };
+});
+
 // ---------- 操作 ----------
 el('btn-start').onclick = async () => {
   try {
@@ -736,6 +942,13 @@ window.addEventListener('beforeunload', () => {
 });
 
 refresh();
+refreshCameraControls();
+setInterval(() => {
+  if (document.hidden) return;
+  if (document.activeElement && document.activeElement.closest
+      && document.activeElement.closest('.cam-controls')) return;
+  refreshCameraControls();
+}, 5000);
 timer = setInterval(refresh, 1000);
 
 // 版本一致性：版本号由后端 Git 信息提供，避免写死字符串。
@@ -1245,6 +1458,8 @@ const LED_STATUS_NAMES = {
   insufficient_detections: 'LED 数量不足', insufficient_matches: '匹配不足',
   geometry_mismatch: '三角形几何不一致', calibration_invalid: '标定不可用',
   sync_stale: '同步帧过期', error: '错误', stopped: '已停止',
+  ok: '检测正常', partial: '部分亮区未分离', no_leds: '未检测到 LED',
+  unresolved: '亮区无法分离',
 };
 
 function numOrNull(id) {
@@ -1264,6 +1479,11 @@ function populateLedParams(p) {
   setInput('l-mina', c.min_area);
   setInput('l-maxa', c.max_area);
   setInput('l-peak', c.min_peak_distance);
+  setInput('l-split-ratio', c.split_min_area_ratio);
+  setInput('l-solidity', c.min_solidity);
+  setInput('l-fill', c.min_fill);
+  setInput('l-aspect', c.max_aspect);
+  setInput('l-maxcand', c.max_candidates);
   el('l-split').checked = c.split_blobs !== false;
   const blur = +c.blur_kernel;
   el('l-blur').value = String([0, 3, 5, 7, 9].includes(blur) ? blur : 3);
@@ -1276,6 +1496,26 @@ function populateLedParams(p) {
     setInput(base + '-0', (o['0'] || {})[k]);
     setInput(base + '-1', (o['1'] || {})[k]);
   });
+  [0, 1].forEach(cam => {
+    const v = (o[String(cam)] || {}).split_blobs;
+    el('l-split-' + cam).value = v === undefined ? ''
+      : (v ? '1' : '0');
+  });
+  const rois = p.rois || {};
+  [0, 1].forEach(cam => {
+    const r = rois[String(cam)];
+    ['x0', 'y0', 'x1', 'y1'].forEach((key, idx) => {
+      setInput('l-roi' + cam + '-' + key,
+               (r && r.length === 4) ? r[idx] : '');
+    });
+  });
+  el('l-roi-track').checked = p.roi_tracking !== false;
+  const roiMsg = el('l-roi-msg');
+  if (roiMsg) {
+    const manual = [0, 1].filter(cam => rois[String(cam)]).length;
+    roiMsg.textContent = manual ? ('手动 ROI：' + manual + ' 台') : '手动 ROI：全图';
+    roiMsg.className = 'badge ' + (manual ? 'ok' : '');
+  }
   const msg = el('l-params-msg');
   if (msg) {
     msg.textContent = '参数' + (p.version !== undefined ? ' v' + p.version : '')
@@ -1299,13 +1539,20 @@ function collectLedParams() {
     max_area: numOrNull('l-maxa'),
     min_peak_distance: numOrNull('l-peak'),
     split_blobs: el('l-split').checked,
+    split_min_area_ratio: numOrNull('l-split-ratio'),
     blur_kernel: +el('l-blur').value,
+    min_solidity: numOrNull('l-solidity'),
+    min_fill: numOrNull('l-fill'),
+    max_aspect: numOrNull('l-aspect'),
+    max_candidates: numOrNull('l-maxcand'),
     epipolar_tol_px: numOrNull('l-epi'),
     reprojection_tol_px: numOrNull('l-reproj'),
     triangle_tol_mm: numOrNull('l-tri'),
   };
   for (const k of ['threshold', 'min_area', 'max_area', 'min_peak_distance',
-                   'epipolar_tol_px', 'reprojection_tol_px', 'triangle_tol_mm']) {
+                   'split_min_area_ratio', 'min_solidity', 'min_fill',
+                   'max_aspect', 'max_candidates', 'epipolar_tol_px',
+                   'reprojection_tol_px', 'triangle_tol_mm']) {
     if (common[k] === null || !isFinite(common[k])) {
       throw new Error('共用参数 ' + k + ' 不能为空');
     }
@@ -1319,9 +1566,24 @@ function collectLedParams() {
       const v = numOrNull(id + '-' + cam);
       if (v !== null) o[key] = v;
     });
+    const split = el('l-split-' + cam).value;
+    if (split === '1') o.split_blobs = true;
+    else if (split === '0') o.split_blobs = false;
     if (Object.keys(o).length) overrides[String(cam)] = o;
   });
-  return { params: common, overrides };
+  const rois = {};
+  [0, 1].forEach(cam => {
+    const vals = ['x0', 'y0', 'x1', 'y1'].map(k =>
+      numOrNull('l-roi' + cam + '-' + k));
+    const filled = vals.filter(v => v !== null).length;
+    if (filled === 0) { rois[String(cam)] = null; return; }
+    if (filled !== 4) {
+      throw new Error('相机 ' + cam + ' ROI 必须同时填写 x0/y0/x1/y1，或全部留空');
+    }
+    rois[String(cam)] = vals;
+  });
+  return { params: common, overrides, rois,
+           roi_tracking: el('l-roi-track').checked };
 }
 
 el('l-params-apply').onclick = async () => {
@@ -1389,11 +1651,22 @@ function renderLedState(s) {
   const pair = s.pair || {};
   const d0 = (s.detections || {})['0'] || {};
   const d1 = (s.detections || {})['1'] || {};
-  const detText = '相机0：候选 ' + (d0.count || 0) + ' · ' + (d0.status || '—')
-    + ((d0.reason) ? '（' + d0.reason + '）' : '') + '\n'
-    + '相机1：候选 ' + (d1.count || 0) + ' · ' + (d1.status || '—')
-    + ((d1.reason) ? '（' + d1.reason + '）' : '') + '\n'
-    + '同步帧对：' + (pair.pair_seq === undefined ? '—' : pair.pair_seq)
+  const camText = (d) => {
+    const roiMode = d.roi_mode === 'track' ? '动态ROI'
+      : (d.roi_mode === 'manual' ? '手动ROI'
+      : (d.roi_mode === 'full_fallback' ? '全图回退' : '全图'));
+    const warns = (d.warnings || []).length ? ' · 警告 ' + d.warnings.length : '';
+    return '原始 ' + (d.raw_count || 0) + ' · 候选 ' + (d.count || 0)
+      + ' · ' + (LED_STATUS_NAMES[d.status] || d.status || '—')
+      + ' · ' + roiMode + warns;
+  };
+  const camWarn = (d) => ((d.warnings || []).length
+    ? '\n  警告：' + d.warnings[0] : '');
+  const detText = '相机0：' + camText(d0) + ((d0.reason) ? '\n  ' + d0.reason : '')
+    + camWarn(d0)
+    + '\n相机1：' + camText(d1) + ((d1.reason) ? '\n  ' + d1.reason : '')
+    + camWarn(d1)
+    + '\n同步帧对：' + (pair.pair_seq === undefined ? '—' : pair.pair_seq)
     + '  Δt=' + (pair.dt_ms === undefined ? '—' : pair.dt_ms) + ' ms\n'
     + '处理帧数：' + (s.processed_pairs || 0)
     + '  耗时 ' + (s.processing_ms || 0).toFixed(1) + ' ms';
@@ -1414,6 +1687,9 @@ function renderLedState(s) {
   if (s.edges_mm) {
     loc += '三边：' + fmtVec(s.edges_mm, 2) + ' mm\n'
          + '边长误差：' + fmtVec(s.edge_errors_mm, 2) + ' mm\n';
+  }
+  if (s.orientation_consistent !== undefined && s.orientation_consistent !== null) {
+    loc += '两相机三点绕向：' + (s.orientation_consistent ? '一致' : '不一致（检查标定/翻转）') + '\n';
   }
   if (s.mean_reprojection_px !== null && s.mean_reprojection_px !== undefined) {
     loc += '重投影 mean ' + s.mean_reprojection_px + ' px · 极线 mean '
@@ -1485,6 +1761,30 @@ el('l-locate-stop').onclick = async () => {
 };
 el('l-view').onchange = () => {
   if (el('c-vis-mode').value === 'led') liveTick();
+};
+el('l-zoom').onchange = () => {
+  if (el('c-vis-mode').value === 'led') liveTick();
+};
+el('l-roi-apply').onclick = () => {
+  el('l-params-apply').click();
+};
+el('l-roi-clear').onclick = () => {
+  [0, 1].forEach(cam => ['x0', 'y0', 'x1', 'y1'].forEach(k => {
+    el('l-roi' + cam + '-' + k).value = '';
+  }));
+  el('l-params-apply').click();
+};
+el('l-debug-save').onclick = async () => {
+  el('l-debug-save').disabled = true;
+  try {
+    const r = await api('/api/led/debug/save', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: '{}'
+    });
+    cLog('调试帧已保存：' + r.path + '（' + (r.count || 0) + ' 个文件）');
+  } catch (e) {
+    cLog('保存调试帧失败：' + e.message);
+  } finally { el('l-debug-save').disabled = false; }
 };
 
 setInterval(() => {
@@ -1638,7 +1938,8 @@ async function liveTick() {
       } else if (mode === 'led') {
         // 只取 LED 缓存叠加图；不要在这个模式下执行棋盘格检测
         const view = el('l-view') ? el('l-view').value : 'detect';
-        feed = `/api/led/overlay?${qs}&view=${encodeURIComponent(view)}`;
+        const zoom = el('l-zoom') ? el('l-zoom').value : '1';
+        feed = `/api/led/overlay?${qs}&view=${encodeURIComponent(view)}&zoom=${encodeURIComponent(zoom)}`;
       } else {
         feed = `/api/camera/${cam}/snapshot?t=${Date.now()}`;   // 普通画面
       }

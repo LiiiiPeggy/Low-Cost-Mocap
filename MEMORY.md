@@ -53,11 +53,13 @@
 ## 红外 LED 检测与三角化
 
 - `api/led/` 复用 `camera_manager`、`sync.SyncService`、`CalibrationService` 和现有三维视图。
-- 检测：可选高斯模糊 → 阈值 → 连通域/面积/形状过滤；距离变换局部峰值 + 最近峰值分配（watershed 简化）拆粘连；完全饱和/不可分亮区标 unresolved/overexposed，**不伪造三点**；强度加权亚像素中心。
-- 默认阈值 200、面积 3–600 px²、峰距 6 px；极线/重投影/三角容差 3/3/6；可对 cam0/cam1 分别覆盖阈值/面积/峰距，存 `captures/calibration/led_params.json`。
-- `F` 由标定 R/t 计算；原始点只去畸变一次；`P = K[R|t]` 三角化直接得世界系米制坐标；检查相机前方、重投影、33 mm 三边。`L0/L1/L2` 是**临时编号**，120° 对称未解，**不输出唯一航向或 6DoF**。
+- 检测：可选高斯模糊 → 阈值 → 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值 + 最近峰值分配（watershed 简化）拆粘连，拆分块至少占父亮区 15%；完全饱和/不可分亮区标 unresolved/overexposed，**不伪造三点**；强度加权亚像素中心；同时返回原始连通域与筛选后候选。
+- 默认阈值 200、面积 3–800 px²、峰距 6 px；极线/重投影/三角容差 4/4/8；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；存 `captures/calibration/led_params.json`。**`max_area=10` 会把真实 LED 当“面积过大”拒绝，是实机 matched=0 的直接原因之一**；已重置为默认值。
+- 支持手动归一化 ROI（每相机独立）、匹配后动态跟踪 ROI（+80 px，失败 12 帧清除并全图重搜）、ROI 不足 3 点自动全图回退。
+- `F` 由标定 R/t 计算；原始点只去畸变一次；`P = K[R|t]` 三角化直接得世界系米制坐标；检查相机前方、重投影、33 mm 三边 + 两相机三点绕向。`L0/L1/L2` 是**临时编号**，120° 对称未解，**不输出唯一航向或 6DoF**。
 - 9 状态卡尔曼按 `rec.created_mono` 真实时间传播；同一 `pair_seq` 只处理一次，参数变化允许对最新帧重算一次。
-- 标记灯统一 **850 nm**；当前 Media Foundation 接口没有可靠的运行时 exposure/gain 控制，需固定相机参数或调 LED 亮度/阈值。
+- 标记灯统一 **850 nm**。LRCP G720P 的 UVC 曝光/自动曝光/增益可由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，**不需要第二路取流、不打断 MF**；本机范围曝光 -13..-1（log2 s）、增益 0..63（仅手动）。旧的 `helpers.py`/pseyepy 通路未使用。
+- “保存调试帧”输出 `captures/led_debug/<时间戳>/` 的原始 PNG、二值 PNG、叠加 JPG、`detections.json`、`state.json`，用于实机离线复现。当前 LED 自检 **41/41**（合成/假相机）；实机 33 mm 与跟踪仍需实测。
 
 ## 工程与运维
 

@@ -65,6 +65,16 @@ def _epipolar_distance(p0, p1, F):
     return max(d0, d1), d0, d1
 
 
+def _signed_area(points) -> float:
+    """二维三点有向面积；用于检查两台相机的三角形绕向是否一致。"""
+    p = np.asarray(points, np.float64)
+    if p.shape != (3, 2):
+        return 0.0
+    return 0.5 * float(
+        (p[1, 0] - p[0, 0]) * (p[2, 1] - p[0, 1])
+        - (p[2, 0] - p[0, 0]) * (p[1, 1] - p[0, 1]))
+
+
 def _labels_from_previous(points: np.ndarray, previous_points):
     """等边三角形三个顶点完全等价；仅用时间连续性保持显示编号稳定。
 
@@ -92,7 +102,7 @@ def _labels_from_previous(points: np.ndarray, previous_points):
 def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                           params: dict, *, previous_points=None,
                           predicted_center=None,
-                          max_match_candidates: int = 48) -> dict:
+                          max_match_candidates: int = 64) -> dict:
     """极线候选 → 三角化 → 重投影筛选 → 33 mm 等边三角形选择。
 
     ``calib`` 需包含 K0/D0/K1/D1/R0/t0/R1/t1（world→camera）和 image_size。
@@ -178,7 +188,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
     candidates = candidates[:max_match_candidates]
     points = np.array([c["xyz"] for c in candidates], np.float64)
 
-    best, best_bad = None, None
+    best, second, best_bad = None, None, None
     for a, b, c in itertools.combinations(range(len(candidates)), 3):
         ca, cb, cc = candidates[a], candidates[b], candidates[c]
         if len({ca["i0"], cb["i0"], cc["i0"]}) != 3:
@@ -193,6 +203,12 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         errs = np.abs(edges - TRIANGLE_SIDE_M)
         max_err = float(errs.max())
         center = tri.mean(axis=0)
+        # 透视投影下二维三角形不一定等边，但两台相机看到的同一三点绕向应一致。
+        # 这里只作为软约束（标定误差/相机翻转时不会硬性拒绝）。
+        orient0 = _signed_area(pts0[[ca["i0"], cb["i0"], cc["i0"]]])
+        orient1 = _signed_area(pts1[[ca["i1"], cb["i1"], cc["i1"]]])
+        orient_ok = (abs(orient0) < 1e-9 or abs(orient1) < 1e-9
+                     or (orient0 > 0) == (orient1 > 0))
         cand = {
             "indices": (a, b, c),
             "points": tri,
@@ -205,21 +221,30 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                 cc["reproj_0_px"], cc["reproj_1_px"]])),
             "mean_epi": float(np.mean([ca["epipolar_px"],
                                        cb["epipolar_px"], cc["epipolar_px"]])),
+            "orientation_consistent": bool(orient_ok),
         }
         if max_err > tol_m:
             if best_bad is None or max_err < best_bad[0]:
                 best_bad = (max_err, cand)
             continue
-        # 边长误差为主，重投影/极线为辅；有历史时轻微偏向预测中心
+        # 边长误差为主，重投影/极线为辅；有历史时轻微偏向预测中心。
+        # 边缘误差的离散度也计入，避免“两条 33 mm、一条 25 mm”这种组合。
+        edge_std = float(edges.std())
         score = (2.0 * float(errs.mean()) / max(tol_m, 1e-9)
+                 + 0.5 * edge_std / max(tol_m, 1e-9)
                  + cand["mean_reproj"] / max(rep_tol, 1e-9)
-                 + 0.5 * cand["mean_epi"] / max(epi_tol, 1e-9))
+                 + 0.5 * cand["mean_epi"] / max(epi_tol, 1e-9)
+                 + (0.0 if orient_ok else 2.0))
         if predicted_center is not None:
             pred = np.asarray(predicted_center, np.float64).reshape(3)
             jump = float(np.linalg.norm(center - pred))
             score += 0.15 * jump
+        cand["score"] = float(score)
         if best is None or score < best[0]:
+            second = best
             best = (score, cand)
+        elif second is None or score < second[0]:
+            second = (score, cand)
 
     if best is None:
         bad = best_bad[1] if best_bad else None
@@ -234,8 +259,11 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
             "best_edge_errors_mm": None if bad is None
                                    else [round(float(v * 1000), 3)
                                          for v in bad["errs"]],
+            "best_orientation_consistent": (None if bad is None
+                                            else bad["orientation_consistent"]),
         }
 
+    second_score = None if second is None else second[0]
     chosen = best[1]
     tri = chosen["points"]
     base_cands = [candidates[i] for i in chosen["indices"]]
@@ -275,6 +303,10 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         "edge_errors_mm": [round(v * 1000, 3) for v in errs],
         "mean_reprojection_px": round(chosen["mean_reproj"], 4),
         "mean_epipolar_px": round(chosen["mean_epi"], 4),
+        "triangle_score": round(float(chosen.get("score", 0.0)), 4),
+        "second_score": (None if second_score is None
+                         else round(float(second_score), 4)),
+        "orientation_consistent": bool(chosen["orientation_consistent"]),
         "triangle_side_m": TRIANGLE_SIDE_M,
         "triangle_tol_mm": params["triangle_tol_mm"],
         "labels_are_temporary": True,
