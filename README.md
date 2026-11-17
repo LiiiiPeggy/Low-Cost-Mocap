@@ -13,9 +13,11 @@
 | `Low-Cost-Mocap-main/computer_code/api/camera_manager.py` | **双/多相机并发采集**（每相机一线程，latest-frame 缓存 + 时间戳） |
 | `Low-Cost-Mocap-main/computer_code/api/camera_preview.py` | Flask 蓝图：状态 / MJPEG 推流 / 原始帧保存 |
 | `Low-Cost-Mocap-main/computer_code/api/preview_server.py` | 只含相机功能的最小服务（无需 serial / ruckig） |
-| `Low-Cost-Mocap-main/computer_code/api/calibration/` | **双相机内参 / 外参标定**（OpenCV `calibrateCamera` / `stereoCalibrate`） |
+| `Low-Cost-Mocap-main/computer_code/api/calibration/` | **双相机内参 / 固定棋盘格世界系外参**（`calibrateCamera` + `solvePnP`；`stereoCalibrate` 仅作交叉校验） |
+| `Low-Cost-Mocap-main/computer_code/api/led/` | **红外 LED 检测、极线匹配与三维定位**（三 LED 标记，L0–L2 临时编号） |
 | `Low-Cost-Mocap-main/computer_code/api/calib_cli.py` | 标定命令行：采集 / 重检测 / 求解 / 验证 / 保存 |
 | `Low-Cost-Mocap-main/computer_code/src/components/CameraPreview.tsx` | React 双路预览面板 |
+| `AGENTS.md` / `PROGRESS.md` / `MEMORY.md` / `PROCESS.md` | AI Agent 公共工作规则与项目记忆 |
 | `docs/calibration.md` | **标定使用说明、坐标约定、精度指标、局限** |
 | `docs/` | 调研笔记：方案总结、Astra Pro 适配、配图 |
 | `image_driver/` | 相机厂商资料（说明书 PDF、AmCap 工具、DirectShow SDK 文档） |
@@ -28,7 +30,7 @@
 **Media Foundation**（`mfplat.dll` / `mf.dll` / `mfreadwrite.dll`）取流，仅依赖 `numpy` + `opencv-python`。
 
 实测设备为 UVC 相机 `LRCP G720P`（OV9281 单色 CMOS），支持 NV12 / MJPG / YUY2，
-最高 1280×960@30，实测 1280×720@30 NV12 可达 28 fps。
+最高 1280×960@30；双路 1280×720@30 NV12 实测每路约 30 fps。
 
 ```bash
 conda activate lowcost_mocap
@@ -170,18 +172,23 @@ python api\preview_server.py --indices 0 1
 :: 浏览器打开 http://127.0.0.1:3002/preview → 右上角「标定面板」
 ```
 
-面板内：新建会话（11×8 / 30mm）→ 板移动采 30–40 张内参图 → 板固定到中心地面
-采外参图（各 5–10 张）→「解外参 solvePnP」→ 勾「世界轴叠加」逐台确认 X 轴沿长边
-（不对就勾对应相机的「反向 180°」，确认后勾「已用轴叠加确认」）→ 板挪到 3 个不同位置/高度
-采同步帧对 → 独立验证 → 保存。
+面板内：新建会话（11×8 / 30mm）→ 板移动采 30–40 张内参图 →「内参标定」查看 K/D/RMS/覆盖率
+→ 板固定到中心地面 →「采集双相机图片」取同步帧对（可重复若干次）→「解外参 solvePnP」
+→ 可视化模式切到「世界坐标轴」逐台确认 X 轴沿 12 格长边（不对就勾对应相机的「反向 180°」，
+确认后勾「已确认世界坐标轴方向」）→ 板挪到 3 个不同位置/高度 →「采集并验证三维精度」。
+内参与已确认外参会自动保存到 `captures/calibration/`，无需手动保存。
+
+> 外参每台 1 张有效图即可求解，多采几张主要用于观察帧间抖动；修改 180° 会作废旧外参与方向确认。
 
 **命令行**（采集默认走 HTTP，复用网页服务里的相机；求解不需要相机在线）
 
 ```bat
 :: 先起服务：python api\preview_server.py --indices 0 1
-python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 0
+python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 3
 python api\calib_cli.py capture-single --session <会话> --camera 0 --count 30
 python api\calib_cli.py capture-single --session <会话> --camera 0 --count 6 --phase extrinsic
+python api\calib_cli.py capture-single --session <会话> --camera 1 --count 6 --phase extrinsic
+python api\calib_cli.py capture-stereo --session <会话> --count 3
 python api\calib_cli.py extrinsic --session <会话> [--flip-cam0|--flip-cam1] [--orientation-confirmed]
 python api\calib_cli.py validate-rig --session <会话>
 python api\calib_cli.py save --session <会话> --validate --orientation-confirmed
@@ -194,10 +201,13 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
   `||T||` = 基线（米）。
 - **矩形板有 D2 四重对称**：4 种角点对应在几何上完全等价（重投影误差逐位相同），
   本模块只用「相机在图案正面一侧」筛掉镜像解，剩下的 180° 必须人工看世界轴确认。
-  注意**看不出**来也要确认：单侧反向会把基线从 2032mm 变成 1635mm，而三角化自洽残差
-  两种情况下都只有 ~0.6mm，指标不会报警。
-- 结果写 `api/calibration/calibration.json`（schema v2，含每相机 world↔cam、相机位置、
-  离地高度、相对位姿、自洽性、帧间抖动、独立验证）。旧 `camera-params.json` **未改动**。
+  注意**看不出**来也要确认：合成案例中单侧反向会把基线从 2032 mm 变成 1635 mm，而三角化
+  自洽残差只有约 0.6 mm，指标不会报警。两台相机可以各自独立翻转 180°。
+- 结果自动保存：内参 → `captures/calibration/intrinsics.json`，外参 →
+  `captures/calibration/world_extrinsics.json`，均可从网页重新载入。只有「两台内参 + 已确认外参」
+  才会额外生成兼容文件 `api/calibration/calibration.json`（schema v2，供旧下游读取）。
+  旧 `camera-params.json` **未改动**。
+- 默认板面高 **3 mm**；数据目录为 `computer_code/captures/calibration/<session_id>/`。
 - 下游取参数：`calibration.service.load_calibration()` + `stereo_matrices(data, scaled_size=...)`，
   或 `GET /api/calib/matrices?size=640x360`。
 
@@ -206,32 +216,50 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | GET | `/api/calib/status` | 会话、样本计数（按 phase）、内外参状态、相机位姿摘要 |
-| POST | `/api/calib/session` | 新建 / 打开会话（含板面高） |
-| POST | `/api/calib/capture/single` | 采内参图（判重 + 质量门限） |
-| POST | `/api/calib/capture/extrinsic` | 采外参图（固定板，不判重） |
-| POST | `/api/calib/capture/stereo` | 采验证帧对（双路同时检测） |
+| POST | `/api/calib/session` · `/session/load` · `/session/close` | 新建 / 打开 / 关闭会话（含板面高） |
+| POST | `/api/calib/capture/single` | 采单相机内参图（判重 + 质量门限） |
+| POST | `/api/calib/capture/extrinsic-pair` | 采一对同步帧作外参（双路检测，按 `pair_seq` 去重） |
+| POST | `/api/calib/capture/extrinsic` | 采单相机外参图（CLI / 兼容路径） |
+| POST | `/api/calib/capture/stereo` | 采同步帧对（旧验证路径） |
 | GET | `/api/calib/live?camera=0` | 实时检测叠加（JPEG） |
 | GET | `/api/calib/extrinsic/overlay?camera=0&flip180=0` | 世界原点 + XYZ 轴叠加 |
-| POST | `/api/calib/intrinsic` | 内参标定 |
-| POST | `/api/calib/solve/extrinsic` | 外参标定（solvePnP） |
-| POST | `/api/calib/validate/rig` | 独立验证（多位置/高度） |
-| POST | `/api/calib/stereo` | stereoCalibrate 交叉校验 |
-| POST | `/api/calib/save` | 写 `calibration.json` |
-| GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取矩阵 |
+| POST | `/api/calib/intrinsic` · `/intrinsic/load` | 内参求解 / 载入已保存内参 |
+| POST | `/api/calib/solve/extrinsic` · `/extrinsic/load` | 外参求解 / 载入已保存外参 |
+| POST | `/api/calib/validate/capture` | 采同步帧并做三维精度验证 |
+| POST | `/api/calib/validate/rig` | 用已有验证帧重新计算 |
+| POST | `/api/calib/stereo` | stereoCalibrate 交叉校验（非主路线） |
+| POST | `/api/calib/save` | 写兼容文件 `calibration.json` |
+| GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
+| GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
+| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数与三维定位 |
 
 **自检（无相机可跑）**
 
 ```bat
-cd Low-Cost-Mocap-main\computer_code\api && python -m calibration.selftest
+conda activate lowcost_mocap
+cd Low-Cost-Mocap-main\computer_code\api
+python -m calibration.selftest   :: 136/136
+python -m led.selftest           :: 26/26
 ```
 
-用已知 `K/D/R/T` 按真实畸变模型逐像素反向渲染虚拟棋盘格（11×8 / 30mm），再走正式代码求解。
-最近一次：**77/77 通过**。合成数据（相机距板心 ~1.8m、基线真值 2032.78mm）下：
-内参 fx 误差 0.13%、solvePnP 重投影 0.096/0.085 px、基线 2031.89mm（误差 0.89mm）、
-三角化自洽 max 0.56mm、验证集网格间距误差 max 0.001mm。
-另外用合成数据/假相机覆盖了流程用例：代表帧与角点同源、IPPE 候选物理筛选、
-CLI `save` 端到端、重载恢复结果、新增采集后旧结果作废、HTTP 采集与重复帧/重复帧对拒绝。
-这只是求解链路与流程验证，**不是实机精度**。
+`calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
+同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、兼容文件、
+LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、极线/三角化、
+33 mm 三边、卡尔曼跟踪与接口。最近一次（2026-11-17）：**136/136 + 26/26 通过**。
+两者都只证明求解链路与流程，**不是实机精度**。
+
+### 红外 LED 检测与三维定位（第二阶段）
+
+标记灯统一采用 **850 nm 红外 LED**，不再评估 940 nm 方案。模块复用两台相机的同步帧对和已载入的标定参数：
+
+- **二维检测**：阈值 + 连通域/面积/形状过滤；距离变换局部峰值拆分粘连光斑；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心。
+- **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边约 33 mm。
+- **限制**：`L0/L1/L2` 是临时编号；三个 LED 完全相同，120° 对称未解，**不输出唯一航向或 6DoF**。
+- **参数**：默认阈值 200、面积 3–600 px²、峰距 6 px，可对 cam0/cam1 分别覆盖；保存到 `captures/calibration/led_params.json`。
+- **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay`。
+- 当前 Media Foundation 接口没有可靠的运行时 exposure/gain 控制；需固定相机参数或调整 LED 亮度/阈值。装机时用实际 850 nm LED 确认亮度与检测阈值。
+
+完整说明见 [docs/calibration.md](docs/calibration.md) §6.4。
 
 ### 实测结果（Windows 11 + lowcost_mocap，两台 LRCP G720P）
 
@@ -275,24 +303,30 @@ CLI `save` 端到端、重载恢复结果、新增采集后旧结果作废、HTT
 - **四相机未实现**：`SyncService` 是"A/B 两路"的一对配对器，本身无全局耦合，扩展到四路需要为
   每对（0-1、0-2、0-3…）各建实例并汇总统计，调度层尚未实现。
 - 双相机同时拔插的热插拔恢复只做了断线重连逻辑（1 s 起指数退避），未做真实拔插实验。
-- **标定功能只用合成数据验证过，尚未接入真实相机实拍**：本次没有在实机上采过标定图，
-  所以仓库里**不含任何实拍标定结果**，`api/calibration/calibration.json` 不存在属正常。
-  真实 RMS、基线、畸变系数必须自己采数据跑出来。
+- **标定与 LED 仍只用合成数据 / 假相机验证**：曾采过实机标定图，但尚未形成“固定安装 + 人工方向确认 +
+  多位置独立验证”的可信闭环，仓库不包含可用的实拍标定结果。旧版 `api/calibration/calibration.json`
+  已删除；真实 RMS、基线、畸变系数必须现场采集后重新求解。
 - 合成数据下画面**四角的畸变外推**误差约 1.6 px（补采四角后从 20 px 降到这里），
   实机需按 `radius_coverage.ratio` 自查是否覆盖足够。
 - 标定 UI 只在 Flask 自带 `/preview` 页验证过；React 侧未加标定面板，也未构建。
 - **棋盘格方向（180°）只能人工确认**：矩形板的 D2 四重对称在几何上不可分辨，
   单侧反向还会把基线改掉 20% 而不触发任何残差告警（详见 `docs/calibration.md` 第 6 节）。
   若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
-- 未实现红外 LED 检测、三角化三维定位（LED 位置解算）、Go2 控制
-  （标定与世界系已建立，见上文）。
+- **LED 只完成链路与合成验证**：现场仍需调阈值/面积/峰距，并确认 850 nm LED 的实际亮度与曝光；
+  L0–L2 为临时编号，尚不能输出唯一航向。
+- Go2 / 机器狗控制与 ROS 2 输出未实现（标定与世界系已建立，见上文）。
 
 ## 注意
 
+- 标记灯统一采用 **850 nm 红外 LED**；不再评估 940 nm 方案。
 - 相机是**独占**的：预览窗口开着时再运行会报 `0xC00D3704`，需先关闭其他占用程序。
 - 该相机输出 **8 bit 亮度**（非辐射亮度），**不能用来测温**。
 - 本仓库未包含 267MB 的厂商 DirectShow SDK（`image_driver/camera windows sdk/`），
   因为代码不编译、不链接它，运行时也不需要。
+
+## 项目记忆（面向 AI Agent）
+
+开始实质任务前先读 [PROGRESS.md](PROGRESS.md)；按需读 [MEMORY.md](MEMORY.md)；涉及历史设计或方案比较时读 [PROCESS.md](PROCESS.md)。公共工作规则见 [AGENTS.md](AGENTS.md)。
 
 ## 许可
 

@@ -24,6 +24,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import camera_preview  # noqa: E402
 import calibration.routes as calibration_routes  # noqa: E402
+import led.routes as led_routes  # noqa: E402
 from camera_manager import manager  # noqa: E402
 from sync import sync_service  # noqa: E402
 
@@ -33,6 +34,7 @@ def build_app() -> Flask:
     CORS(app, resources={r"/api/*": {"origins": "*"}})
     camera_preview.register(app)
     calibration_routes.register(app)   # /api/calib/*
+    led_routes.register(app)           # /api/led/*
 
     @app.get("/")
     def index():

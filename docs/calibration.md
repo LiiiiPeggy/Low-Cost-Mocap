@@ -19,7 +19,7 @@
 |---|---|
 | 相机 | 两台固定在不同位置，朝房间中心区域 |
 | 标定板 | **12×9 个方格 → 11×8 内角点**，单格 **30 mm**，总尺寸 360×270 mm |
-| 板面高 | 图案表面高于地面，**默认 5 mm**，按实际修改 |
+| 板面高 | 图案表面高于地面，**默认 3 mm**，按实际修改 |
 | 图像 | 1280×720，NV12@30（MJPG 同样可用） |
 | 环境 | conda `lowcost_mocap`：Python 3.10.22 / OpenCV 4.10.0 / NumPy 1.26.4 |
 
@@ -54,28 +54,43 @@ python api\preview_server.py --indices 0 1
 
 面板里 5 步：
 
-1. **新建 / 打开会话**：内角点 `11 × 8`、方格 `30` mm、板面高默认 `5` mm（按实际改）。
+1. **新建 / 打开会话**：内角点 `11 × 8`、方格 `30` mm、板面高默认 `3` mm（按实际改）。
 2. **内参**：让板在**两台相机前移动**，各采 30–40 张（角度/距离/位置都要变，尽量铺到画面四角）
-   → 「内参标定」。日志会分别给出相机 0/1 的 K、D、RMS、有效张数和**区域覆盖率**
-   （6×6 网格，仅统计该相机的 intrinsic 样本）。可视化模式默认是
-   **棋盘格角点可视化**，可直接看角点/编号/网格；确认方向时再切到世界坐标轴。
+   → 「内参标定」。成功后**自动保存**：
+   - 会话：`captures/calibration/<session>/result_intrinsic.json`
+   - 跨会话最新：`captures/calibration/intrinsics.json`
+   页面会直接显示两台相机的 K、D、RMS、fx/fy/cx/cy、有效样本数、区域覆盖率和保存路径。
+   重启程序或新建会话后，可点「载入内参」直接恢复 K/D，**不需要重新采集**。
+   可视化模式默认是**棋盘格角点可视化**，确认方向时再切到世界坐标轴。
 3. **外参**：把板**固定在中心地面** → 「采集双相机图片」按一次同时取一对同步帧，分别存入
    两台相机的 `extrinsic` 阶段。**每台 1 张有效图即可 solvePnP**；可重复按 3–5 次观察位姿
-   抖动（单张时不会输出无意义的标准差）→「解外参 solvePnP」。
+   抖动（单张时不会输出无意义的标准差）→「解外参 solvePnP」。成功后**自动保存**：
+   - 会话：`captures/calibration/<session>/result_extrinsic.json`
+   - 跨会话最新：`captures/calibration/world_extrinsics.json`
+   重启后可点「载入世界坐标系外参」恢复三维位置、朝向、基线和三维视图。
 4. **确认 180°**：把「可视化模式」切到**世界坐标轴可视化**，图上会画出世界原点、
    X（红）/Y（绿）/Z（蓝）轴和角点编号，0 号角点有红圈。**看 X 轴是否沿实物 12 格长边**；
-   如果反了，勾对应相机的「反向 180°」再看一次。确认后勾「已确认世界坐标轴方向」。
-   改任一相机的 180° 或重新采集外参图片，都会自动取消这个确认。这一步只能人眼判断，
-   原因见第 6 节。
+   如果反了，勾对应相机的「反向 180°」再看一次。确认后勾「已确认世界坐标轴方向」，再点一次
+   「解外参 solvePnP」把确认状态写入结果。**修改任一相机的 180° 会立即作废旧外参**，
+   必须重新解外参；这一步只能人眼判断，原因见第 6 节。
 5. **三维定位精度验证**：把板挪到**其它位置和高度**（建议至少 3 处），每处点
    「采集并验证三维精度」——自动取同步帧对、入库、三角化并更新历史统计；
    「重新计算」复用已保存的验证帧对，不再采集图像。
+
+6. **红外 LED 检测与三维定位**（标定完成后的第二阶段）：确认双相机 streaming、内外参
+   已载入且方向已确认 → 在“红外 LED 检测与定位”区点 **开始二维检测** → 把可视化模式
+   切到 **红外 LED 检测可视化**，调整阈值/面积/峰值间距/光斑分离，直到两台相机各稳定
+   检测到 3 个 LED → 点 **开始三维定位** → 在现有三维视图中查看三点、三角形、几何中心
+   与轨迹 → 结束时点 **停止三维定位 / 停止二维检测**。参数保存在
+   `captures/calibration/led_params.json`。
 
 下方的三维世界视图用真实外参画出两台相机的位置、朝向与视锥体，并显示基线、世界轴、
 棋盘格和相机编号/位置/离地高度/重投影误差。左键拖动旋转、滚轮缩放、右键拖动平移；
 另有「重置视角」「俯视图」。标定结果变化后视图自动更新。
 
-最后「保存 calibration.json」写 `api/calibration/calibration.json`（界面显示项目相对路径）。
+手动「查看结果」「保存 calibration.json」按钮已删除。两台内参与**已确认**的世界系外参
+都有效时，系统会自动生成/更新下游兼容文件 `api/calibration/calibration.json`（界面显示
+项目相对路径）；未确认方向的外参只保存为待确认结果，不写兼容文件。
 
 命令行等价流程见第 5 节。
 
@@ -106,6 +121,12 @@ python api\preview_server.py --indices 0 1
 0.07px，但把模型用到画面四角会出现明显偏差（合成实验里 20px → 补采四角后 1.6px）。
 `radius_coverage.ratio < 0.75` 时会显式告警。
 
+**自动保存与载入**：计算成功的相机会合并写入 `captures/calibration/intrinsics.json`
+（包含 K、D、RMS、图像尺寸、有效样本数、覆盖比例、相机标识、计算时间）。失败的相机不会
+覆盖文件里已有的有效结果。载入时校验 schema、相机编号、K/D、图像尺寸；不兼容的相机不会
+清空当前内存结果，并在界面日志里明确报告“文件不存在 / 参数不兼容”。载入结果带
+`source="loaded"` 和 `loaded_from`，不会被误认为本会话重新计算。
+
 ### 4.2 外参（solvePnP）
 
 对每台相机：`solvePnPGeneric(SOLVEPNP_IPPE)` 得到两个候选，用
@@ -124,6 +145,14 @@ python api\preview_server.py --indices 0 1
   条件允许时仍建议把板移近到画面约 **100 px 宽以上**，或让板面更正对两台相机。
 
 强行把内参阶段也降到 0.1% 是不合适的：畸变参数需要画面边缘的角点覆盖。
+
+**自动保存与载入**：`solvePnP` 成功后自动写会话 `result_extrinsic.json` 和跨会话
+`captures/calibration/world_extrinsics.json`，包含两台相机的 R/t、三维位置、离地高度、
+`R_10/T_10`、基线、重投影、棋盘格/世界系定义、内参快照和 `orientation_confirmed`。
+未确认方向的结果会保存为**待确认**，但不会更新兼容 `calibration.json`。
+载入时校验棋盘格规格、世界系定义、相机编号、位姿字段完整性，以及文件内参快照与当前
+已载入 K/D 的一致性；不兼容则明确报错且**不覆盖当前有效外参**。载入后三维视图和数值
+自动刷新，并恢复 flip 与方向确认状态。修改 180° 会作废旧外参与确认，必须重新求解。
 
 **候选解怎么选**：平面的两解互为"穿过板面的镜像"，重投影误差几乎相同，**不能按误差选**。
 用物理先验——图案正面朝上，相机只能在其上方，所以取相机世界 Z 最大的解。
@@ -170,7 +199,7 @@ python api\preview_server.py --indices 0 1
 python api\preview_server.py --indices 0 1
 
 :: 在线采集（HTTP）
-python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 5
+python api\calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 3
 python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 0 --count 30
 python api\calib_cli.py capture-single --session captures\calibration\<会话> --camera 1 --count 30
 :: 板固定到中心地面后（CLI 仍是逐相机采集；网页用「采集双相机图片」一次采一对）
@@ -193,6 +222,11 @@ python api\calib_cli.py info
 `result_intrinsic.json`，不会每次重算覆盖内参；`validate-rig` 只读已解出的外参，
 **不会改写**它。
 
+CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/intrinsics.json`
+和 `world_extrinsics.json`，并打印最新路径与兼容文件状态。`save` 子命令保留为显式写兼容
+`calibration.json`（可指定 `--out`）。跨会话载入目前通过网页“载入内参 / 载入世界坐标系
+外参”按钮完成；对应的服务方法为 `service.load_intrinsics()` / `service.load_extrinsics()`。
+
 ---
 
 ## 6. 角点对应关系：D2 四重对称（必须知道）
@@ -209,9 +243,10 @@ python api\calib_cli.py info
    并且**刻意不按重投影误差挑选**（两种解误差逐位相同，按误差选等于瞎猜）；结果里的
    `orientation_ambiguous` 会标出还有另一种解。
 3. 剩下的 180° 只能**人工确认**：把「可视化模式」切到「世界坐标轴可视化」，逐台看
-   X 轴是否沿 12 格长边。界面里 cam0 / cam1 各有独立的 180° 开关，确认后勾
-   「已确认世界坐标轴方向」，这个状态会写进结果（`orientation_confirmed`）。改任一
-   相机的 180° 或重新采集外参图片会自动取消该确认。
+   X 轴是否沿 12 格长边。界面里 cam0 / cam1 各有独立的 180° 开关；确认后勾
+   「已确认世界坐标轴方向」，再点一次「解外参 solvePnP」，状态才会写进结果文件
+   （`orientation_confirmed`）。改任一相机的 180° 或重新采集外参图片会自动作废旧确认，
+   必须重新求解。
 4. **三角化一致性残差查不出 180° 错误**。实测：cam1 反向时基线从 **2032 mm 变成 1635 mm**，
    而自洽残差两种情况都只有 **0.6–0.8 mm**。也就是说，基线错了 20%，指标却看不出来。
    → 这就是为什么必须人眼看轴，也是为什么单翻一台相机的开关要单独给出。
@@ -220,6 +255,87 @@ python api\calib_cli.py info
 
 更严谨的做法是在板上加非对称标记（ArUco / 缺角标记），本次未做。
 
+### 6.4 红外 LED 检测与三维定位（第二阶段）
+
+标定完成后，网页标定面板底部的“红外 LED 检测与定位”使用同一对同步帧和已载入标定参数。
+代码在 `api/led/`：
+
+| 文件 | 作用 |
+|---|---|
+| `detector.py` | 灰度阈值、连通域、距离变换峰值、光斑分离、亚像素中心、过曝/不可分状态 |
+| `geometry.py` | 极线候选、世界系三角化、重投影筛选、33 mm 等边三角形、临时编号 |
+| `tracker.py` | 9 状态（位置/速度/加速度）卡尔曼跟踪，按真实同步时间戳传播 |
+| `service.py` | 后台线程、同步帧去重、参数持久化、二维叠加图、状态缓存 |
+| `routes.py` | `/api/led/*` HTTP 接口 |
+| `selftest.py` | 合成光斑/三角化/跟踪/服务去重测试（`python -m led.selftest`） |
+
+**检测**：可选高斯模糊 → 灰度阈值 → 连通域 → 面积/形状（solidity）过滤。对每个亮区做
+距离变换，取局部峰值；多个峰值时用最近峰值分配（watershed 的简化等价）拆分，再以原始
+灰度做强度加权亚像素中心。距离峰值不够时用灰度局部极大值兜底。完全饱和、无法分开的
+大亮区标记为 `unresolved / overexposed`，**不会伪造三个点**。
+
+**参数**：默认灰度阈值 200、最小/最大面积 3/600 px²、最小峰值间距 6 px、光斑分离开启、
+模糊核 3×3；另有极线 3 px、重投影 3 px、三角形边长容差 6 mm。两台相机共用默认值，
+可对阈值/最小面积/最大面积/最小峰值间距做相机 0/1 覆盖（留空=共用）。参数保存到
+`captures/calibration/led_params.json`，支持恢复默认；修改后对最新同步帧重算一次。
+
+**匹配与三角化**：原始像素只去畸变一次，得到理想像素；用标定的 `R/t` 构造
+`P = K [R|t]`，由 `R_10/T_10` 计算基础矩阵做极线筛选；`cv2.triangulatePoints` 直接得到
+**世界系**米制坐标（不再重复施加世界变换）；检查两个相机前方、重投影误差；最后枚举
+3 点组合，要求三边与 33 mm 的偏差在容差内。输出三边长度/误差、各 LED 重投影误差和
+极线误差。
+
+**等边三角形**：三个 LED 完全相同，120° 对称无法仅凭几何消除；输出的 L0/L1/L2 只是
+**临时显示编号**，利用时间连续性保持稳定，`labels_are_temporary=true`。本版本不输出
+唯一航向或完整 6DoF。
+
+**跟踪**：三维中心进入卡尔曼滤波；使用 `rec.created_mono`，不假定固定帧率。正常测量为
+`tracking`；短时漏检/几何临时不一致为 `predicted`（明确标记“无当前测量”）；超过
+0.6 s / 8 帧为 `lost` 并清除当前点，不把旧位置当作有效测量。
+
+**二维可视化**：复用标定面板已有的两路图像。可视化模式新增“红外 LED 检测可视化”，
+显示方式可选检测叠加/二值化/原始灰度/去畸变+极线；候选为黄色、成功匹配为绿色、
+被拒绝亮区为红色；显示临时编号、数量、过曝/粘连状态和帧对 Δt。只有该模式请求
+`/api/led/overlay`，不会同时执行棋盘格检测。
+
+**三维可视化**：复用现有 Z 向上 Canvas 场景，增加三个 LED 点、三角形连线、几何中心、
+中心 X/Y/Z 标签、历史轨迹和有效性状态；鼠标视角状态不会被定位刷新重置。
+
+**启动条件**：相机 0/1 必须 `streaming`；二维检测需先启动；三维定位还要求两台内参、
+世界系外参存在、`orientation_confirmed=true`，且当前分辨率与内参图像尺寸一致。标定在
+运行中变化时，服务会重置跟踪并重新加载；不满足条件则停止三维定位并显示具体原因。
+
+**接口**（返回 JSON，叠加图为 JPEG）：
+
+```text
+GET  /api/led/state          当前检测/定位状态、LED、三边、中心、速度、轨迹
+GET  /api/led/params         默认值/共用值/相机覆盖/有效参数/保存路径
+POST /api/led/params         保存参数（body: {params, overrides}）
+POST /api/led/params/reset   恢复默认
+POST /api/led/detect/start|stop
+POST /api/led/locate/start|stop
+GET  /api/led/overlay?camera=0&view=detect|binary|raw|epipolar
+```
+
+**曝光/增益**：当前 Media Foundation 采集接口没有可靠的运行时曝光/增益属性（旧的
+`helpers.py` 是 pseyepy 通路的 exposure/gain，不适用于本驱动），因此没有加入伪曝光
+控制；请固定相机曝光/增益，或在允许范围内调整检测阈值。
+
+### 6.5 网页版本与刷新
+
+- `GET /api/version` 返回当前进程的 Git 短 SHA、分支、dirty 状态、启动时间和 PID；
+  页面顶部 `#build` 显示该版本，不再写死字符串。
+- 页面每 2 s 检查一次版本；若 `git_sha` 或 `started_at` 变化（服务重启/更新），显示
+  “服务已更新，请刷新页面”与刷新按钮，**不会自动刷新**。
+- API 始终同源；移除了 3001/3002 端口自动回退，普通 400/404/500 原样显示。
+- `/preview`、`/api/version`、`/api/led/state`、`/api/led/overlay` 使用 `no-store`；
+  标定面板收起时暂停标定状态轮询；LED 状态在面板打开时 4 Hz，后台标签页降频；
+  同步帧/参数变化才重新处理，避免重复三角化。
+
+LED 专项自检：`python -m led.selftest`，**26/26 通过**（合成光斑、粘连分离、过曝拒绝、
+极线匹配、33 mm 三角化、缺失/几何不一致、卡尔曼预测/丢失、服务帧去重与叠加图）。
+标定自检：**136/136 通过**（包含 LED UI/参数接口与版本接口检查）。
+
 ---
 
 ## 7. 输出
@@ -227,16 +343,25 @@ python api\calib_cli.py info
 ### 7.1 会话目录
 
 ```
-captures/calibration/<会话>/
-  session.json                板规格（含 world_frame）、相机、分辨率、坐标约定
-  samples.json                每条样本：phase、角点、质量、有效性、失败原因、Δt
-  img/<id>_cam0.png           原始灰度（未旋转未缩放未去畸变）
-  overlay/<id>_cam0.png       角点叠加图
-  result_intrinsic.json       内参中间结果
-  result_extrinsic.json       solvePnP 外参中间结果（含逐帧抖动）
-  result_validation.json      独立验证结果
-  calibration.json            最终结果副本
+captures/calibration/
+  intrinsics.json             最新有效内参（跨会话，两台相机合并保存）
+  world_extrinsics.json       最新有效世界系外参（跨会话，含方向确认状态）
+  led_params.json             红外 LED 检测参数（共用 + 相机覆盖）
+  <会话>/
+    session.json              板规格（含 world_frame）、相机、分辨率、坐标约定
+    samples.json              每条样本：phase、角点、质量、有效性、失败原因、Δt
+    img/<id>_cam0.png         原始灰度（未旋转未缩放未去畸变）
+    overlay/<id>_cam0.png     角点叠加图
+    result_intrinsic.json     内参中间结果（含 loaded_from 时可区分历史载入）
+    result_extrinsic.json     solvePnP 外参中间结果（含逐帧抖动）
+    result_validation.json    独立验证结果
+    calibration.json          兼容结果副本（仅确认外参时）
 ```
+
+`intrinsics.json` 按相机分别保存 K、D、RMS、图像尺寸、有效样本数、覆盖比例、相机标识、
+计算时间；计算失败的相机不会覆盖其中已有的有效条目。`world_extrinsics.json` 保存两台相机
+的 R/t、三维位置、离地高度、`R_10/T_10`、基线、重投影、棋盘格/世界系定义、内参快照和
+`orientation_confirmed`；未确认方向的结果也会保存，但不会被当作已确认配置。
 
 `samples.json` 里 `phase` 取值：`intrinsic`（板移动）/ `extrinsic`（板固定）/ `validation`（板换位置）。
 
@@ -257,7 +382,7 @@ captures/calibration/<会话>/
 | `method` | `solvePnP (IPPE candidates + LM refine) per camera against one fixed board` |
 | `world_frame` | 世界系定义（原点、三轴、手性、板面高、地面 Z） |
 | `flip_cam` | 每台相机的 180° 开关 `{"0":bool,"1":bool}` |
-| `orientation_confirmed` | 是否已人工用轴叠加确认方向（几何无法自动判定） |
+| `orientation_confirmed` | 是否已人工用世界坐标轴可视化确认方向（几何无法自动判定） |
 | `cameras.{0,1}.R_world_to_cam` / `t_world_to_cam_m` | 世界 → 相机 |
 | `cameras.{0,1}.R_cam_to_world` / `t_cam_to_world_m` | 相机 → 世界 |
 | `cameras.{0,1}.camera_centre_world_m` | 相机光心世界坐标 |
@@ -267,6 +392,12 @@ captures/calibration/<会话>/
 | `R_10` / `T_10` / `T_unit` / `baseline_m` | 相机 0 → 1 相对位姿（兼容字段） |
 | `consistency` | 三角化角点与已知世界点的三维偏差 |
 | `stability` | 同一静止板多帧之间的位姿抖动 |
+
+**兼容文件不再需要网页手动保存**：两台内参都有效、世界系外参已解且
+`orientation_confirmed=true` 时，系统会在内参计算/载入、外参求解/载入后自动生成或更新
+`api/calibration/calibration.json`。未确认方向、只有一台内参或写盘失败时不会写入半成品，
+会保留上一次已确认文件。旧的 `load_calibration()` / `stereo_matrices()` /
+`GET /api/calib/matrices` 读取方式不变。
 
 下游取参数：
 
@@ -294,13 +425,18 @@ K0, D0, K1, D1, R, T = stereo_matrices(data)    # 或 scaled_size=(640, 360)
 | POST | `/api/calib/capture/stereo` | 采一对同步帧（validation 用） |
 | GET | `/api/calib/live?camera=0` | 角点检测可视化（JPEG） |
 | GET | `/api/calib/extrinsic/overlay?camera=0&flip180=0` | **世界坐标轴可视化**（确认角点对应） |
-| POST | `/api/calib/intrinsic` | 内参标定（含每相机区域覆盖率） |
-| POST | `/api/calib/solve/extrinsic` | **外参标定（solvePnP）** |
+| POST | `/api/calib/intrinsic` | 内参标定（含每相机区域覆盖率，成功后自动保存最新内参） |
+| POST | `/api/calib/intrinsic/load` | **载入内参**：从 `intrinsics.json` 恢复 K/D，不重采/重算 |
+| POST | `/api/calib/solve/extrinsic` | **外参标定（solvePnP）**，成功后自动保存最新外参 |
+| POST | `/api/calib/extrinsic/load` | **载入世界坐标系外参**：校验后恢复三维位姿/基线 |
+| POST | `/api/calib/extrinsic/invalidate` | 修改 180° 后作废旧外参与方向确认 |
 | POST | `/api/calib/validate/rig` | 重新计算验证（复用已保存数据） |
 | POST | `/api/calib/validate/capture` | **采集并验证三维精度**（采一对新帧 + 自动验证） |
 | POST | `/api/calib/stereo` | stereoCalibrate 交叉校验（保留，网页不再入口） |
 | POST | `/api/calib/save` | 写 `calibration.json` |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取矩阵 |
+| GET | `/api/version` | 真实 Git 短 SHA、分支、dirty、启动时间 |
+| * | `/api/led/*` | 红外检测/定位状态、参数、启停、叠加图（见 6.4） |
 
 ---
 
@@ -316,7 +452,8 @@ python -m calibration.selftest --keep     :: 保留渲染图
 用已知 `K/D/R/T` 按**真实畸变模型**逐像素反向渲染虚拟棋盘格（11×8 / 30 mm），再走正式代码
 检测与求解，最后与真值比对。
 
-最近一次：**102/102 通过**（`--quick` 与完整模式均通过）。合成数据（两台相机距板心
+最近一次标定自检：**136/136 通过**（`--quick` 与完整模式均通过）；LED 专项自检
+`python -m led.selftest`：**26/26 通过**。合成数据（两台相机距板心
 ~1.8 m、基线 2032.78 mm）的代表性量级：
 
 | 项目 | 结果 |
@@ -344,6 +481,21 @@ python -m calibration.selftest --keep     :: 保留渲染图
 - 汇总间距误差与逐位置结果单位一致（mm）；旧结果的米→毫米迁移幂等
 - 网页包含三种可视化模式、三维视图/重置/俯视入口，旧的双目标定/覆盖检查/分散采集
   入口已移除
+- 内参计算后自动写 `intrinsics.json`；新会话零样本执行 `load_intrinsics()` 可恢复两台 K/D，
+  并标记 `source="loaded"` / `loaded_from`
+- 未确认外参保存为待确认、不写兼容文件；确认后自动写 `world_extrinsics.json` 与
+  `api/calibration/calibration.json`，下游 `load_calibration`/`stereo_matrices`/
+  `GET /api/calib/matrices` 正常
+- 新会话载入内外参后基线/方向确认状态恢复；不兼容棋盘格、不兼容内参或缺失文件会被拒绝，
+  且不清除当前有效结果
+- 最新内参/外参文件写入失败时仍返回计算结果，并报告 `latest_error`/`save_errors`
+- 修改 180° 后旧外参与方向确认被作废
+- 网页已移除“查看结果 / 保存 calibration.json”，新增“载入内参 / 载入世界坐标系外参”
+- LED 专项：分离三点、粘连两点/三点拆分、完全饱和不伪造、亚像素中心
+- LED 专项：极线匹配、世界系三角化、33 mm 三边、缺失检测、几何不一致
+- LED 专项：卡尔曼匀速速度/位置、短时预测、超时丢失
+- LED 服务：同一 `pair_seq` 不重复处理、新帧处理、二维叠加图可生成
+- 版本接口返回 Git 版本；页面含版本横幅/刷新按钮；前端无 3001/3002 回退
 
 **这不是实机精度**：合成图没有镜头杂散光、板面不平、运动模糊、滚动快门和 USB 传输抖动。
 实机必须自己采数据重跑。
@@ -365,8 +517,22 @@ python -m calibration.selftest --keep     :: 保留渲染图
 7. **三维视图是检查工具，不是测量结果**：网页里的三维场景由 Canvas 2D 透视投影绘制
    （不依赖联网或额外前端工程），相机位置/朝向/视锥体来自已求解的外参和内参，用于检查
    方向与几何关系；数值精度仍以 `calibration.json` 和验证指标为准。
-8. **板面高是声明值**：默认 5 mm 只描述图案表面高于地面的高度，世界原点仍在图案表面；
+8. **板面高是声明值**：默认 3 mm 只描述图案表面高于地面的高度，世界原点仍在图案表面；
    如果实际板面高与填写值不符，基于地面的高度会整体偏移。
+9. **最新文件是“最近一次成功求解”**：`world_extrinsics.json` 会被下一次 solvePnP 覆盖
+   （包括待确认结果）；`intrinsics.json` 按相机合并，某台失败不会覆盖该相机旧值。
+   兼容 `calibration.json` 只在方向已确认时更新，待确认结果不会替换上一次已确认配置。
+10. **载入外参需要匹配当前内参与板规格**：文件里保存了内参快照和棋盘格/世界系定义；
+    重新计算内参、改板面高或换会话规格后，旧外参文件会被判为不兼容，必须重新 solvePnP。
+11. **LED 等边三角形 120° 对称未解**：L0/L1/L2 只是临时显示编号；本版本不输出唯一
+    航向或完整 6DoF，也不使用原作者的 droneIndex 规则。
+12. **LED 检测参数需要按现场调整**：阈值、面积、峰值间距、模糊核与 LED 亮度/距离相关；
+    光斑完全饱和或粘连到无法分出峰值时只会提示，不会伪造三点。1–2.5 m 是设计工作段，
+    更远距离的质心噪声和误匹配风险会显著增加。
+13. **运行时曝光/增益不可控**：当前 Media Foundation 采集接口没有可靠的 exposure/gain
+    属性；不要用软件亮度归一化冒充硬件曝光控制。请固定相机参数，必要时调整 LED 亮度。
+14. **运动目标仍受软件同步限制**：LED 定位使用同步帧对，但两机曝光时刻仍有半帧级
+    不确定度；静止或低速目标可用，高速运动必须另行评估或做硬件同步。
 
 ---
 

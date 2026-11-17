@@ -371,6 +371,14 @@ try:
 except Exception as _exc:
     print("[警告] 标定模块加载失败：%s" % _exc)
 
+# --- 红外 LED 检测 / 三维定位蓝图 -------------------------------------------
+try:
+    from led.routes import register as register_led
+    register_led(app)
+    print("[定位] 接口已挂载：/api/led/*")
+except Exception as _exc:
+    print("[警告] LED 定位模块加载失败：%s" % _exc)
+
 
 if __name__ == '__main__':
     from camera_manager import manager as camera_manager

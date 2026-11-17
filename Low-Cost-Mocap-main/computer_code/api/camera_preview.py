@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import time
 from datetime import datetime
 
@@ -35,6 +36,41 @@ DEFAULT_HEIGHT = int(os.environ.get("MOCAP_CAM_HEIGHT", "720"))
 DEFAULT_FPS = float(os.environ.get("MOCAP_CAM_FPS", "30"))
 DEFAULT_FORMAT = os.environ.get("MOCAP_CAM_FORMAT", "NV12")
 DEFAULT_OUT_DIR = os.environ.get("MOCAP_CAPTURE_DIR", os.path.abspath("captures"))
+
+_SERVER_STARTED = datetime.now().isoformat(timespec="seconds")
+_GIT_INFO: dict | None = None
+
+
+def _git_info() -> dict:
+    """进程启动版本：git 短 SHA / 分支 / 是否有未提交改动。失败时返回 unknown。"""
+    global _GIT_INFO
+    if _GIT_INFO is not None:
+        return _GIT_INFO
+    api_dir = os.path.dirname(os.path.abspath(__file__))
+
+    def run(*args) -> str:
+        return subprocess.check_output(
+            ["git", *args], cwd=api_dir, text=True, encoding="utf-8",
+            errors="replace", stderr=subprocess.DEVNULL, timeout=2).strip()
+
+    try:
+        sha = run("rev-parse", "--short", "HEAD")
+        branch = run("rev-parse", "--abbrev-ref", "HEAD")
+        dirty = bool(run("status", "--porcelain"))
+    except Exception:
+        sha, branch, dirty = "unknown", "unknown", False
+    _GIT_INFO = {"git_sha": sha, "branch": branch, "dirty": dirty}
+    return _GIT_INFO
+
+
+@bp.get("/api/version")
+def api_version():
+    info = dict(_git_info())
+    info.update({"started_at": _SERVER_STARTED, "pid": os.getpid(),
+                 "server": "preview_server"})
+    resp = jsonify(info)
+    resp.headers["Cache-Control"] = "no-store"
+    return resp
 
 
 def _parse_indices(raw) -> list[int]:

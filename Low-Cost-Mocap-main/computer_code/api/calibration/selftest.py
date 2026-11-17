@@ -1088,14 +1088,232 @@ def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
 
 
 # ---------------------------------------------------------------------------
+# 用例 13：最新内外参自动保存、跨会话载入与兼容文件
+# ---------------------------------------------------------------------------
+def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
+    print("\n[13] 最新内外参自动保存与跨会话载入")
+    import calibration.service as SVC
+    from camera_manager import Frame
+    from calibration.service import (
+        DEFAULT_EXTRINSICS_PATH, DEFAULT_INTRINSICS_PATH, DEFAULT_RESULT_PATH,
+        load_calibration, stereo_matrices,
+    )
+
+    root_a = os.path.join(tmp, "latest_a")
+    shutil.rmtree(root_a, ignore_errors=True)
+    sess_a = Session.create(root_a, spec, [0, 1], size, "NV12")
+    counts = _add_intrinsic_samples(sess_a, spec, size, tex, off, 6)
+    check("最新结果用例：内参样本准备", counts == {0: 6, 1: 6}, counts)
+
+    svc = SVC.service()
+    svc.reload_session(root_a)
+    r = svc.run_intrinsic(None)
+    check("内参计算后自动保存最新 intrinsics.json",
+          bool(r.get("latest_saved")) and os.path.isfile(DEFAULT_INTRINSICS_PATH),
+          r.get("latest_error"))
+    with open(DEFAULT_INTRINSICS_PATH, encoding="utf-8") as fh:
+        idata = json.load(fh)
+    icams = idata.get("cameras") or {}
+    check("最新内参文件含两台相机的 K/D/RMS/尺寸/样本数/覆盖率/时间",
+          idata.get("schema") == "lowcost-mocap/intrinsics"
+          and all(k in icams for k in ("0", "1"))
+          and all(all(f in icams[k] for f in (
+              "K", "D", "rms_px", "image_size", "num_views",
+              "coverage_ratio", "created")) for k in ("0", "1")),
+          sorted(icams))
+    check("未确认外参时不写兼容 calibration.json",
+          (r.get("compat") or {}).get("updated") is False, r.get("compat"))
+
+    # 保存失败：把目标路径换成一个目录，计算仍应返回结果
+    real_intr_path = SVC.DEFAULT_INTRINSICS_PATH
+    bad_path = os.path.join(tmp, "intrinsics_as_dir.json")
+    shutil.rmtree(bad_path, ignore_errors=True)
+    os.makedirs(bad_path)
+    SVC.DEFAULT_INTRINSICS_PATH = bad_path
+    try:
+        rf = svc.run_intrinsic(None)
+        check("最新内参保存失败时仍返回计算结果",
+              rf.get("latest_saved") is False and bool(rf.get("intrinsics"))
+              and bool(rf.get("latest_error")), rf.get("latest_error"))
+    finally:
+        SVC.DEFAULT_INTRINSICS_PATH = real_intr_path
+
+    # 新会话、零样本，直接载入内参
+    root_b = os.path.join(tmp, "latest_b")
+    shutil.rmtree(root_b, ignore_errors=True)
+    Session.create(root_b, spec, [0, 1], size, "NV12")
+    svc.reload_session(root_b)
+    before_phase = svc.session.stats()["by_phase"]
+    rl = svc.load_intrinsics()
+    check("新会话无样本也能载入两台内参",
+          set(rl.get("loaded") or {}) == {"0", "1"}
+          and all(v.get("source") == "loaded"
+                  for v in svc._intrinsics.values()),
+          rl.get("errors"))
+    check("载入内参不改变采集计数",
+          svc.session.stats()["by_phase"] == before_phase)
+    with open(os.path.join(root_b, "result_intrinsic.json"), encoding="utf-8") as fh:
+        b_intr = json.load(fh)
+    check("载入内参在会话结果里标记 loaded_from（不冒充重新计算）",
+          b_intr.get("loaded_from") == rl.get("path"), b_intr.get("loaded_from"))
+
+    # 外参：未确认 -> 待确认文件；确认 -> 兼容文件
+    C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
+    img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
+    img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
+
+    def _frame(gray, seq):
+        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
+                     host_ts=time.time(), mono_ts=time.perf_counter())
+
+    w0 = _FakeWorker(_frame(img0, 3100), 0)
+    w1 = _FakeWorker(_frame(img1, 3200), 1)
+    orig_manager, orig_sync = SVC.manager, SVC.sync_service
+    SVC.manager = lambda: _FakeManager({0: w0, 1: w1})
+    try:
+        SVC.sync_service = lambda: _FakeSync(w0.latest(), w1.latest(), pair_seq=30)
+        cap = svc.capture_extrinsic_pair()
+        check("最新结果用例：外参图像采集", bool(cap.get("ok")), cap.get("message"))
+
+        pending = svc.solve_extrinsic(orientation_confirmed=False,
+                                      flip_cam={"0": False, "1": False})
+        with open(DEFAULT_EXTRINSICS_PATH, encoding="utf-8") as fh:
+            pdata = json.load(fh)
+        check("未确认方向的外参保存为待确认，且不写兼容文件",
+              pdata.get("orientation_confirmed") is False
+              and (pending.get("compat") or {}).get("updated") is False,
+              pending.get("compat"))
+
+        rig = svc.solve_extrinsic(orientation_confirmed=True,
+                                  flip_cam={"0": False, "1": False})
+        check("已确认外参自动保存 world_extrinsics.json",
+              bool(rig.get("latest_saved"))
+              and os.path.isfile(DEFAULT_EXTRINSICS_PATH),
+              rig.get("latest_error"))
+        with open(DEFAULT_EXTRINSICS_PATH, encoding="utf-8") as fh:
+            edata = json.load(fh)
+        check("最新外参文件含相机位姿/相对位姿/基线/世界系/内参快照",
+              edata.get("schema") == "lowcost-mocap/world-extrinsics"
+              and all(k in (edata.get("cameras") or {}) for k in ("0", "1"))
+              and edata.get("orientation_confirmed") is True
+              and edata.get("baseline_m") is not None
+              and edata.get("board") and edata.get("world_frame")
+              and (edata.get("relative") or {}).get("R_10") is not None
+              and (edata.get("intrinsics") or {}).get("0") is not None,
+              edata.get("baseline_m"))
+        check("两台内参 + 已确认外参自动更新兼容 calibration.json",
+              (rig.get("compat") or {}).get("updated") is True
+              and os.path.isfile(DEFAULT_RESULT_PATH), rig.get("compat"))
+        cdata = load_calibration(DEFAULT_RESULT_PATH)
+        K0, D0, K1, D1, R, T = stereo_matrices(cdata)
+        check("兼容 calibration.json 的下游矩阵读取正常",
+              K0.shape == (3, 3) and R.shape == (3, 3) and T.shape == (3,)
+              # baseline_m 落盘保留 6 位小数，T_10 未取整；差 <0.1mm 即一致
+              and abs(float(np.linalg.norm(T)) - float(edata["baseline_m"])) < 1e-4,
+              "baseline=%.2fmm" % (np.linalg.norm(T) * 1000))
+        from preview_server import build_app
+        mr = build_app().test_client().get("/api/calib/matrices")
+        check("GET /api/calib/matrices 兼容接口正常",
+              mr.status_code == 200
+              and abs(float(mr.json.get("baseline_m", 0))
+                      - float(edata["baseline_m"])) < 1e-4,
+              mr.status_code)
+
+        # 最新外参保存失败时仍保留内存结果
+        real_world_path = SVC.DEFAULT_EXTRINSICS_PATH
+        bad_world_dir = os.path.join(tmp, "world_as_dir.json")
+        shutil.rmtree(bad_world_dir, ignore_errors=True)
+        os.makedirs(bad_world_dir)
+        SVC.DEFAULT_EXTRINSICS_PATH = bad_world_dir
+        try:
+            rf = svc.solve_extrinsic(orientation_confirmed=True,
+                                     flip_cam={"0": False, "1": False})
+            check("最新外参保存失败时仍返回计算结果",
+                  rf.get("latest_saved") is False and bool(rf.get("latest_error"))
+                  and svc._extrinsic is not None, rf.get("latest_error"))
+        finally:
+            SVC.DEFAULT_EXTRINSICS_PATH = real_world_path
+
+        # 模拟重启 + 新会话：先后载入内外参
+        root_c = os.path.join(tmp, "latest_c")
+        shutil.rmtree(root_c, ignore_errors=True)
+        Session.create(root_c, spec, [0, 1], size, "NV12")
+        svc.reload_session(root_c)
+        rli = svc.load_intrinsics()
+        rle = svc.load_extrinsics()
+        check("新会话载入内外参后可直接使用",
+              set(rli.get("loaded") or {}) == {"0", "1"}
+              and svc._extrinsic is not None
+              and all(k in svc._extrinsic["cameras"] for k in ("0", "1")),
+              rle.get("path"))
+        check("载入外参恢复基线、flip 与方向确认状态",
+              abs(svc._extrinsic["relative"]["baseline_m"]
+                  - edata["baseline_m"]) < 1e-9
+              and svc._extrinsic["orientation_confirmed"] is True
+              and svc._extrinsic.get("source") == "loaded"
+              and isinstance(svc._extrinsic.get("flip_cam"), dict))
+
+        # 不兼容 / 缺失不得破坏当前结果
+        before_rig = svc._extrinsic
+        bad_world = os.path.join(tmp, "bad_world.json")
+        bad_data = json.loads(json.dumps(edata))
+        bad_data["board"]["square_mm"] = 25.0
+        with open(bad_world, "w", encoding="utf-8") as fh:
+            json.dump(bad_data, fh, ensure_ascii=False)
+        try:
+            svc.load_extrinsics(bad_world)
+            msg = ""
+        except ValueError as exc:
+            msg = str(exc)
+        check("不兼容外参文件被拒绝且不清除当前外参",
+              "不兼容" in msg and svc._extrinsic is before_rig, msg[:100])
+
+        before_intr = svc._intrinsics["0"]["K"]
+        bad_intr = os.path.join(tmp, "bad_intrinsics_data.json")
+        bidata = json.loads(json.dumps(idata))
+        bidata["cameras"]["0"]["image_size"] = [640, 480]
+        bidata["cameras"]["1"]["image_size"] = [640, 480]
+        with open(bad_intr, "w", encoding="utf-8") as fh:
+            json.dump(bidata, fh, ensure_ascii=False)
+        try:
+            svc.load_intrinsics(bad_intr)
+            msg2 = ""
+        except ValueError as exc:
+            msg2 = str(exc)
+        check("不兼容内参文件被拒绝且不清空当前内参",
+              "不兼容" in msg2 and svc._intrinsics["0"]["K"] == before_intr,
+              msg2[:100])
+
+        before_rig2 = svc._extrinsic
+        try:
+            svc.load_extrinsics(os.path.join(tmp, "no_such_world.json"))
+            msg3 = ""
+        except FileNotFoundError as exc:
+            msg3 = str(exc)
+        check("缺失外参文件不清除当前外参",
+              "不存在" in msg3 and svc._extrinsic is before_rig2, msg3[:100])
+
+        inv = svc.invalidate_extrinsic()
+        check("修改 180° 后旧外参与方向确认失效",
+              inv.get("invalidated") is True and svc._extrinsic is None
+              and svc._validation is None, inv.get("message"))
+    finally:
+        SVC.manager, SVC.sync_service = orig_manager, orig_sync
+        try:
+            svc.close_session()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # 用例 12：网页入口与项目相对路径
 # ---------------------------------------------------------------------------
-def test_preview_ui_and_paths() -> None:
+def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     print("\n[12] 网页入口与项目相对路径")
     from calibration.service import (
-        DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, MIN_COVERAGE,
-        MIN_COVERAGE_EXTRINSIC, _normalize_validation_units, coverage_limit_for,
-        project_relative,
+        CALIB_DIR, DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, MIN_COVERAGE,
+        MIN_COVERAGE_EXTRINSIC, PROJECT_DIR, _normalize_validation_units,
+        coverage_limit_for, project_relative,
     )
 
     check("外参/验证覆盖率为 0.1%，内参仍为 0.8%",
@@ -1105,12 +1323,18 @@ def test_preview_ui_and_paths() -> None:
           "内参 %.1f%% / 外参 %.1f%%"
           % (100 * MIN_COVERAGE, 100 * MIN_COVERAGE_EXTRINSIC))
 
-    check("默认会话目录位于 computer_code/captures/calibration",
-          project_relative(DEFAULT_SESSION_ROOT).startswith("captures/calibration"),
-          project_relative(DEFAULT_SESSION_ROOT))
-    check("默认标定结果路径为项目相对路径",
-          project_relative(DEFAULT_RESULT_PATH) == "api/calibration/calibration.json",
-          project_relative(DEFAULT_RESULT_PATH))
+    check("项目相对路径 helper 以 computer_code 为基准",
+          project_relative(os.path.join(PROJECT_DIR, "captures", "calibration"))
+          == "captures/calibration"
+          and project_relative(os.path.join(CALIB_DIR, "calibration.json"))
+          == "api/calibration/calibration.json",
+          project_relative(os.path.join(CALIB_DIR, "calibration.json")))
+    if tmp:
+        check("自检把跨会话结果/兼容文件重定向到临时目录",
+              os.path.abspath(DEFAULT_SESSION_ROOT) == os.path.abspath(tmp)
+              and os.path.abspath(DEFAULT_RESULT_PATH)
+              == os.path.abspath(os.path.join(tmp, "calibration.json")),
+              DEFAULT_RESULT_PATH)
 
     legacy = {"aggregate": {"spacing_abs_error_mm": {
         "mean": 0.0038, "p95": 0.0112, "max": 0.2028,
@@ -1142,6 +1366,57 @@ def test_preview_ui_and_paths() -> None:
           all(x not in html for x in (
               'id="c-stereo"', 'id="c-cover"', 'id="c-ex0"', 'id="c-ex1"',
               'id="c-cap-pair"', 'id="c-valrig"')))
+    check("内参自动保存/载入入口与数值卡片",
+          'id="c-intr-load"' in html and 'id="c-intr-out"' in html)
+    check("外参自动保存/载入入口与数值卡片",
+          'id="c-ex-load"' in html and 'id="c-ex-out"' in html)
+    check("已移除手动查看结果/保存 calibration.json 按钮",
+          'id="c-view"' not in html and 'id="c-save"' not in html)
+    check("红外 LED 检测/定位入口",
+          'id="led-section"' in html and 'id="l-detect-start"' in html
+          and 'id="l-locate-start"' in html and 'id="l-view"' in html
+          and 'value="led"' in html)
+    check("红外参数表含阈值/面积/峰距/分离/极线/三角容差",
+          all(x in html for x in (
+              'id="l-thr"', 'id="l-mina"', 'id="l-maxa"', 'id="l-peak"',
+              'id="l-split"', 'id="l-blur"', 'id="l-epi"',
+              'id="l-reproj"', 'id="l-tri"', 'id="l-thr-0"')))
+    check("版本横幅与刷新按钮",
+          'id="version-banner"' in html and 'id="btn-reload"' in html)
+    check("前端不再写死版本或回退到其他端口",
+          'DIRECT_BASE' not in html and 'API_BASE' not in html
+          and 'v6 ·' not in html)
+
+    from preview_server import build_app
+    client = build_app().test_client()
+    vr = client.get("/api/version")
+    vd = vr.json or {}
+    check("后端 /api/version 返回真实 Git 版本",
+          vr.status_code == 200 and vd.get("git_sha") and vd.get("started_at"),
+          "%s / %s" % (vd.get("git_sha"), vd.get("started_at")))
+    sr = client.get("/api/led/state")
+    sd = sr.json or {}
+    check("LED state 空闲状态可用",
+          sr.status_code == 200 and sd.get("status") == "idle", sr.status_code)
+    pr = client.get("/api/led/params")
+    pd = pr.json or {}
+    check("LED 参数读取默认值",
+          pr.status_code == 200
+          and (pd.get("params") or {}).get("threshold") is not None,
+          pr.status_code)
+    wr = client.post("/api/led/params", json={
+        "params": {"threshold": 180, "min_area": 4, "max_area": 500,
+                   "min_peak_distance": 5.5, "split_blobs": True,
+                   "blur_kernel": 3, "epipolar_tol_px": 2.5,
+                   "reprojection_tol_px": 2.5, "triangle_tol_mm": 5},
+        "overrides": {"0": {"threshold": 190}}})
+    wd = wr.json or {}
+    check("LED 参数保存到临时目录",
+          wr.status_code == 200 and wd.get("version") == 1, wd.get("path"))
+    rs = client.post("/api/led/params/reset", json={})
+    rd = rs.json or {}
+    check("LED 参数恢复默认", rs.status_code == 200
+          and (rd.get("params") or {}).get("threshold") == 200, rs.status_code)
 
 
 def _selftest_dir() -> str:
@@ -1167,6 +1442,10 @@ def main(argv=None) -> int:
     spec = B.BoardSpec(11, 8, 30.0)
 
     tmp = _selftest_dir()
+    # 自检不能覆盖本机真实的最新结果/兼容文件；在第一次 import service 前
+    # 把跨会话结果与兼容 calibration.json 都重定向到临时目录。
+    os.environ["MOCAP_CALIB_DIR"] = tmp
+    os.environ["MOCAP_CALIB_RESULT"] = os.path.join(tmp, "calibration.json")
     keep_dir = tmp if args.keep else None
     print("自检临时目录：%s" % tmp)
     print("标定板 %dx%d 内角点（%d×%d 方格），方格 %gmm，图像 %dx%d"
@@ -1189,7 +1468,8 @@ def main(argv=None) -> int:
     test_capture_http(spec, size, _tex, _off, tmp)
     test_intrinsic_coverage(spec, size, _tex, _off, tmp)
     test_extrinsic_pair_and_validation(spec, size, _tex, _off, tmp)
-    test_preview_ui_and_paths()
+    test_latest_result_files(spec, size, _tex, _off, tmp)
+    test_preview_ui_and_paths(tmp)
     if st:
         test_persistence(spec, size, intr, st, tmp)
 

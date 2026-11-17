@@ -52,7 +52,7 @@ def calib_session_create():
             session_id=b.get("session_id"),
             pixel_format=str(b.get("format", "")),
             note=str(b.get("note", "")),
-            surface_height_m=float(b.get("surface_height_mm", 5.0)) / 1000.0,
+            surface_height_m=float(b.get("surface_height_mm", 3.0)) / 1000.0,
             root=b.get("root") or None,
         ))
     except Exception as exc:
@@ -235,6 +235,29 @@ def calib_solve_extrinsic():
         return _fail(exc)
 
 
+@bp.post("/api/calib/extrinsic/load")
+def calib_load_extrinsic():
+    """载入跨会话 world_extrinsics.json，不重新采集/求解。"""
+    b = _body()
+    try:
+        return jsonify(service().load_extrinsics(b.get("path")))
+    except FileNotFoundError as exc:
+        return _fail(exc, 404)
+    except Exception as exc:
+        return _fail(exc, 400)
+
+
+@bp.post("/api/calib/extrinsic/invalidate")
+def calib_invalidate_extrinsic():
+    """180° 设置改变后作废旧外参与方向确认。"""
+    b = _body()
+    try:
+        return jsonify(service().invalidate_extrinsic(
+            reason=str(b.get("reason") or "180° 方向设置已修改")))
+    except Exception as exc:
+        return _fail(exc, 500)
+
+
 @bp.get("/api/calib/extrinsic/overlay")
 def calib_extrinsic_overlay():
     """世界原点 + X/Y/Z 轴 + 角点编号叠加到当前画面（JPEG），用于人工确认。"""
@@ -340,6 +363,18 @@ def calib_intrinsic():
         return jsonify(service().run_intrinsic(cams, exclude=b.get("exclude") or ()))
     except Exception as exc:
         return _fail(exc)
+
+
+@bp.post("/api/calib/intrinsic/load")
+def calib_load_intrinsic():
+    """载入跨会话 intrinsics.json，不重新采集/计算。"""
+    b = _body()
+    try:
+        return jsonify(service().load_intrinsics(b.get("path")))
+    except FileNotFoundError as exc:
+        return _fail(exc, 404)
+    except Exception as exc:
+        return _fail(exc, 400)
 
 
 @bp.post("/api/calib/stereo")

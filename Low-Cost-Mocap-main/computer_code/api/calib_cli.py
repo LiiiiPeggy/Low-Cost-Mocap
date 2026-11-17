@@ -3,7 +3,7 @@
 在 ``Low-Cost-Mocap-main/computer_code`` 目录下运行::
 
     python api/calib_cli.py list
-    python api/calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 5
+    python api/calib_cli.py new --cols 11 --rows 8 --square-mm 30 --surface-height-mm 3
     python api/calib_cli.py capture-single --camera 0 --count 20 --interval 1.5
     python api/calib_cli.py capture-stereo --count 3 --interval 2.0
     python api/calib_cli.py detect --session captures/calibration/20261113_120000
@@ -434,7 +434,19 @@ def cmd_intrinsic(args) -> int:
     _print_intrinsic(r["intrinsics"])
     for cam, msg in (r.get("errors") or {}).items():
         print("\n相机 %s 未完成：%s" % (cam, msg), file=sys.stderr)
-    print("\n中间结果：%s" % r["saved_to"])
+    if r.get("latest_saved"):
+        print("\n最新内参已保存：%s" % r["latest_path"])
+    else:
+        print("\n计算成功但最新内参文件保存失败：%s" % r.get("latest_error"),
+              file=sys.stderr)
+    for msg in (r.get("save_errors") or []):
+        print("  ! %s" % msg, file=sys.stderr)
+    if r.get("compat"):
+        c = r["compat"]
+        print("兼容 calibration.json：%s"
+              % ("已更新 " + c["path"] if c.get("updated")
+                 else "未更新（%s）" % c.get("reason")))
+    print("\n中间结果：%s" % (r.get("saved_to") or "未保存（见上方错误）"))
     return 0
 
 
@@ -487,7 +499,20 @@ def cmd_extrinsic(args) -> int:
                               orientation_confirmed=args.orientation_confirmed,
                               exclude=args.exclude)
     _print_rig(rig)
-    print("\n中间结果：%s" % os.path.join(svc.session.root, "result_extrinsic.json"))
+    if rig.get("latest_saved"):
+        print("\n最新外参已保存：%s" % rig["latest_path"])
+    else:
+        print("\n计算成功但最新外参文件保存失败：%s" % rig.get("latest_error"),
+              file=sys.stderr)
+    for msg in (rig.get("save_errors") or []):
+        print("  ! %s" % msg, file=sys.stderr)
+    if rig.get("compat"):
+        c = rig["compat"]
+        print("兼容 calibration.json：%s"
+              % ("已更新 " + c["path"] if c.get("updated")
+                 else "未更新（%s）" % c.get("reason")))
+    print("\n中间结果：%s"
+          % (rig.get("saved_to") or "未保存（见上方错误）"))
     return 0
 
 
@@ -590,8 +615,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--cols", type=int, default=B.DEFAULT_COLS, help="内角点列数（12 格 → 11）")
     sp.add_argument("--rows", type=int, default=B.DEFAULT_ROWS, help="内角点行数（9 格 → 8）")
     sp.add_argument("--square-mm", type=float, default=B.DEFAULT_SQUARE_MM, help="方格边长 mm")
-    sp.add_argument("--surface-height-mm", type=float, default=5.0,
-                    help="板面高于地面的高度 mm（默认 5，用于地面基准换算）")
+    sp.add_argument("--surface-height-mm", type=float, default=3.0,
+                    help="板面高于地面的高度 mm（默认 3，用于地面基准换算）")
     sp.add_argument("--cameras", type=int, nargs="+", default=[0, 1])
     sp.add_argument("--id", default=None, help="会话名（默认时间戳）")
     sp.add_argument("--format", default="", help="采集格式记录（NV12/MJPG）")

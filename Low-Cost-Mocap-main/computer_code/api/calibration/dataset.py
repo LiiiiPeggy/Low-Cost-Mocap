@@ -41,6 +41,13 @@ def _atomic_json(path: str, data) -> None:
     os.replace(tmp, path)
 
 
+def atomic_json_write(path: str, data) -> None:
+    """跨会话结果文件的原子写：自动建目录，临时文件 + ``os.replace``。"""
+    path = os.path.abspath(path)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    _atomic_json(path, data)
+
+
 @dataclass
 class Sample:
     """一条样本：单相机一张，或双相机一对。

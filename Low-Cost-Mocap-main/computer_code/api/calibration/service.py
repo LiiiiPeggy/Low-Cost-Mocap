@@ -19,6 +19,7 @@
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -35,7 +36,7 @@ from calibration import extrinsic as ext_mod
 from calibration import intrinsic as intr_mod
 from calibration import stereo as stereo_mod
 from calibration.board import BoardSpec, to_jsonable
-from calibration.dataset import Session
+from calibration.dataset import Session, atomic_json_write
 
 # 超过这个"年龄"的帧视为过期：用户点了采集，但相机可能已经停流/断线
 MAX_FRAME_AGE_S = 1.5
@@ -62,7 +63,6 @@ def low_coverage_warning(coverage: float) -> str:
 CALIB_DIR = os.path.dirname(os.path.abspath(__file__))
 # computer_code 是项目数据基准目录：api/calibration/service.py 往上两级。
 PROJECT_DIR = os.path.dirname(os.path.dirname(CALIB_DIR))
-DEFAULT_RESULT_PATH = os.path.join(CALIB_DIR, "calibration.json")
 
 
 def resolve_path(path: str) -> str:
@@ -88,6 +88,11 @@ def project_relative(path: str) -> str:
     return rel.replace(os.sep, "/")
 
 
+# 统一兼容文件仍放在 api/calibration/calibration.json；测试可用
+# MOCAP_CALIB_RESULT 重定向，避免覆盖本机真实文件。
+DEFAULT_RESULT_PATH = resolve_path(
+    os.environ.get("MOCAP_CALIB_RESULT") or os.path.join(CALIB_DIR, "calibration.json"))
+
 _calib_env = os.environ.get("MOCAP_CALIB_DIR")
 _capture_env = os.environ.get("MOCAP_CAPTURE_DIR")
 if _calib_env:
@@ -96,6 +101,13 @@ elif _capture_env:
     DEFAULT_SESSION_ROOT = resolve_path(os.path.join(_capture_env, "calibration"))
 else:
     DEFAULT_SESSION_ROOT = os.path.join(PROJECT_DIR, "captures", "calibration")
+
+# 跨会话复用的“最新有效”结果文件
+DEFAULT_INTRINSICS_PATH = os.path.join(DEFAULT_SESSION_ROOT, "intrinsics.json")
+DEFAULT_EXTRINSICS_PATH = os.path.join(DEFAULT_SESSION_ROOT, "world_extrinsics.json")
+
+INTRINSICS_SCHEMA = "lowcost-mocap/intrinsics"
+EXTRINSICS_SCHEMA = "lowcost-mocap/world-extrinsics"
 
 
 def _now_iso() -> str:
@@ -140,6 +152,138 @@ def _detections_for(samples, camera: int) -> list:
     return out
 
 
+def _read_json_file(path: str) -> dict:
+    with open(path, encoding="utf-8") as fh:
+        data = json.load(fh)
+    if not isinstance(data, dict):
+        raise ValueError("文件内容不是 JSON 对象")
+    return data
+
+
+def _intrinsic_entry(camera: int, res: dict, *, device=None,
+                     source: str = "computed", session_root: str | None = None) -> dict:
+    """从内参结果生成跨会话文件的单相机条目。"""
+    cov = res.get("coverage") or {}
+    entry = {
+        "index": int(camera),
+        "camera": int(camera),
+        "device": device,
+        "K": res.get("K"),
+        "D": res.get("D"),
+        "rms_px": res.get("rms_px"),
+        "image_size": res.get("image_size"),
+        "num_views": res.get("num_views"),
+        "focal_px": res.get("focal_px"),
+        "principal_point_px": res.get("principal_point_px"),
+        "coverage_ratio": cov.get("covered_ratio"),
+        "coverage": cov or None,
+        "created": res.get("created"),
+        "source": source,
+    }
+    if session_root:
+        entry["source_session"] = project_relative(session_root)
+    if res.get("loaded_from"):
+        entry["loaded_from"] = res["loaded_from"]
+    return entry
+
+
+def _validate_intrinsic_entry(entry: dict, camera: int,
+                              image_size) -> list[str]:
+    problems = []
+    if not isinstance(entry, dict):
+        return ["条目不是对象"]
+    idx = entry.get("index", entry.get("camera"))
+    if idx is None or int(idx) != int(camera):
+        problems.append("相机编号不匹配（期望 %d，实际 %s）" % (camera, idx))
+    ok, why = intr_mod.validate_result(entry)
+    if not ok:
+        problems.extend(why)
+    try:
+        size = [int(v) for v in (entry.get("image_size") or [])]
+    except (TypeError, ValueError):
+        size = []
+    if size != [int(image_size[0]), int(image_size[1])]:
+        problems.append("图像尺寸不兼容（文件 %s，当前 %s）"
+                        % (size or "缺失", list(image_size)))
+    return problems
+
+
+def _board_mismatch(board: dict, spec: BoardSpec) -> list[str]:
+    problems = []
+    if not isinstance(board, dict):
+        return ["文件缺少棋盘格参数"]
+    for key, cast in (("cols", int), ("rows", int), ("square_mm", float),
+                      ("surface_height_m", float)):
+        if key not in board:
+            problems.append("棋盘格缺少 %s" % key)
+            continue
+        try:
+            same = abs(float(board[key]) - float(getattr(spec, key))) < 1e-6
+        except (TypeError, ValueError):
+            same = False
+        if not same:
+            problems.append("棋盘格 %s 不兼容（文件 %s，当前 %s）"
+                            % (key, board[key], getattr(spec, key)))
+    return problems
+
+
+def _world_frame_mismatch(wf: dict, spec: BoardSpec) -> list[str]:
+    expected = spec.world_frame()
+    if not isinstance(wf, dict):
+        return ["文件缺少世界坐标系定义"]
+    problems = []
+    for key in ("origin", "x_axis", "y_axis", "z_axis", "handedness", "unit"):
+        if wf.get(key) != expected.get(key):
+            problems.append("世界系 %s 不兼容" % key)
+    for key in ("board_extent_x_m", "board_extent_y_m", "surface_height_m"):
+        try:
+            if abs(float(wf.get(key)) - float(expected.get(key))) > 1e-6:
+                problems.append("世界系 %s 不兼容" % key)
+        except (TypeError, ValueError):
+            problems.append("世界系 %s 缺失" % key)
+    return problems
+
+
+def _intrinsics_snapshot(intrinsics: dict, cameras) -> dict:
+    return {
+        str(int(c)): {
+            "K": intrinsics[str(int(c))].get("K"),
+            "D": intrinsics[str(int(c))].get("D"),
+            "image_size": intrinsics[str(int(c))].get("image_size"),
+            "rms_px": intrinsics[str(int(c))].get("rms_px"),
+        }
+        for c in cameras if str(int(c)) in intrinsics
+    }
+
+
+def _intrinsics_mismatch(saved: dict, current: dict, cameras) -> list[str]:
+    problems = []
+    for c in cameras:
+        key = str(int(c))
+        s, cur = (saved or {}).get(key), (current or {}).get(key)
+        if s is None:
+            problems.append("外参文件缺少相机 %s 的内参快照" % key)
+            continue
+        if cur is None:
+            problems.append("当前还没有相机 %s 的内参，请先载入内参" % key)
+            continue
+        try:
+            K_ok = np.allclose(np.asarray(s["K"], float),
+                               np.asarray(cur["K"], float),
+                               rtol=1e-6, atol=1e-6)
+            D_ok = np.allclose(np.asarray(s["D"], float).reshape(-1),
+                               np.asarray(cur["D"], float).reshape(-1),
+                               rtol=1e-6, atol=1e-6)
+            size_ok = ([int(v) for v in s["image_size"]]
+                       == [int(v) for v in cur["image_size"]])
+        except (KeyError, TypeError, ValueError):
+            K_ok = D_ok = size_ok = False
+        if not (K_ok and D_ok and size_ok):
+            problems.append("相机 %s 的内参与外参文件不兼容（K/D/图像尺寸不一致）"
+                            % key)
+    return problems
+
+
 class CalibrationService:
     """进程级单例：持有当前会话与最近一次标定结果。"""
 
@@ -172,7 +316,7 @@ class CalibrationService:
     def open_session(self, *, cols: int, rows: int, square_mm: float,
                      cameras=None, session_id: str | None = None,
                      pixel_format: str = "", note: str = "",
-                     surface_height_m: float = 0.005,
+                     surface_height_m: float = 0.003,
                      root: str | None = None) -> dict:
         spec = BoardSpec(cols=cols, rows=rows, square_mm=square_mm,
                          surface_height_m=surface_height_m)
@@ -631,10 +775,16 @@ class CalibrationService:
                                 flip180=flip180, flip_cam=flip_cam,
                                 orientation_confirmed=orientation_confirmed)
         rig["created"] = _now_iso()
+        rig["computed_at"] = rig["created"]
         rig["camera_pair"] = [int(cams[0]), int(cams[1])]
         rig["frames"] = {str(k): v for k, v in ids.items()}
         rig["intrinsic_rms_px"] = {ca: self._intrinsics[ca].get("rms_px"),
                                    cb: self._intrinsics[cb].get("rms_px")}
+        rig["world_frame"] = sess.spec.world_frame()
+        rig["intrinsics"] = _intrinsics_snapshot(self._intrinsics,
+                                                 [int(cams[0]), int(cams[1])])
+        rig["source"] = "computed"
+        rig["source_session"] = project_relative(sess.root)
         if low_cov:
             rig.setdefault("warnings", []).append(
                 "外参图覆盖率偏低：%s。单张固定板仍可求解，但位姿/深度精度会下降；"
@@ -643,8 +793,342 @@ class CalibrationService:
 
         with self._lock:
             self._extrinsic = rig
-        sess.save_result("result_extrinsic.json", rig)
-        return rig
+
+        save_errors = []
+        saved_to = None
+        try:
+            saved_to = sess.save_result("result_extrinsic.json", rig)
+            saved_to = project_relative(saved_to)
+        except Exception as exc:
+            save_errors.append("会话外参结果保存失败：%s"
+                               % str(exc).strip().splitlines()[-1])
+
+        latest_saved, latest_error = False, None
+        try:
+            self._save_latest_extrinsics(rig)
+            latest_saved = True
+        except Exception as exc:
+            latest_error = str(exc).strip().splitlines()[-1]
+            save_errors.append("最新外参文件保存失败：%s" % latest_error)
+
+        compat = self._maybe_update_compat()
+        out = dict(rig)
+        out.update({
+            "saved_to": saved_to,
+            "latest_path": project_relative(DEFAULT_EXTRINSICS_PATH),
+            "latest_saved": latest_saved, "latest_error": latest_error,
+            "save_errors": save_errors, "compat": compat,
+        })
+        return out
+
+    # ------------------------------------------------------------------
+    # 跨会话最新结果：自动保存 / 载入
+    # ------------------------------------------------------------------
+    def _save_latest_intrinsics(self, results: dict) -> str:
+        """把本次成功的相机合并进 captures/calibration/intrinsics.json。"""
+        sess = self._require_session()
+        path = DEFAULT_INTRINSICS_PATH
+        existing = {}
+        if os.path.isfile(path):
+            try:
+                existing = _read_json_file(path)
+            except (OSError, ValueError):
+                existing = {}
+        raw = existing.get("cameras")
+        cameras = dict(raw) if isinstance(raw, dict) else {}
+        for key, res in results.items():
+            cam = int(key)
+            w = manager().worker(cam)
+            cameras[str(cam)] = _intrinsic_entry(
+                cam, res, device=(w.device_name if w else None),
+                source=res.get("source", "computed"), session_root=sess.root)
+        payload = {
+            "schema": INTRINSICS_SCHEMA,
+            "version": 1,
+            "created": existing.get("created") or _now_iso(),
+            "updated": _now_iso(),
+            "cameras": cameras,
+        }
+        atomic_json_write(path, payload)
+        return project_relative(path)
+
+    def _save_latest_extrinsics(self, rig: dict) -> str:
+        """保存最新有效世界系外参（未确认方向也保存为待确认结果）。"""
+        sess = self._require_session()
+        cams = [int(c) for c in sess.cameras[:2]]
+        payload = dict(rig)
+        payload.update({
+            "schema": EXTRINSICS_SCHEMA,
+            "version": 1,
+            "created": rig.get("created") or _now_iso(),
+            "updated": _now_iso(),
+            "source_session": project_relative(sess.root),
+            "board": rig.get("board") or sess.spec.to_dict(),
+            "world_frame": rig.get("world_frame") or sess.spec.world_frame(),
+            "intrinsics": rig.get("intrinsics")
+            or _intrinsics_snapshot(self._intrinsics, cams),
+            "orientation_confirmed": bool(rig.get("orientation_confirmed")),
+        })
+        atomic_json_write(DEFAULT_EXTRINSICS_PATH, payload)
+        return project_relative(DEFAULT_EXTRINSICS_PATH)
+
+    def _invalidate_extrinsic_if_intrinsics_changed(self) -> bool:
+        """新内参与已解外参的内参快照不一致时，旧外参必须作废。"""
+        rig = self._extrinsic
+        sess = self._session
+        if not rig or sess is None:
+            return False
+        snap = rig.get("intrinsics")
+        if not isinstance(snap, dict) or not snap:
+            return False                  # 旧格式结果没有快照，无法可靠比较
+        cams = [int(c) for c in sess.cameras[:2]]
+        if not _intrinsics_mismatch(snap, self._intrinsics, cams):
+            return False
+        with self._lock:
+            self._extrinsic = None
+            self._validation = None
+        return True
+
+    def _compat_info(self) -> dict:
+        """给界面显示兼容文件来源，避免把历史 calibration.json 当成当前结果。"""
+        path = self.result_path_abs
+        info = {"path": self.result_path, "exists": os.path.isfile(path)}
+        if not info["exists"]:
+            return info
+        try:
+            data = _read_json_file(path)
+            info["created"] = data.get("created")
+            info["session_id"] = (data.get("session") or {}).get("session_id")
+            ext = data.get("extrinsics") or {}
+            info["baseline_m"] = ext.get("baseline_m")
+            info["orientation_confirmed"] = ext.get("orientation_confirmed")
+        except (OSError, ValueError) as exc:
+            info["read_error"] = str(exc).strip().splitlines()[-1]
+        return info
+
+    def _maybe_update_compat(self) -> dict:
+        """两台内参 + 已确认世界系外参都有效时，自动更新兼容 calibration.json。"""
+        path = project_relative(DEFAULT_RESULT_PATH)
+        sess = self._session
+        if sess is None:
+            return {"updated": False, "path": path, "reason": "没有打开的会话"}
+        cams = [str(int(c)) for c in sess.cameras[:2]]
+        if len(cams) < 2 or any(c not in self._intrinsics for c in cams):
+            return {"updated": False, "path": path, "reason": "两台相机内参不完整"}
+        rig = self._extrinsic
+        if not rig:
+            return {"updated": False, "path": path, "reason": "没有世界系外参"}
+        if not rig.get("orientation_confirmed"):
+            return {"updated": False, "path": path,
+                    "reason": "世界坐标轴方向未确认（待确认结果不写入兼容文件）"}
+        try:
+            info = self.save_result(None)
+            return {"updated": True, "path": info.get("path", path), "reason": ""}
+        except Exception as exc:
+            return {"updated": False, "path": path,
+                    "reason": "写入失败：%s" % str(exc).strip().splitlines()[-1]}
+
+    def load_intrinsics(self, path: str | None = None) -> dict:
+        """从跨会话 intrinsics.json 恢复 K/D，不重新采集或重算。
+
+        只应用通过校验的相机；校验失败的相机保持当前内存结果不变。
+        """
+        sess = self._require_session()
+        if len(sess.cameras) < 2:
+            raise ValueError("会话只登记了 %d 台相机，无法载入双相机内参"
+                             % len(sess.cameras))
+        p = resolve_path(path or DEFAULT_INTRINSICS_PATH)
+        rel = project_relative(p)
+        if not os.path.isfile(p):
+            raise FileNotFoundError("内参文件不存在：%s" % rel)
+        try:
+            data = _read_json_file(p)
+        except (OSError, ValueError) as exc:
+            raise ValueError("内参文件读取失败：%s" % exc)
+        if data.get("schema") != INTRINSICS_SCHEMA:
+            raise ValueError("内参文件格式不兼容（schema=%r，期望 %r）"
+                             % (data.get("schema"), INTRINSICS_SCHEMA))
+        cameras = data.get("cameras")
+        if not isinstance(cameras, dict):
+            raise ValueError("内参文件格式不兼容：缺少 cameras 对象")
+
+        cams = [int(c) for c in sess.cameras[:2]]
+        size = tuple(int(v) for v in sess.image_size)
+        loaded, problems = {}, {}
+        for cam in cams:
+            key = str(cam)
+            entry = cameras.get(key)
+            if not isinstance(entry, dict):
+                problems[key] = "文件中没有相机 %s 的内参" % key
+                continue
+            why = _validate_intrinsic_entry(entry, cam, size)
+            if why:
+                problems[key] = "；".join(why)
+                continue
+            K = np.asarray(entry["K"], np.float64)
+            loaded[key] = {
+                "camera": cam,
+                "K": entry["K"],
+                "D": entry["D"],
+                "rms_px": entry.get("rms_px"),
+                "image_size": [int(v) for v in entry["image_size"]],
+                "num_views": entry.get("num_views"),
+                "focal_px": entry.get("focal_px") or [float(K[0, 0]), float(K[1, 1])],
+                "principal_point_px": entry.get("principal_point_px")
+                or [float(K[0, 2]), float(K[1, 2])],
+                "coverage": entry.get("coverage")
+                or {"covered_ratio": entry.get("coverage_ratio")},
+                "created": entry.get("created"),
+                "source": "loaded",
+                "loaded_from": rel,
+                "loaded_at": _now_iso(),
+            }
+        if not loaded:
+            raise ValueError("内参文件不兼容，未载入任何相机：%s"
+                             % "；".join(problems.values()))
+
+        with self._lock:
+            self._intrinsics.update(loaded)
+
+        save_error = None
+        try:
+            sess.save_result("result_intrinsic.json", {
+                "intrinsics": self._intrinsics, "loaded_from": rel,
+                "loaded_at": _now_iso(), "errors": problems})
+            saved_to = project_relative(os.path.join(sess.root,
+                                                     "result_intrinsic.json"))
+        except Exception as exc:
+            saved_to = None
+            save_error = str(exc).strip().splitlines()[-1]
+
+        extrinsic_invalidated = self._invalidate_extrinsic_if_intrinsics_changed()
+        compat = self._maybe_update_compat()
+        return {"loaded": loaded, "errors": problems, "path": rel,
+                "saved_to": saved_to, "save_error": save_error,
+                "extrinsic_invalidated": extrinsic_invalidated,
+                "compat": compat}
+
+    def load_extrinsics(self, path: str | None = None) -> dict:
+        """从跨会话 world_extrinsics.json 恢复外参，不重新采集或求解。"""
+        sess = self._require_session()
+        if len(sess.cameras) < 2:
+            raise ValueError("会话只登记了 %d 台相机，无法载入双相机外参"
+                             % len(sess.cameras))
+        p = resolve_path(path or DEFAULT_EXTRINSICS_PATH)
+        rel = project_relative(p)
+        if not os.path.isfile(p):
+            raise FileNotFoundError("世界系外参文件不存在：%s" % rel)
+        try:
+            data = _read_json_file(p)
+        except (OSError, ValueError) as exc:
+            raise ValueError("世界系外参文件读取失败：%s" % exc)
+        if data.get("schema") != EXTRINSICS_SCHEMA:
+            raise ValueError("世界系外参文件格式不兼容（schema=%r，期望 %r）"
+                             % (data.get("schema"), EXTRINSICS_SCHEMA))
+
+        cams = [int(c) for c in sess.cameras[:2]]
+        problems = _board_mismatch(data.get("board") or {}, sess.spec)
+        problems += _world_frame_mismatch(data.get("world_frame") or {}, sess.spec)
+        cameras = data.get("cameras")
+        if not isinstance(cameras, dict):
+            problems.append("文件缺少 cameras 对象")
+            cameras = {}
+        for cam in cams:
+            entry = cameras.get(str(cam))
+            if not isinstance(entry, dict):
+                problems.append("缺少相机 %d 的外参" % cam)
+                continue
+            for key in ("R", "t", "camera_centre_world",
+                        "height_above_floor_m", "reprojection",
+                        "optical_axis_world", "distance_to_pattern_centre_m",
+                        "correspondence", "rotation", "points_in_front",
+                        "cam_to_world"):
+                if key not in entry:
+                    problems.append("相机 %d 外参缺少 %s" % (cam, key))
+            try:
+                R = np.asarray(entry.get("R"), np.float64)
+                t = np.asarray(entry.get("t"), np.float64).reshape(-1)
+                if R.shape != (3, 3) or t.size != 3:
+                    problems.append("相机 %d 的 R/t 形状不合法" % cam)
+                if np.asarray(entry.get("optical_axis_world"),
+                              np.float64).reshape(-1).size != 3:
+                    problems.append("相机 %d 的光轴不是三维向量" % cam)
+                cw = entry.get("cam_to_world") or {}
+                if (np.asarray(cw.get("R_wc")).shape != (3, 3)
+                        or np.asarray(cw.get("t_wc")).reshape(-1).size != 3):
+                    problems.append("相机 %d 缺少有效的 cam_to_world" % cam)
+                if not isinstance(entry.get("reprojection"), dict):
+                    problems.append("相机 %d 缺少 reprojection" % cam)
+            except (TypeError, ValueError):
+                problems.append("相机 %d 的 R/t 不是数值矩阵" % cam)
+        rel_pose = data.get("relative") or {}
+        try:
+            if (np.asarray(rel_pose.get("R_10")).shape != (3, 3)
+                    or np.asarray(rel_pose.get("T_10")).reshape(-1).size != 3):
+                problems.append("相对位姿 R_10/T_10 形状不合法")
+        except (TypeError, ValueError):
+            problems.append("相对位姿 R_10/T_10 不是数值矩阵")
+        for key in ("baseline_m", "baseline_vector_c0_to_c1_m",
+                    "rotation_angle_deg", "E", "rotation"):
+            if key not in rel_pose:
+                problems.append("相对位姿缺少 %s" % key)
+        for key in ("method", "stability", "corner_correspondence",
+                    "consistency", "board", "world_frame"):
+            if key not in data:
+                problems.append("外参文件缺少 %s" % key)
+        if not isinstance(data.get("consistency"), dict):
+            problems.append("缺少三角化自洽 consistency")
+        problems += _intrinsics_mismatch(data.get("intrinsics") or {},
+                                         self._intrinsics, cams)
+        if problems:
+            raise ValueError("世界系外参文件不兼容，未载入：" + "；".join(problems))
+
+        keys = ("method", "board", "world_frame", "flip180", "flip_cam",
+                "orientation_confirmed", "orientation_ok", "cameras", "relative",
+                "convention", "T_unit", "baseline_m", "consistency", "stability",
+                "corner_correspondence", "warnings", "caveat", "created",
+                "computed_at", "source_session", "frames", "camera_pair",
+                "intrinsics")
+        rig = {k: data[k] for k in keys if k in data}
+        rig["camera_pair"] = [int(c) for c in (rig.get("camera_pair") or cams)]
+        rig["frames"] = rig.get("frames") or {}
+        rig["intrinsic_rms_px"] = {
+            str(c): self._intrinsics[str(c)].get("rms_px") for c in cams}
+        rig["orientation_confirmed"] = bool(rig.get("orientation_confirmed"))
+        rig["orientation_ok"] = bool(rig.get("orientation_ok",
+                                             rig["orientation_confirmed"]))
+        rig["source"] = "loaded"
+        rig["loaded_from"] = rel
+        rig["loaded_at"] = _now_iso()
+
+        with self._lock:
+            self._extrinsic = rig
+            self._validation = None       # 旧验证结果不适用于新载入的外参
+
+        save_error = None
+        try:
+            sess.save_result("result_extrinsic.json", rig)
+            saved_to = project_relative(os.path.join(sess.root,
+                                                     "result_extrinsic.json"))
+        except Exception as exc:
+            saved_to = None
+            save_error = str(exc).strip().splitlines()[-1]
+
+        compat = self._maybe_update_compat()
+        out = dict(rig)
+        out.update({"path": rel, "saved_to": saved_to,
+                    "save_error": save_error, "compat": compat})
+        return out
+
+    def invalidate_extrinsic(self, reason: str = "180° 方向设置已修改") -> dict:
+        """修改 180° 后，旧外参和方向确认都不再可信，必须重新 solvePnP。"""
+        with self._lock:
+            had = self._extrinsic is not None
+            self._extrinsic = None
+            self._validation = None
+        return {"invalidated": had, "reason": reason,
+                "message": ("旧外参与方向确认已失效，请重新解外参"
+                            if had else "当前没有可失效的外参")}
 
     def extrinsic_overlay(self, camera: int, *, flip180: bool = False,
                           scale: float = 0.6, quality: int = 72) -> tuple[bytes, dict]:
@@ -825,13 +1309,42 @@ class CalibrationService:
             raise ValueError("内参标定失败：" + "；".join(
                 "%s: %s" % (k, v) for k, v in errors.items()))
 
+        # 标记来源，和“载入历史内参”区分开
+        for key, res in results.items():
+            res["source"] = "computed"
+            res["source_session"] = project_relative(sess.root)
         with self._lock:
             self._intrinsics.update(results)
-        sess.save_result("result_intrinsic.json", {"intrinsics": self._intrinsics,
-                                                  "errors": errors,
-                                                  "created": _now_iso()})
+
+        save_errors = []
+        saved_to = None
+        try:
+            saved_to = sess.save_result(
+                "result_intrinsic.json",
+                {"intrinsics": self._intrinsics, "errors": errors,
+                 "created": _now_iso()})
+            saved_to = project_relative(saved_to)
+        except Exception as exc:            # 计算成功不能因落盘失败而丢掉结果
+            save_errors.append("会话内参结果保存失败：%s"
+                               % str(exc).strip().splitlines()[-1])
+
+        latest_saved, latest_error = False, None
+        try:
+            self._save_latest_intrinsics(results)
+            latest_saved = True
+        except Exception as exc:
+            latest_error = str(exc).strip().splitlines()[-1]
+            save_errors.append("最新内参文件保存失败：%s" % latest_error)
+
+        extrinsic_invalidated = self._invalidate_extrinsic_if_intrinsics_changed()
+        compat = self._maybe_update_compat()
         return {"intrinsics": results, "errors": errors,
-                "saved_to": os.path.join(sess.root, "result_intrinsic.json")}
+                "saved_to": saved_to,
+                "latest_path": project_relative(DEFAULT_INTRINSICS_PATH),
+                "latest_saved": latest_saved, "latest_error": latest_error,
+                "save_errors": save_errors,
+                "extrinsic_invalidated": extrinsic_invalidated,
+                "compat": compat}
 
     def run_stereo(self, *, exclude=(), auto_flip: bool = True,
                    flip_b: bool | None = None) -> dict:
@@ -859,6 +1372,18 @@ class CalibrationService:
             self._stereo = res
         sess.save_result("result_stereo.json", res)
         return res
+
+    def localization_snapshot(self) -> dict:
+        """给 LED 定位用的只读标定快照（深拷贝，避免外部修改运行状态）。"""
+        with self._lock:
+            intr = copy.deepcopy(self._intrinsics)
+            rig = copy.deepcopy(self._extrinsic)
+            cams = [int(c) for c in (self._session.cameras
+                                     if self._session else [0, 1])]
+            board = self._session.spec.to_dict() if self._session else None
+            image_size = list(self._session.image_size) if self._session else None
+        return {"intrinsics": intr, "extrinsic": rig, "cameras": cams,
+                "board": board, "image_size": image_size}
 
     # ------------------------------------------------------------------
     # 结果保存 / 加载
@@ -1013,18 +1538,35 @@ class CalibrationService:
         sess_summary = sess.summary() if sess else None
         if sess_summary:
             sess_summary["root"] = project_relative(sess_summary["root"])
+        compat = self._compat_info()
         out = {
             "session": sess_summary,
             "intrinsics": {
-                k: {"rms_px": v.get("rms_px"), "num_views": v.get("num_views"),
+                k: {"K": v.get("K"), "D": v.get("D"),
+                    "rms_px": v.get("rms_px"), "num_views": v.get("num_views"),
+                    "image_size": v.get("image_size"),
                     "focal_px": v.get("focal_px"),
-                    "coverage": v.get("coverage")}
+                    "principal_point_px": v.get("principal_point_px"),
+                    "coverage": v.get("coverage"),
+                    "coverage_ratio": (v.get("coverage") or {}).get("covered_ratio"),
+                    "source": v.get("source"),
+                    "source_session": v.get("source_session"),
+                    "loaded_from": v.get("loaded_from"),
+                    "loaded_at": v.get("loaded_at"),
+                    "created": v.get("created")}
                 for k, v in self._intrinsics.items()},
+            "latest_intrinsics": {
+                "path": project_relative(DEFAULT_INTRINSICS_PATH),
+                "exists": os.path.isfile(DEFAULT_INTRINSICS_PATH)},
+            "latest_extrinsics": {
+                "path": project_relative(DEFAULT_EXTRINSICS_PATH),
+                "exists": os.path.isfile(DEFAULT_EXTRINSICS_PATH)},
+            "compat": compat,
             "stereo": None,
             "extrinsic": None,
             "validation": None,
             "result_path": self.result_path,
-            "result_exists": os.path.isfile(self.result_path_abs),
+            "result_exists": compat["exists"],
             "sync": {k: sync_st.get(k) for k in
                      ("pairs_total", "pair_rate", "max_dt_ms", "last_dt_ms")}
                     if sync_st else None,
@@ -1041,8 +1583,16 @@ class CalibrationService:
                 "orientation_confirmed": bool(rig.get("orientation_confirmed")),
                 "orientation_ok": bool(rig.get("orientation_ok")),
                 "baseline_m": rig["relative"]["baseline_m"],
+                "R_10": rig["relative"].get("R_10"),
+                "T_10": rig["relative"].get("T_10"),
                 "relative_rotation_deg": rig["relative"]["rotation_angle_deg"],
                 "consistency_max_mm": round(rig["consistency"]["max_m"] * 1000, 4),
+                "created": rig.get("created"),
+                "computed_at": rig.get("computed_at"),
+                "source": rig.get("source"),
+                "source_session": rig.get("source_session"),
+                "loaded_from": rig.get("loaded_from"),
+                "loaded_at": rig.get("loaded_at"),
                 "cameras": {
                     k: {
                         "centre_m": v["camera_centre_world"],
@@ -1053,6 +1603,7 @@ class CalibrationService:
                         "R_cam_to_world": v["cam_to_world"]["R_wc"],
                         "t_cam_to_world_m": v["cam_to_world"]["t_wc"],
                         "reprojection_rms_px": v["reprojection"]["rms_px"],
+                        "reprojection_max_px": v["reprojection"].get("max_px"),
                         "correspondence": v["correspondence"],
                         "frames": len((rig.get("frames", {}).get(k) or [])),
                     } for k, v in rig["cameras"].items()},
@@ -1092,7 +1643,8 @@ def _slim_intrinsic(d: dict) -> dict:
     keep = ("K", "D", "rms_px", "reprojection", "num_views", "sample_ids",
             "image_size", "focal_px", "principal_point_px", "distortion_model",
             "warnings", "created", "camera", "per_view", "outlier_suggestion",
-            "coverage")
+            "coverage", "coverage_ratio", "source", "source_session",
+            "loaded_from", "loaded_at")
     return {k: d[k] for k in keep if k in d}
 
 
