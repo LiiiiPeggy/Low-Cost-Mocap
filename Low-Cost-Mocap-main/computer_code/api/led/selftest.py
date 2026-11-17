@@ -168,13 +168,24 @@ def _rig():
     return K, D, R0, t0, R1, t1
 
 
-def _triangle(center=(0.0, 0.0, 0.60), yaw=0.0):
+def _triangle(center=(0.0, 0.0, 0.60), yaw=0.0, tilt=0.0):
+    """34/79/79 mm 等腰三角形，返回顺序 [L0, L1, L2]。"""
     c = np.asarray(center, np.float64)
-    e1 = np.array([math.cos(yaw), math.sin(yaw), 0.0])
-    e2 = np.array([-math.sin(yaw), math.cos(yaw), 0.0])
-    r = 0.033 / math.sqrt(3.0)
-    return np.array([c + r * (math.cos(a) * e1 + math.sin(a) * e2)
-                     for a in (0.0, 2 * math.pi / 3, 4 * math.pi / 3)])
+    half = 0.034 / 2.0
+    height = math.sqrt(0.079 ** 2 - half ** 2)
+    base = np.array([[0.0, height, 0.0], [-half, 0.0, 0.0],
+                     [half, 0.0, 0.0]], np.float64)
+    r20 = cv2.Rodrigues(np.array([0.0, 0.0, yaw], np.float64))[0]
+    r10 = cv2.Rodrigues(np.array([tilt, 0.0, 0.0], np.float64))[0]
+    return base @ (r20 @ r10).T + c
+
+
+def _equilateral(center=(0.0, 0.0, 0.60)):
+    c = np.asarray(center, np.float64)
+    r = 0.034 / math.sqrt(3.0)
+    return np.array([[c[0] + r * math.cos(a), c[1] + r * math.sin(a), c[2]]
+                     for a in (math.pi / 2, math.pi / 2 + 2 * math.pi / 3,
+                               math.pi / 2 + 4 * math.pi / 3)])
 
 
 def _dets(points2d):
@@ -185,13 +196,26 @@ def _match(p0, p1, calib, params):
     return match_and_triangulate(_dets(p0), _dets(p1), calib, params)
 
 
-def _edges_ok(res):
-    return bool(res.get("ok")) and max(
-        abs(v - 33.0) for v in (res.get("edges_mm") or [])) < 0.5
+def _edges_ok(res, tol=0.5):
+    edges = res.get("edges_mm") or []
+    return (bool(res.get("ok")) and len(edges) == 3
+            and max(abs(a - b) for a, b in zip(edges, (34.0, 79.0, 79.0))) < tol)
+
+
+def _labels_ok(res):
+    leds = res.get("leds") or []
+    if not res.get("ok") or len(leds) != 3:
+        return False
+    p = np.array([l["xyz"] for l in leds], np.float64)
+    d01 = np.linalg.norm(p[0] - p[1])
+    d02 = np.linalg.norm(p[0] - p[2])
+    d12 = np.linalg.norm(p[1] - p[2])
+    return (abs(d01 - 0.079) < 0.0005 and abs(d02 - 0.079) < 0.0005
+            and abs(d12 - 0.034) < 0.0005)
 
 
 def test_geometry():
-    print("\n[2] 极线匹配 / 三角化 / 33 mm 等边三角形")
+    print("\n[2] 极线匹配 / 三角化 / 34/79/79 mm 等腰三角形")
     K, D, R0, t0, R1, t1 = _rig()
     world = _triangle()
     p0 = project(world, K, D, R0, t0)
@@ -208,11 +232,21 @@ def test_geometry():
         err = float(np.linalg.norm(center - np.asarray(world).mean(axis=0)))
         check("三角化世界中心误差 < 1mm", err < 0.001,
               "%.4f mm" % (err * 1000))
-        check("三条边均为 33 mm（±0.5mm）", _edges_ok(res), res["edges_mm"])
+        check("三条边为 34/79/79 mm（±0.5mm）", _edges_ok(res), res["edges_mm"])
+        check("L0 是两条 79 mm 边的公共顶点", _labels_ok(res),
+              [(l["label"], l["xyz"]) for l in res.get("leds", [])])
+        base_mid = (np.asarray(world[1]) + np.asarray(world[2])) / 2.0
+        want_dir = np.asarray(world[0]) - base_mid
+        want_dir /= np.linalg.norm(want_dir)
+        got_dir = np.asarray(res.get("board_direction") or [0, 0, 0])
+        check("灯板方向由短边中点指向 L0",
+              float(np.dot(got_dir, want_dir)) > 0.999,
+              res.get("board_direction"))
         check("重投影 < 0.2px", res["mean_reprojection_px"] < 0.2,
               res["mean_reprojection_px"])
-        check("三个 LED 标签是临时编号",
-              res.get("labels_are_temporary") is True)
+        check("L0 几何固定，L1/L2 仅保持时间连续",
+              res.get("label_rule", "").startswith("L0=")
+              and res.get("labels_are_temporary") is True)
         check("两台相机三点绕向一致",
               res.get("orientation_consistent") is True,
               res.get("orientation_consistent"))
@@ -251,7 +285,7 @@ def test_geometry():
     extra1 = rng2.uniform([50, 50], [1200, 650], (6, 2))
     res_many = _match(np.vstack([p0n, extra0]),
                       np.vstack([p1n, extra1]), calib, params)
-    check("多个反射候选下仍能选出 33 mm 三角形", _edges_ok(res_many),
+    check("多个反射候选下仍能选出 34/79/79 mm 三角形", _edges_ok(res_many),
           None if not res_many.get("ok") else res_many["edges_mm"])
 
     # 少一个 LED
@@ -267,10 +301,40 @@ def test_geometry():
     b0 = project(bad_world, K, D, R0, t0)
     b1 = project(bad_world, K, D, R1, t1)
     res_bad = _match(b0, b1, calib, params)
-    check("33 mm 几何不一致时不输出有效中心",
+    check("等腰三角形几何不一致时不输出有效中心",
           res_bad.get("ok") is False
           and res_bad.get("status") == "geometry_mismatch",
           res_bad.get("status"))
+
+    # 任意输入顺序、空间位置和旋转都必须识别同一块等腰灯板。
+    for perm in ((2, 0, 1), (1, 2, 0)):
+        rp = _match(p0[list(perm)], p1[list(perm)], calib, params)
+        check("任意点顺序仍识别等腰三角形 %s" % (perm,), _edges_ok(rp),
+              rp.get("edges_mm"))
+        check("任意点顺序仍定位 L0 %s" % (perm,), _labels_ok(rp),
+              [l["xyz"] for l in rp.get("leds", [])])
+    swap = _match(p0[[0, 2, 1]], p1[[0, 2, 1]], calib, params)
+    d0 = np.asarray(res.get("board_direction") or [0, 0, 0])
+    d1 = np.asarray(swap.get("board_direction") or [0, 0, 0])
+    check("交换两个底边点后灯板方向不变", float(np.dot(d0, d1)) > 0.999,
+          [res.get("board_direction"), swap.get("board_direction")])
+
+    moved = _triangle(center=(0.22, -0.15, 0.82), yaw=0.7, tilt=0.25)
+    q0 = project(moved, K, D, R0, t0)
+    q1 = project(moved, K, D, R1, t1)
+    rm = _match(q0, q1, calib, params)
+    check("不同位置/旋转下仍识别等腰三角形", _edges_ok(rm), rm.get("edges_mm"))
+    check("不同位置/旋转下 L0 仍稳定", _labels_ok(rm),
+          [l["xyz"] for l in rm.get("leds", [])])
+
+    # 旧的 34/34/34 等边三角形不得再被当前灯板接受。
+    eq = _equilateral()
+    e0 = project(eq, K, D, R0, t0)
+    e1 = project(eq, K, D, R1, t1)
+    re = _match(e0, e1, calib, params)
+    check("旧 34/34/34 等边三角形被拒绝",
+          re.get("ok") is False and re.get("status") == "geometry_mismatch",
+          re.get("status"))
 
 
 def test_camera_mapping():
@@ -333,7 +397,7 @@ def test_camera_mapping():
           "chosen=%s id=%s swap=%s" % (key2, r_id2.get("ok"),
                                        r_sw2.get("ok")))
     if chosen2.get("ok"):
-        check("自动映射后三边仍为 33 mm", _edges_ok(chosen2),
+        check("自动映射后三边仍为 34/79/79 mm", _edges_ok(chosen2),
               chosen2["edges_mm"])
 
 
@@ -470,11 +534,11 @@ def test_service_pipeline():
                 err = float(np.linalg.norm(center - world.mean(axis=0)))
                 check("服务输出中心接近真值 (<3mm)", err < 0.003,
                       "%.3f mm" % (err * 1000))
-                check("服务输出三条边 33 mm",
-                      max(abs(v - 33.0) for v in state["edges_mm"]) < 0.5,
-                      state["edges_mm"])
-                check("LED 标签标记为临时编号",
-                      state.get("labels_are_temporary") is True)
+                check("服务输出三条边 34/79/79 mm",
+                      _edges_ok(state, tol=1.0), state["edges_mm"])
+                check("LED 标签遵循 L0/底边端点规则",
+                      state.get("label_rule", "").startswith("L0=")
+                      and state.get("labels_are_temporary") is True)
                 check("服务状态包含 ROI / 动态跟踪信息",
                       isinstance(state.get("roi"), dict)
                       and "tracking" in state["roi"]

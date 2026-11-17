@@ -15,7 +15,7 @@ PS3 Eye、Socket.IO 无人机控制和 ESP32 链路已从运行代码中移除�
 | `Low-Cost-Mocap-main/computer_code/api/camera_preview.py` | Flask 蓝图：状态 / MJPEG 推流 / 原始帧保存 |
 | `Low-Cost-Mocap-main/computer_code/api/preview_server.py` | 只含相机功能的最小服务（无需 serial / ruckig） |
 | `Low-Cost-Mocap-main/computer_code/api/calibration/` | **双相机内参 / 固定棋盘格世界系外参**（`calibrateCamera` + `solvePnP`；`stereoCalibrate` 仅作交叉校验） |
-| `Low-Cost-Mocap-main/computer_code/api/led/` | **红外 LED 检测、极线匹配与三维定位**（三 LED 标记，L0–L2 临时编号） |
+| `Low-Cost-Mocap-main/computer_code/api/led/` | **红外 LED 检测、极线匹配与三维定位**（34/79/79 mm 等腰灯板，L0 为长边公共顶点） |
 | `Low-Cost-Mocap-main/computer_code/api/calib_cli.py` | 标定命令行：采集 / 重检测 / 求解 / 验证 / 保存 |
 | `Low-Cost-Mocap-main/computer_code/api/static/preview.html` | 当前 3002 `/preview` 网页（原生 JS + Canvas 三维视图） |
 | `AGENTS.md` / `PROGRESS.md` / `MEMORY.md` / `PROCESS.md` | AI Agent 公共工作规则与项目记忆 |
@@ -232,15 +232,15 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 ```bat
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
-python -m calibration.selftest   :: 139/139
-python -m led.selftest           :: 50/50
+python -m calibration.selftest   :: 141/141
+python -m led.selftest           :: 60/60
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
 同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、会话结果、
 LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
-ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存与接口。
-最近一次（2026-11-17）：**139/139 + 50/50 通过**。
+ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存与接口。
+最近一次（2026-11-17）：**141/141 + 60/60 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
@@ -248,13 +248,14 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
 标记灯统一采用 **850 nm 红外 LED**，不再评估 940 nm 方案。模块复用两台相机的同步帧对和已载入的标定参数：
 
 - **二维检测**：阈值 + 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值拆分粘连光斑，拆分块至少占父亮区 15%；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心；分别输出原始连通域和筛选候选。
-- **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边约 33 mm、两相机三点绕向一致。
-- **相机映射**：两台相机同名，USB/重启后枚举顺序可能互换。LED 服务同时评估 `live0→calib0/live1→calib1` 和反向映射，按正深度 + 33 mm 三角选择并锁定；状态和调试 JSON 会显示当前映射。
+- **三维定位**：`F` 由标定 R/t 计算，做极线/重投影约束后三角化到世界系；检查 LED 位于相机前方、三边排序后匹配 34/79/79 mm、两相机三点绕向一致。L0 是两条 79 mm 边的公共顶点。
+- **相机映射**：两台相机同名，USB/重启后枚举顺序可能互换。LED 服务同时评估 `live0→calib0/live1→calib1` 和反向映射，按正深度 + 34/79/79 mm 三角选择并锁定；状态和调试 JSON 会显示当前映射。
 - **ROI**：每台相机可设归一化手动 ROI；匹配后动态跟踪 ROI（+80 px），连续失败 12 帧清除并全图重搜；ROI 不足 3 点自动全图回退。
 - **极线诊断视图**：不依赖最终 matches；两台相机有候选点即绘制另一路每个候选的极线，同色标记来源，距离表显示最小极线距离与 OK/FAIL，支持水平/倾斜/近竖直极线裁剪。匹配门槛不变。
 - **信息布局**：相机编号、候选/匹配数量、状态、ROI、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
-- **限制**：`L0/L1/L2` 是临时编号；三个 LED 完全相同，120° 对称未解，**不输出唯一航向或 6DoF**。
-- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、极线 5 px、三边容差 10 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
+- **三维方向**：有效跟踪时，从灯板几何中心沿“短边中点 → L0”画橙色箭头；预测/丢失状态不画。该方向不是机器人航向角。相机模型与视锥体绘制尺寸为原来的 50%，相机坐标和基线不变。
+- **限制**：L1/L2 是短边端点，物理身份不唯一；L0 由两条 79 mm 边唯一确定。**不输出唯一航向或完整 6DoF**。
+- **参数**：默认阈值 200、面积 3–800 px²、峰距 6 px、极线 5 px、三边容差 20 mm；可对 cam0/cam1 分别覆盖阈值/面积/峰距/分离；保存到 `captures/calibration/led_params.json`。
 - **入口**：标定面板底部“红外 LED 检测与定位”；接口 `/api/led/state|params|detect/start|stop|locate/start|stop|overlay|overlay_pair|diagnose|debug/save`，以及 `/api/cameras/controls`。
 - **曝光/增益**：LRCP G720P 的 UVC 曝光/自动曝光/增益由 DirectShow `IAMCameraControl`/`IAMVideoProcAmp` 实时读写，不另开取流、不打断 MF；控件已移动到“红外 LED 检测与定位”模块内，相机 0/1 独立。设置按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开/服务重启后自动恢复并读回验证；不再每 5 秒轮询设备属性。装机时用实际 850 nm LED 确认亮度与检测阈值。
 
@@ -309,7 +310,7 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
   单侧反向还会把基线改掉 20% 而不触发任何残差告警（详见 `docs/calibration.md` 第 6 节）。
   若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
 - **LED 已有实机三点跟踪记录，但尚未完成全场景精度验收**：现场仍需按距离/曝光调整阈值、面积和峰距；
-  L0–L2 为临时编号，尚不能输出唯一航向。
+  L0 由几何唯一确定，L1/L2 为短边端点、物理身份不唯一，尚不能输出完整 6DoF。
 - Go2 / 机器狗控制与 ROS 2 输出未实现（标定与世界系已建立，见上文）。
 
 ## 注意

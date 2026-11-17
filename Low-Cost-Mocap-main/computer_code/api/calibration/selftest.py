@@ -1399,6 +1399,12 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     rd = rs.json or {}
     check("LED 参数恢复默认", rs.status_code == 200
           and (rd.get("params") or {}).get("threshold") == 200, rs.status_code)
+    check("网页使用 34/79/79 mm 等腰三角形与灯板方向箭头",
+          "34/79/79" in html and "drawBoardDirection" in html
+          and "灯板方向" in html)
+    check("相机模型与视锥体绘制缩小 50%",
+          "const d = 0.14" in html and "0.0175" in html
+          and "const d = 0.28" not in html)
 
 
 def _selftest_dir() -> str:

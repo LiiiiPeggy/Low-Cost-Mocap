@@ -10,7 +10,7 @@
 
 二维检测与三维定位是两个独立状态：
 * ``detect_enabled``  只做单相机亮点检测和二维可视化；
-* ``locate_enabled``  才做极线匹配、三角化、等边三角形和卡尔曼跟踪。
+* ``locate_enabled``  才做极线匹配、三角化、34/79/79 mm 等腰三角形识别和卡尔曼跟踪。
 """
 
 from __future__ import annotations
@@ -176,7 +176,8 @@ def _compact_diag(diag: dict | None) -> dict | None:
             "depth_pass", "reprojection_pass", "candidate_count",
             "triangle_combinations", "valid_triangles", "best_edges_mm",
             "best_edge_errors_mm", "best_reprojection_px",
-            "best_epipolar_px", "best_triangle_indices")
+            "best_epipolar_px", "best_triangle_indices",
+            "expected_edges_mm", "triangle_sides_m")
     out = {k: diag.get(k) for k in keep if k in diag}
     epi = diag.get("epipolar_distances") or []
     if epi and len(epi) <= 8 and all(len(r) <= 8 for r in epi):
@@ -352,7 +353,7 @@ class LedService:
         self._roi_miss = {"0": 0, "1": 0}
         self._roi_force_full = {"0": False, "1": False}
         # 实时相机 → 标定相机映射。硬件名称相同，USB 枚举顺序可能在重启后
-        # 互换；auto 模式下用 33 mm 三角化结果自动判别。
+        # 互换；auto 模式下用 34/79/79 mm 三角化结果自动判别。
         self._camera_map_mode = "auto"
         self._calib_options: dict[str, dict] = {}
         self._mapping_confirmed = False
@@ -509,7 +510,7 @@ class LedService:
         """读取并校验当前标定；同时准备两种相机映射。
 
         返回 ``(active_calib, changed)``。auto 模式下先沿用当前映射；
-        真正选择由 ``_process`` 用 33 mm 三角化结果完成。
+        真正选择由 ``_process`` 用 34/79/79 mm 三角化结果完成。
         """
         try:
             snapshot = calibration_service().localization_snapshot()
@@ -726,6 +727,7 @@ class LedService:
                 "matches": [], "leds": [], "raw_center": None,
                 "filtered_center": None, "velocity": None,
                 "edges_mm": None, "edge_errors_mm": None,
+                "expected_edges_mm": None, "board_direction": None,
                 "trajectory": [],
                 "calibration": self._calib_summary_locked(),
             })
@@ -743,6 +745,7 @@ class LedService:
                 "leds": [], "matches": [], "raw_center": None,
                 "filtered_center": None, "velocity": None,
                 "edges_mm": None, "edge_errors_mm": None,
+                "expected_edges_mm": None, "board_direction": None,
                 "trajectory": [],
             })
         return self.state()
@@ -871,7 +874,7 @@ class LedService:
                     predicted_center=pred_center)
 
             # auto 模式先同时评估两种“实时相机 ↔ 标定相机”映射；错误的
-            # 映射会三角化到相机后方（负深度），正确映射会得到 33 mm 三角。
+            # 映射会三角化到相机后方（负深度），正确映射会得到 34/79/79 mm 三角。
             if auto_map and not confirmed:
                 results = {key: run_match(opt) for key, opt in options.items()}
                 chosen_key, match = _choose_mapping(results)
@@ -1022,6 +1025,9 @@ class LedService:
                 "velocity": velocity,
                 "edges_mm": m.get("edges_mm") if tracking else None,
                 "edge_errors_mm": m.get("edge_errors_mm") if tracking else None,
+                "expected_edges_mm": m.get("expected_edges_mm"),
+                "board_direction": m.get("board_direction") if tracking else None,
+                "label_rule": m.get("label_rule"),
                 "mean_reprojection_px": m.get("mean_reprojection_px"),
                 "mean_epipolar_px": m.get("mean_epipolar_px"),
                 "triangle_score": m.get("triangle_score"),
@@ -1091,10 +1097,12 @@ class LedService:
             "roi": self._roi_state_locked(),
             "matches": [], "leds": [], "raw_center": None,
             "filtered_center": None, "velocity": None,
-            "edges_mm": None, "edge_errors_mm": None,
+            "edges_mm": None, "edge_errors_mm": None, "expected_edges_mm": None,
+            "board_direction": None,
             "mean_reprojection_px": None, "mean_epipolar_px": None,
             "triangle_score": None, "orientation_consistent": None,
             "triangle_tol_mm": None, "labels_are_temporary": True,
+            "label_rule": "L0=两长边公共顶点；L1/L2=短边端点",
             "label_assignment": None,
             "tracking": {"state": "idle"},
             "trajectory": [],

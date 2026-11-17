@@ -1,6 +1,6 @@
 # PROGRESS — 当前状态
 
-> 快照日期：**2026-11-17**。分支 `main`；本轮精简与旧系统清理已提交（`65b786e`）。
+> 快照日期：**2026-11-17**。分支 `main`；本轮 34/79/79 mm 灯板与方向箭头改动已提交（`git log -1` 可查）。
 > 本文只描述“现在做到哪里”；长期结论见 `MEMORY.md`，决策依据见 `PROCESS.md`，操作说明见 `README.md` 与 `docs/calibration.md`。
 
 ## 当前目标
@@ -15,11 +15,12 @@
 - 软件帧同步：60 s 实机测试 30.01 对/s、20 ms 阈值下配对率 100%、丢弃 0；`|Δt|` 均值 0.2–1.6 ms、P95 最高约 16 ms。
 - 标定链路：内参、固定板 `solvePnP` 外参、`validate_rig`、结果失效/恢复、CLI 与 HTTP 接口（已提交至 `c353edf`）。
 - 已提交改版：内参/外参自动保存与载入、网页“采集双相机图片”、Canvas 2D 三维视图、红外 LED 检测与三角化、版本一致性、覆盖率门限放宽到 0.1%、单位修复、默认板面高 3 mm。
-- 2026-11-17 实机 LED：极线阈值调整为 **5 px** 后成功完成三点三角化/跟踪；当前场景 cam1 使用阈值 210 覆盖，三边约 30–35 mm、重投影约 1.3–1.4 px。该记录不代表全场景精度验收。
+- 2026-11-17 实机 LED：极线阈值调整为 **5 px** 后成功完成三点三角化/跟踪；当前场景 cam1 使用阈值 210 覆盖，重投影约 1.3–1.4 px。该记录不代表全场景精度验收。
+- 2026-11-17 灯板更新：识别几何改为 **34/79/79 mm 等腰三角形**，边长容差调整为 **20 mm**；L0 为两长边公共顶点；三维视图新增“短边中点 → L0”橙色方向箭头；相机模型与视锥体绘制缩小 50%（外参不变）。
 - 本轮代码精简：合并 LED 参数/跟踪重置/诊断/叠加图重复逻辑，统一标定检测分类与 JSON 载入，收紧前端重复事件与无效状态，合并测试中的假相机和几何辅助代码。
 - 自检（2026-11-17 在本机复跑确认）：
-  - `python -m calibration.selftest` → **139/139 通过**
-  - `python -m led.selftest` → **50/50 通过**
+  - `python -m calibration.selftest` → **141/141 通过**
+  - `python -m led.selftest` → **60/60 通过**
   - 均为合成图 / 假相机，只证明求解链路与流程，**不代表实机精度**。
 
 运行方式（无相机也可）：
@@ -36,6 +37,7 @@ python -m led.selftest
 - **内参**：`computer_code/captures/calibration/intrinsics.json`（2026-11-16 17:34，`source=migrated`，源会话 `20261116_104419`）。两台各 8 张，RMS **0.2259 / 0.077 px**，1280×720。
 - **外参**：`computer_code/captures/calibration/world_extrinsics.json`（2026-11-16 17:50，源会话 `20261116_174926`）。`orientation_confirmed=true`，基线 **560.567 mm**；每台仅 1 帧，带“外参图覆盖率偏低（s0001、s0002）”警告。
 - 以上两份新格式结果已纳入 Git 跟踪；原始采集图与 `led_params.json` 仍被 `captures/` 忽略。
+- 当前实机 LED 参数（已保存到 `captures/calibration/led_params.json`，不进入 Git）：threshold 150、cam1 覆盖 threshold 180、epi 5 px、reprojection 4.25 px、triangle 20 mm、camera_map auto；实机换多个位置均可定位。
 - **旧版兼容文件已彻底移除**：`api/calibration/calibration.json` 及其自动写入逻辑、`/api/calib/result` 与 `/api/calib/matrices` 的默认回退读取均已删除，不再重新生成。完整结果只存在于当前会话目录的 `calibration.json`。
 - **早期实机会话**：`computer_code/captures/calibration/20261116_152637`，两台各 8 张内参图；`s0017`–`s0022` 是旧 0.8% 门限下被拒的外参样本（覆盖率 0.39–0.48%，原图已保存）。
 - 结论：**尚无“固定安装 + 人工方向确认 + 独立多位置验证”闭环的可信外参/基线**。旧 `camera-params.json`、`helpers.py`、3001 后端、React 网页和 ESP32 固件均已从运行代码删除；原作者实现见 `upstream/`。

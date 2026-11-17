@@ -43,7 +43,7 @@ DEFAULT_PARAMS = {
     "saturation_value": 250,      # 视为饱和的像素值
     "epipolar_tol_px": 5.0,       # 双相机极线距离阈值（去畸变理想像素）
     "reprojection_tol_px": 4.0,   # 三角化点的重投影误差阈值
-    "triangle_tol_mm": 10.0,      # 33 mm 等边三角形的边长容差；实机质心噪声下先给 10mm
+    "triangle_tol_mm": 20.0,      # 34/79/79 mm 等腰三角形的边长容差
 }
 
 # 每个数值参数的允许范围；用于 API 校验，避免误输入把检测拖死。
@@ -65,7 +65,9 @@ PARAM_LIMITS = {
     "triangle_tol_mm": (1.0, 30.0),
 }
 
-TRIANGLE_SIDE_M = 0.033          # 三个 LED 中心间距，米
+TRIANGLE_SHORT_M = 0.034         # 等腰三角形短边（两底边端点间距）
+TRIANGLE_LONG_M = 0.079          # 两腰：顶点到底边端点
+TRIANGLE_SIDES_M = (TRIANGLE_SHORT_M, TRIANGLE_LONG_M, TRIANGLE_LONG_M)
 MAX_RAW_COMPONENTS = 64           # 返回给网页的原始连通域上限（防止极端噪声刷屏）
 
 
@@ -600,6 +602,7 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
     }
 
 
-__all__ = ["DEFAULT_PARAMS", "PARAM_LIMITS", "TRIANGLE_SIDE_M",
+__all__ = ["DEFAULT_PARAMS", "PARAM_LIMITS", "TRIANGLE_SHORT_M",
+           "TRIANGLE_LONG_M", "TRIANGLE_SIDES_M",
            "default_params", "validate_params", "merge_params",
            "detect_leds", "_as_gray", "_normalize_roi"]

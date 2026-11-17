@@ -1,4 +1,4 @@
-"""双相机极线匹配、世界系三角化与 33 mm 等边三角形识别。
+"""双相机极线匹配、世界系三角化与 34/79/79 mm 等腰三角形识别。
 
 坐标约定与 calibration 模块完全一致：
     X_cam = R @ X_world + t          （R、t 来自标定文件/结果）
@@ -15,7 +15,9 @@ import math
 import cv2
 import numpy as np
 
-from led.detector import TRIANGLE_SIDE_M
+from led.detector import TRIANGLE_LONG_M, TRIANGLE_SHORT_M, TRIANGLE_SIDES_M
+
+_EXPECTED_EDGES_M = np.sort(np.asarray(TRIANGLE_SIDES_M, np.float64))
 
 
 def skew(v: np.ndarray) -> np.ndarray:
@@ -75,35 +77,43 @@ def _signed_area(points) -> float:
         - (p[2, 0] - p[0, 0]) * (p[1, 1] - p[0, 1]))
 
 
-def _labels_from_previous(points: np.ndarray, previous_points):
-    """等边三角形三个顶点完全等价；仅用时间连续性保持显示编号稳定。
+def _triangle_order(points: np.ndarray, previous_points=None):
+    """按 34/79/79 mm 几何把三点排成 [L0, L1, L2]。
+
+    L0 是两条 79 mm 长边的公共顶点；L1/L2 是 34 mm 短边端点，物理身份不唯一，
+    因此只在与上一帧不冲突时用时间连续性保持顺序。
 
     返回 (重排后的点, 方式, 原索引顺序)。第三个返回值必须同时用于匹配记录，
     否则 LED 的 label 与 cam0/cam1 检测点会错位。
     """
-    n = len(points)
+    p = np.asarray(points, np.float64).reshape(3, 3)
+    d = [float(np.linalg.norm(p[0] - p[1])),
+         float(np.linalg.norm(p[1] - p[2])),
+         float(np.linalg.norm(p[2] - p[0]))]
+    # (短边长度, 短边端点 i, 短边端点 j, 顶点 k)
+    _short, i, j, k = min(
+        ((d[0], 0, 1, 2), (d[1], 1, 2, 0), (d[2], 2, 0, 1)),
+        key=lambda item: item[0])
     if previous_points is not None:
         prev = np.asarray(previous_points, np.float64).reshape(-1, 3)
-        if len(prev) == n and n == 3:
-            best, best_cost = None, float("inf")
-            for perm in itertools.permutations(range(n)):
-                cost = float(sum(np.linalg.norm(points[perm[k]] - prev[k])
-                                 for k in range(n)))
-                if cost < best_cost:
-                    best_cost, best = cost, perm
-            if best is not None:
-                order = list(best)
-                return points[order], "previous", order
-    # 没有历史时按 x、y 排序，给出一个确定的临时编号
-    order = sorted(range(n), key=lambda i: (points[i][0], points[i][1]))
-    return points[order], "spatial", order
+        if len(prev) == 3:
+            keep = (np.linalg.norm(p[i] - prev[1])
+                    + np.linalg.norm(p[j] - prev[2]))
+            swap = (np.linalg.norm(p[i] - prev[2])
+                    + np.linalg.norm(p[j] - prev[1]))
+            order = [k, i, j] if keep <= swap else [k, j, i]
+            return p[order], "previous", order
+    # 无历史时给底边两个端点一个确定的临时顺序
+    base = sorted((i, j), key=lambda idx: (p[idx][0], p[idx][1]))
+    order = [k] + base
+    return p[order], "spatial", order
 
 
 def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                           params: dict, *, previous_points=None,
                           predicted_center=None,
                           max_match_candidates: int = 64) -> dict:
-    """极线候选 → 三角化 → 重投影筛选 → 33 mm 等边三角形选择。
+    """极线候选 → 三角化 → 重投影筛选 → 34/79/79 mm 等腰三角形选择。
 
     ``calib`` 需包含 K0/D0/K1/D1/R0/t0/R1/t1（world→camera）和 image_size。
     """
@@ -162,6 +172,9 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         "epipolar_tol_px": epi_tol,
         "reprojection_tol_px": rep_tol,
         "triangle_tol_mm": params["triangle_tol_mm"],
+        "expected_edges_mm": [round(float(v * 1000), 3)
+                              for v in _EXPECTED_EDGES_M],
+        "triangle_sides_m": [float(v) for v in TRIANGLE_SIDES_M],
         "epipolar_distances": [],
         "epipolar_pass": 0,
         "depth_pass": 0,
@@ -282,10 +295,11 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         d12 = float(np.linalg.norm(tri[1] - tri[2]))
         d20 = float(np.linalg.norm(tri[2] - tri[0]))
         edges = np.array([d01, d12, d20], np.float64)
-        errs = np.abs(edges - TRIANGLE_SIDE_M)
+        sorted_edges = np.sort(edges)
+        errs = np.abs(sorted_edges - _EXPECTED_EDGES_M)
         max_err = float(errs.max())
         center = tri.mean(axis=0)
-        # 透视投影下二维三角形不一定等边，但两台相机看到的同一三点绕向应一致。
+        # 透视投影下二维三角形不一定保持等腰，但两台相机看到的同一三点绕向应一致。
         # 这里只作为软约束（标定误差/相机翻转时不会硬性拒绝）。
         orient0 = _signed_area(pts0[[ca["i0"], cb["i0"], cc["i0"]]])
         orient1 = _signed_area(pts1[[ca["i1"], cb["i1"], cc["i1"]]])
@@ -296,6 +310,7 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
             "indices": (a, b, c),
             "points": tri,
             "edges": edges,
+            "sorted_edges": sorted_edges,
             "errs": errs,
             "center": center,
             "mean_reproj": float(np.mean([
@@ -311,11 +326,9 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                 best_bad = (max_err, cand)
             continue
         diag["valid_triangles"] += 1
-        # 边长误差为主，重投影/极线为辅；有历史时轻微偏向预测中心。
-        # 边缘误差的离散度也计入，避免“两条 33 mm、一条 25 mm”这种组合。
-        edge_std = float(edges.std())
+        # 边长残差（排序后对 34/79/79）为主，重投影/极线为辅；
+        # 有历史时轻微偏向预测中心。等腰三角形各边天然不等，不再惩罚边长离散度。
         score = (2.0 * float(errs.mean()) / max(tol_m, 1e-9)
-                 + 0.5 * edge_std / max(tol_m, 1e-9)
                  + cand["mean_reproj"] / max(rep_tol, 1e-9)
                  + 0.5 * cand["mean_epi"] / max(epi_tol, 1e-9)
                  + (0.0 if orient_ok else 2.0))
@@ -334,7 +347,8 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         bad = best_bad[1] if best_bad else None
         if bad is not None:
             diag.update({
-                "best_edges_mm": [round(float(v * 1000), 3) for v in bad["edges"]],
+                "best_edges_mm": [round(float(v * 1000), 3)
+                                  for v in bad["sorted_edges"]],
                 "best_edge_errors_mm": [round(float(v * 1000), 3)
                                         for v in bad["errs"]],
                 "best_reprojection_px": round(bad["mean_reproj"], 3),
@@ -343,17 +357,19 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
             })
         return {
             "ok": False, "status": "geometry_mismatch",
-            "reason": "没有三点组合满足 %.1f mm 等边三角形（容差 %.1f mm）"
-                      % (TRIANGLE_SIDE_M * 1000, params["triangle_tol_mm"]),
+            "reason": "没有三点组合满足 34/79/79 mm 等腰三角形（容差 %.1f mm）"
+                      % params["triangle_tol_mm"],
             "matches": [], "leds": [], "raw_center": None,
             "detected_counts": [len(leds0), len(leds1)],
             "best_edges_mm": None if bad is None
-                             else [round(float(v * 1000), 3) for v in bad["edges"]],
+                             else [round(float(v * 1000), 3)
+                                   for v in bad["sorted_edges"]],
             "best_edge_errors_mm": None if bad is None
                                    else [round(float(v * 1000), 3)
                                          for v in bad["errs"]],
             "best_orientation_consistent": (None if bad is None
                                             else bad["orientation_consistent"]),
+            "triangle_sides_m": [float(v) for v in _EXPECTED_EDGES_M],
             "diagnostics": diag,
         }
 
@@ -361,14 +377,21 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
     chosen = best[1]
     tri = chosen["points"]
     base_cands = [candidates[i] for i in chosen["indices"]]
-    # 用时间连续性保持显示编号稳定；这只是临时编号，不是物理顶点身份。
-    labeled, assignment, order = _labels_from_previous(tri, previous_points)
+    # L0 由几何唯一确定；L1/L2 只是短边端点，用时间连续性避免显示跳号。
+    labeled, assignment, order = _triangle_order(tri, previous_points)
     ordered_cands = [base_cands[i] for i in order]
-    edges = [float(np.linalg.norm(labeled[0] - labeled[1])),
-             float(np.linalg.norm(labeled[1] - labeled[2])),
-             float(np.linalg.norm(labeled[2] - labeled[0]))]
-    errs = [abs(v - TRIANGLE_SIDE_M) for v in edges]
+    edges = np.array([
+        float(np.linalg.norm(labeled[0] - labeled[1])),
+        float(np.linalg.norm(labeled[1] - labeled[2])),
+        float(np.linalg.norm(labeled[2] - labeled[0])),
+    ], np.float64)
+    sorted_edges = np.sort(edges)
+    errs = np.abs(sorted_edges - _EXPECTED_EDGES_M)
     center = labeled.mean(axis=0)
+    base_mid = (labeled[1] + labeled[2]) / 2.0
+    direction = labeled[0] - base_mid
+    norm = float(np.linalg.norm(direction))
+    board_direction = (direction / norm).tolist() if norm > 1e-9 else None
     leds_out = []
     for k, (pt, cand) in enumerate(zip(labeled, ordered_cands)):
         leds_out.append({
@@ -387,9 +410,8 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
                 "reproj_1_px": c["reproj_1_px"]}
                for k, c in enumerate(ordered_cands)]
     diag.update({
-        "best_edges_mm": [round(float(v * 1000), 3) for v in chosen["edges"]],
-        "best_edge_errors_mm": [round(float(v * 1000), 3)
-                                for v in chosen["errs"]],
+        "best_edges_mm": [round(float(v * 1000), 3) for v in sorted_edges],
+        "best_edge_errors_mm": [round(float(v * 1000), 3) for v in errs],
         "best_reprojection_px": round(chosen["mean_reproj"], 3),
         "best_epipolar_px": round(chosen["mean_epi"], 3),
         "best_triangle_indices": list(chosen["indices"]),
@@ -401,17 +423,24 @@ def match_and_triangulate(det0: dict, det1: dict, calib: dict,
         "matches": matches,
         "leds": leds_out,
         "raw_center": [round(float(v), 6) for v in center],
-        "edges_mm": [round(v * 1000, 3) for v in edges],
-        "edge_errors_mm": [round(v * 1000, 3) for v in errs],
+        "board_direction": ([round(float(v), 6) for v in board_direction]
+                            if board_direction else None),
+        "edges_mm": [round(float(v * 1000), 3) for v in sorted_edges],
+        "edge_errors_mm": [round(float(v * 1000), 3) for v in errs],
+        "expected_edges_mm": [round(float(v * 1000), 3)
+                              for v in _EXPECTED_EDGES_M],
         "mean_reprojection_px": round(chosen["mean_reproj"], 4),
         "mean_epipolar_px": round(chosen["mean_epi"], 4),
         "triangle_score": round(float(chosen.get("score", 0.0)), 4),
         "second_score": (None if second_score is None
                          else round(float(second_score), 4)),
         "orientation_consistent": bool(chosen["orientation_consistent"]),
-        "triangle_side_m": TRIANGLE_SIDE_M,
+        "triangle_sides_m": [float(TRIANGLE_SHORT_M),
+                             float(TRIANGLE_LONG_M),
+                             float(TRIANGLE_LONG_M)],
         "triangle_tol_mm": params["triangle_tol_mm"],
         "labels_are_temporary": True,
+        "label_rule": "L0=两条 79 mm 边的公共顶点；L1/L2=34 mm 短边端点",
         "label_assignment": assignment,
         "detected_counts": [len(leds0), len(leds1)],
         "candidate_count": len(candidates),
