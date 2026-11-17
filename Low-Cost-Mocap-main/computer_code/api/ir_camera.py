@@ -25,6 +25,7 @@ USB_UVC协议_SDK开发文档.pdf）其实是同一份 **Microsoft DirectShow / 
 运行环境（实测）
 --------------------------------------------------------------------------
   conda activate lowcost_mocap      # Python 3.10 + numpy 1.26 + opencv 4.10
+  cd Low-Cost-Mocap-main\computer_code\api
   python ir_camera.py
 
 用法

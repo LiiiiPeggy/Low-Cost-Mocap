@@ -2,7 +2,7 @@
 
 设计要点
 --------------------------------------------------------------------------
-* 复用仓库根目录的 ``ir_camera.py``（设备枚举 + 单相机取帧 + COM/MF 资源管理），
+* 复用同目录的 ``ir_camera.py``（设备枚举 + 单相机取帧 + COM/MF 资源管理），
   本模块只负责“多路调度”，不改动单相机 CLI 的行为。
 * Media Foundation 的采集对象按 COM STA 规则“谁创建谁释放”，所以**每台相机
   一个线程，open() / grab() / close() 全部在该线程内完成**，主线程只读缓存。
@@ -37,24 +37,7 @@ from datetime import datetime
 import cv2
 import numpy as np
 
-# ---------------------------------------------------------------------------
-# 定位仓库根目录下的 ir_camera.py
-# ---------------------------------------------------------------------------
-_HERE = os.path.dirname(os.path.abspath(__file__))
-# api/ -> computer_code/ -> Low-Cost-Mocap-main/ -> <repo root>
-_REPO_ROOT = os.path.abspath(os.path.join(_HERE, "..", "..", ".."))
-
-_IR_CAMERA_DIR = os.environ.get("MOCAP_IR_CAMERA_DIR", _REPO_ROOT)
-if _IR_CAMERA_DIR not in sys.path:
-    sys.path.insert(0, _IR_CAMERA_DIR)
-
-try:
-    import ir_camera as irc
-except ImportError as exc:  # pragma: no cover
-    raise ImportError(
-        "找不到 ir_camera.py。请把仓库根目录加入 PYTHONPATH，"
-        "或设置环境变量 MOCAP_IR_CAMERA_DIR 指向它。当前尝试的目录：%s" % _IR_CAMERA_DIR
-    ) from exc
+import ir_camera as irc
 
 
 MF_TICK_SECONDS = 1e-7  # Media Foundation 时间单位是 100ns

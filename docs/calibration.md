@@ -21,7 +21,7 @@
 | 标定板 | **12×9 个方格 → 11×8 内角点**，单格 **30 mm**，总尺寸 360×270 mm |
 | 板面高 | 图案表面高于地面，**默认 3 mm**，按实际修改 |
 | 图像 | 1280×720，NV12@30（MJPG 同样可用） |
-| 环境 | conda `lowcost_mocap`：Python 3.10.22 / OpenCV 4.10.0 / NumPy 1.26.4 |
+| 环境 | conda `lowcost_mocap`：Python 3.10.22 / OpenCV 4.10.0 / NumPy 1.26.4；环境文件见 `docs/environment.yml` |
 
 > 注意：**内角点数 = 方格数 − 1**。填 12×9 就错了，必须填 **11 × 8**。
 
@@ -46,6 +46,8 @@ Z 轴   = 板面法向，指向图案正面外侧；板正面朝上平放时 = �
 ## 2. 快速开始
 
 ```bat
+:: 仓库根目录首次创建环境
+conda env create -f docs\environment.yml
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code
 python api\preview_server.py --indices 0 1

@@ -15,7 +15,7 @@
 
 **可以用，但不能直接替换。** 相机是被动接收近红外、自带窄带滤光片，这一项比改装 PS3 Eye 更省事；但它是**主动结构光**设备，自带激光散斑投射器，与项目「画面里只能剩下几个亮点」的硬约束正面冲突。需改动采集层、图像格式、内参、循环节拍，以及 3 处 `cv2.sfm` 调用。
 
-**好消息**：源码只用了 `cv2.sfm` 的 3 个函数，全部可用常规 OpenCV + numpy 等价实现，**不再需要源码编译 OpenCV + opencv_contrib**，conda 环境可一次装齐（见 `environment-astra.yml`）。
+**好消息**：源码只用了 `cv2.sfm` 的 3 个函数，全部可用常规 OpenCV + numpy 等价实现，**不再需要源码编译 OpenCV + opencv_contrib**。当前项目环境见 `docs/environment.yml`；该文件不包含 Astra/OpenNI 依赖，Astra 适配需另行安装。
 
 ## 3. 规格与仓库假设的差距
 
@@ -80,7 +80,7 @@
 
 | 方案 | 适用 | 说明 |
 | --- | --- | --- |
-| `pyorbbecsdk==1.3.2`（Orbbec SDK **v1.x**） | Windows x64 + Python 3.8/3.9/3.11 | PyPI 有预编译 wheel（约 68 MB），`environment-astra.yml` 已含；**是否识别 SM 未验证** |
+| `pyorbbecsdk==1.3.2`（Orbbec SDK **v1.x**） | Windows x64 + Python 3.8/3.9/3.11 | PyPI 有预编译 wheel（约 68 MB），需另行安装；当前 `docs/environment.yml` 未包含，**是否识别 SM 未验证** |
 | OpenNI2 | Windows / Linux x64 / ARM64 | Astra 系列原生协议；第三方博客称在 RK3588 上实测可用；Python 侧需 ctypes 包装或系统级安装 |
 | ROS2 `astra_camera` / `orbbec_camera` | RK3588 + ROS2 | 直接发布 `/camera/ir/image_raw`（640×480@30fps），并带 `/camera/set_laser` 服务关散斑；与用户现有 ROS2 栈最契合，但后端要改成订阅 topic |
 

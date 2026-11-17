@@ -8,7 +8,7 @@
 
 | 路径 | 说明 |
 |---|---|
-| `ir_camera.py` | **单相机**取帧 + 桌面实时可视化（Windows / Media Foundation，纯 ctypes） |
+| `Low-Cost-Mocap-main/computer_code/api/ir_camera.py` | **单相机**取帧 + 桌面实时可视化（Windows / Media Foundation，纯 ctypes） |
 | `Low-Cost-Mocap-main/` | 原始项目代码（3D 件、ESP32 收发端、上位机解算） |
 | `Low-Cost-Mocap-main/computer_code/api/camera_manager.py` | **双/多相机并发采集**（每相机一线程，latest-frame 缓存 + 时间戳） |
 | `Low-Cost-Mocap-main/computer_code/api/camera_preview.py` | Flask 蓝图：状态 / MJPEG 推流 / 原始帧保存 |
@@ -22,7 +22,7 @@
 | `docs/` | 调研笔记：方案总结、Astra Pro 适配、配图 |
 | `image_driver/` | 相机厂商资料（说明书 PDF、AmCap 工具、DirectShow SDK 文档） |
 | `Notes.md` | 物料清单 |
-| `environment*.yml` | conda 环境定义 |
+| `docs/environment.yml` | 当前实机 Conda 环境导出（含 channels、Conda/pip 依赖与版本） |
 
 ## ir_camera.py
 
@@ -33,7 +33,11 @@
 最高 1280×960@30；双路 1280×720@30 NV12 实测每路约 30 fps。
 
 ```bash
+# 首次创建环境（仓库根目录）
+conda env create -f docs/environment.yml
 conda activate lowcost_mocap
+
+cd Low-Cost-Mocap-main/computer_code/api
 python ir_camera.py                     # 实时显示（默认 NV12 1280x720@30）
 python ir_camera.py --formats           # 列出相机支持的所有格式
 python ir_camera.py --cmap inferno      # 伪彩色显示
@@ -50,7 +54,7 @@ python ir_camera.py --no-display --frames 120   # 无窗口压测
 ### 架构（最小改动）
 
 ```
-ir_camera.py                 ← 单相机取帧（未改动）
+api/ir_camera.py             ← 单相机取帧（未改动）
   └── api/camera_manager.py  ← 每相机一个线程；latest 缓存 + 定长历史缓存；三时间戳
         ├── api/camera_preview.py   ← Flask 蓝图：/api/cameras、MJPEG、save、sync
         │     ├── api/preview_server.py   独立入口（3002，无需 serial/ruckig）
@@ -301,7 +305,8 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
 > 注意：30.01 对/秒 与 100% 配对率说明**配对算法没有丢帧**，不代表**曝光同步**。
 > 真实曝光时间差 = 报告 Δt + 两路交付延迟之差，这个差值未知且非常数。
 
-> 单相机原有功能未受影响：`python ir_camera.py` 的桌面窗口、`--formats`、`--snapshot` 均保持原样。
+> 单相机原有功能未受影响：在 `Low-Cost-Mocap-main/computer_code/api` 下运行 `python ir_camera.py`，
+> 桌面窗口、`--formats`、`--snapshot` 均保持原样。
 
 ### 尚未验证
 
