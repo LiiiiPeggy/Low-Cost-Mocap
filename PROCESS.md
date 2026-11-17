@@ -80,12 +80,12 @@
 
 ## 7. 自动保存、独立 180°、LED 改版（2026-11-16 起，2026-11-17 提交）
 
-- **自动保存/载入**：内参/外参成功后分别写 `captures/calibration/intrinsics.json` 与 `world_extrinsics.json`；载入时校验相机号、K/D、图像尺寸、棋盘/世界系和方向确认状态。兼容文件 `api/calibration/calibration.json` 只在“两台内参 + 已确认外参”时更新，未确认外参只存为待确认。
+- **自动保存/载入**：内参/外参成功后分别写 `captures/calibration/intrinsics.json` 与 `world_extrinsics.json`；载入时校验相机号、K/D、图像尺寸、棋盘/世界系和方向确认状态。完整合并结果只按需写当前会话 `calibration.json`；旧全局兼容文件及其读写逻辑已移除。
 - **每台独立 180°**：取代旧“全局 flip180”。理由见 §8：对称歧义可能只出现在单台相机；修改 flip 会作废旧外参与方向确认，避免状态轮询把“已确认”自动勾回。
 - **默认板面高 3 mm**：新会话默认值；旧会话保持原值。
 - **LED 模块**：阈值 + 连通域 → 距离变换峰值 + 最近峰值分配拆粘连 → 强度加权亚像素；过曝不可分不伪造。`F` 由标定 R/t 计算，`P=K[R|t]` 三角化到世界系，检查相机前方、重投影、33 mm 三边；卡尔曼按 `created_mono` 传播。
 - **LED 波长定为 850 nm**：不再评估 940 nm 方案；装机时用实际 LED 确认亮度、曝光与检测阈值。
-- **验证**：`calibration.selftest` 136/136、`led.selftest` 26/26（合成图/假相机，2026-11-17 复跑）。
+- **验证**：`calibration.selftest` 139/139、`led.selftest` 50/50（合成图/假相机，2026-11-17 复跑）。
 
 ## 8. 关键证据
 
@@ -106,7 +106,7 @@
 - `20261116_152637`：两台各 8 张内参图，fx≈633/654，RMS 0.56/0.14 px；外参未成功。
 - 内参迁移：`intrinsics.json` 的 RMS 0.2259/0.077 px 来自会话 `20261116_104419`，标记 `source=migrated`。该文件与世界系外参 `world_extrinsics.json` 已于 2026-11-17 纳入 Git；原始采集图仍忽略。
 - `20261116_174926`：完成“已确认”外参求解，基线 **560.567 mm**，每台仅 1 帧且覆盖率偏低。
-- 兼容文件 `calibration.json` 于 18:23 由已载入结果再保存（session `20261116_182336`），`validation=null`，不是独立验证；该旧文件已于 2026-11-17 删除，运行时只有“两台内参 + 已确认外参”才会重新生成。
+- 旧全局 `api/calibration/calibration.json` 于 2026-11-17 删除；其自动写入逻辑和 `/api/calib/result`、`/api/calib/matrices` 的默认回退读取也已移除，不再重新生成。完整结果只存在于会话目录 `calibration.json`。
 - 旧 `camera-params.json` 的 320 像素参数未改写；`helpers.py` 仍按 PS3 Eye 的 `rot90`、`make_square`、旧内参和 `cv2.sfm` 假设，尚未接入当前标定输出。
 
 ## 9. 相关提交与文档

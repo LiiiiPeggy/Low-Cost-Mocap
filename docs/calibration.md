@@ -97,9 +97,10 @@ python api\preview_server.py --indices 0 1
 棋盘格和相机编号/位置/离地高度/重投影误差。左键拖动旋转、滚轮缩放、右键拖动平移；
 另有「重置视角」「俯视图」。标定结果变化后视图自动更新。
 
-手动「查看结果」「保存 calibration.json」按钮已删除。两台内参与**已确认**的世界系外参
-都有效时，系统会自动生成/更新下游兼容文件 `api/calibration/calibration.json`（界面显示
-项目相对路径）；未确认方向的外参只保存为待确认结果，不写兼容文件。
+手动「查看结果」「保存 calibration.json」按钮已删除。两台内参与世界系外参分别自动保存到
+`captures/calibration/intrinsics.json` 和 `world_extrinsics.json`；完整合并结果只写当前会话
+目录的 `calibration.json`。旧版全局兼容文件 `api/calibration/calibration.json` 及其自动写入
+逻辑已移除，未确认方向的外参只保存为待确认结果。
 
 命令行等价流程见第 5 节。
 
@@ -158,7 +159,7 @@ python api\preview_server.py --indices 0 1
 **自动保存与载入**：`solvePnP` 成功后自动写会话 `result_extrinsic.json` 和跨会话
 `captures/calibration/world_extrinsics.json`，包含两台相机的 R/t、三维位置、离地高度、
 `R_10/T_10`、基线、重投影、棋盘格/世界系定义、内参快照和 `orientation_confirmed`。
-未确认方向的结果会保存为**待确认**，但不会更新兼容 `calibration.json`。
+未确认方向的结果会保存为**待确认**；无论是否确认，都不会再写全局兼容文件。
 载入时校验棋盘格规格、世界系定义、相机编号、位姿字段完整性，以及文件内参快照与当前
 已载入 K/D 的一致性；不兼容则明确报错且**不覆盖当前有效外参**。载入后三维视图和数值
 自动刷新，并恢复 flip 与方向确认状态。修改 180° 会作废旧外参与确认，必须重新求解。
@@ -222,7 +223,7 @@ python api\calib_cli.py intrinsic    --session <会话>
 python api\calib_cli.py extrinsic    --session <会话> [--flip180 | --flip-cam0 | --flip-cam1] [--orientation-confirmed]
 python api\calib_cli.py validate-rig --session <会话>
 python api\calib_cli.py save         --session <会话> --validate --orientation-confirmed
-python api\calib_cli.py info
+python api\calib_cli.py info         --result <会话>\calibration.json
 ```
 
 `stereo` 子命令保留为 `stereoCalibrate` 交叉校验（不是主路线）。
@@ -232,9 +233,10 @@ python api\calib_cli.py info
 **不会改写**它。
 
 CLI 的 `intrinsic` / `extrinsic` 同样会自动保存 `captures/calibration/intrinsics.json`
-和 `world_extrinsics.json`，并打印最新路径与兼容文件状态。`save` 子命令保留为显式写兼容
-`calibration.json`（可指定 `--out`）。跨会话载入目前通过网页“载入内参 / 载入世界坐标系
-外参”按钮完成；对应的服务方法为 `service.load_intrinsics()` / `service.load_extrinsics()`。
+和 `world_extrinsics.json`，并打印最新路径。`save` 子命令把完整结果写入当前会话目录的
+`calibration.json`，可用 `--out` 额外导出；`info --result <文件>` 必须显式指定要查看的结果。
+跨会话载入目前通过网页“载入内参 / 载入世界坐标系外参”按钮完成；对应的服务方法为
+`service.load_intrinsics()` / `service.load_extrinsics()`。
 
 ---
 
@@ -392,7 +394,7 @@ LED 专项自检：`python -m led.selftest`，**50/50 通过**（合成光斑、
 细长反光过滤、ROI 坐标偏移、极线匹配、33 mm 三角化、缺失/几何不一致、绕向一致性、
 自动相机映射、卡尔曼预测/丢失、服务帧去重、同 pair 叠加图、matched=0 极线、水平/垂直
 极线裁剪、局部放大、调试帧保存、参数/ROI/单相机覆盖）。
-标定自检：**136/136 通过**（包含 LED UI/参数接口与版本接口检查）。
+标定自检：**139/139 通过**（包含 LED UI/参数接口与版本接口检查）。
 
 ---
 
@@ -414,7 +416,7 @@ captures/calibration/
     result_intrinsic.json     内参中间结果（含 loaded_from 时可区分历史载入）
     result_extrinsic.json     solvePnP 外参中间结果（含逐帧抖动）
     result_validation.json    独立验证结果
-    calibration.json          兼容结果副本（仅确认外参时）
+    calibration.json          完整结果副本（save / CLI save 按需写入）
 
 captures/led_debug/<时间戳>/   “保存调试帧”输出
   cam0_raw.png / cam1_raw.png          原始灰度
@@ -432,12 +434,12 @@ captures/led_debug/<时间戳>/   “保存调试帧”输出
 
 `samples.json` 里 `phase` 取值：`intrinsic`（板移动）/ `extrinsic`（板固定）/ `validation`（板换位置）。
 
-**路径约定**：数据基准目录是 `computer_code/`。默认会话根目录 `captures/calibration/`、
-默认结果 `api/calibration/calibration.json`，界面与结果文件里的 `session.root` 使用项目
+**路径约定**：数据基准目录是 `computer_code/`。默认会话根目录 `captures/calibration/`；
+完整合并结果写在该会话目录的 `calibration.json`。界面与结果文件里的 `session.root` 使用项目
 相对路径；内部读写时再解析成绝对路径，因此不依赖启动进程时的当前工作目录。旧会话里保存
 的绝对路径仍可直接读取，历史采集目录不会被覆盖。
 
-### 7.2 `api/calibration/calibration.json`（schema v2）
+### 7.2 会话目录 `calibration.json`（schema v2）
 
 顶层：`schema` / `version` / `created` / `session` / `cameras` / `board` / `world_frame` /
 `image_convention` / `intrinsics` / `extrinsics` / `validation` / `data` / `caveats`。
@@ -460,21 +462,21 @@ captures/led_debug/<时间戳>/   “保存调试帧”输出
 | `consistency` | 三角化角点与已知世界点的三维偏差 |
 | `stability` | 同一静止板多帧之间的位姿抖动 |
 
-**兼容文件不再需要网页手动保存**：两台内参都有效、世界系外参已解且
-`orientation_confirmed=true` 时，系统会在内参计算/载入、外参求解/载入后自动生成或更新
-`api/calibration/calibration.json`。未确认方向、只有一台内参或写盘失败时不会写入半成品，
-会保留上一次已确认文件。旧的 `load_calibration()` / `stereo_matrices()` /
-`GET /api/calib/matrices` 读取方式不变。
+`calibration.json` 是**当前会话的完整结果副本**，由 `/api/calib/save` 或 CLI `save`
+按需写入；标定流程本身不再自动生成任何全局兼容文件。旧版
+`api/calibration/calibration.json` 的写入逻辑和默认回退读取均已移除。
 
 下游取参数：
 
 ```python
 from calibration.service import load_calibration, stereo_matrices
-data = load_calibration()                       # 默认 api/calibration/calibration.json
+data = load_calibration("captures/calibration/<会话>/calibration.json")
 K0, D0, K1, D1, R, T = stereo_matrices(data)    # 或 scaled_size=(640, 360)
 ```
 
-或 `GET /api/calib/matrices?size=640x360`。
+`load_calibration(path)` 必须显式给路径；或调用
+`GET /api/calib/matrices?size=640x360`（默认读取当前会话已保存的结果，也可用
+`?path=` 指定文件）。
 
 旧的 `camera-params.json`（320×320 占位参数）**保持原样未改**，新模块不读它。
 
@@ -523,7 +525,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 用已知 `K/D/R/T` 按**真实畸变模型**逐像素反向渲染虚拟棋盘格（11×8 / 30 mm），再走正式代码
 检测与求解，最后与真值比对。
 
-最近一次标定自检：**136/136 通过**（`--quick` 与完整模式均通过）；LED 专项自检
+最近一次标定自检：**139/139 通过**（`--quick` 与完整模式均通过）；LED 专项自检
 `python -m led.selftest`：**50/50 通过**。合成数据（两台相机距板心
 ~1.8 m、基线 2032.78 mm）的代表性量级：
 
@@ -554,9 +556,9 @@ python -m calibration.selftest --keep     :: 保留渲染图
   入口已移除
 - 内参计算后自动写 `intrinsics.json`；新会话零样本执行 `load_intrinsics()` 可恢复两台 K/D，
   并标记 `source="loaded"` / `loaded_from`
-- 未确认外参保存为待确认、不写兼容文件；确认后自动写 `world_extrinsics.json` 与
-  `api/calibration/calibration.json`，下游 `load_calibration`/`stereo_matrices`/
-  `GET /api/calib/matrices` 正常
+- 无论是否确认方向都不再写全局兼容文件；确认后自动写 `world_extrinsics.json`，
+  会话 `calibration.json` 可由 `save_result` / CLI `save` 生成，下游
+  `load_calibration(path)`/`stereo_matrices`/`GET /api/calib/matrices` 正常
 - 新会话载入内外参后基线/方向确认状态恢复；不兼容棋盘格、不兼容内参或缺失文件会被拒绝，
   且不清除当前有效结果
 - 最新内参/外参文件写入失败时仍返回计算结果，并报告 `latest_error`/`save_errors`
@@ -594,7 +596,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
    如果实际板面高与填写值不符，基于地面的高度会整体偏移。
 9. **最新文件是“最近一次成功求解”**：`world_extrinsics.json` 会被下一次 solvePnP 覆盖
    （包括待确认结果）；`intrinsics.json` 按相机合并，某台失败不会覆盖该相机旧值。
-   兼容 `calibration.json` 只在方向已确认时更新，待确认结果不会替换上一次已确认配置。
+   完整 `calibration.json` 只存在于会话目录，按需保存，不再维护全局兼容副本。
 10. **载入外参需要匹配当前内参与板规格**：文件里保存了内参快照和棋盘格/世界系定义；
     重新计算内参、改板面高或换会话规格后，旧外参文件会被判为不兼容，必须重新 solvePnP。
 11. **LED 等边三角形 120° 对称未解**：L0/L1/L2 只是临时显示编号；本版本不输出唯一
@@ -619,7 +621,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 17. **自动会话不会清空结果**：页面初始化调用 `/api/calib/session/ensure`，已有会话
     直接复用；没有才创建。服务重启后内存里的会话/结果会重新建立，最新内外参仍在
     `intrinsics.json` / `world_extrinsics.json`，需要点“载入内参 / 载入世界坐标系外参”
-    恢复；载入外参会按既有逻辑更新兼容 `calibration.json`。
+    恢复；载入外参只更新内存与最新外参文件，不再生成全局兼容文件。
 
 ---
 

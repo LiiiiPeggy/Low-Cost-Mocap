@@ -44,11 +44,11 @@
 - 内参采集必须覆盖画面四角：只用中央棋盘会让高阶畸变互相补偿，RMS 很低但画面边缘外推可错约 **20 px**；补采四角后约 **1.6 px**。已有 `radius_coverage.ratio < 0.75` 告警。
 - 覆盖率门限：内参 `MIN_COVERAGE = 0.8%`；固定板外参/验证 `MIN_COVERAGE_EXTRINSIC = 0.1%`。0.1%–0.8% 的样本会入库，但带“覆盖率偏低，位姿/深度精度会下降”告警。
 - 指标名不可混用：`max_reprojection_rms_px`（重投影）与 `consistency_max_mm`（三角化角点 vs 已知世界点，毫米）含义不同；`spacing_abs_error_mm` 已修正为毫米并带 `unit`，旧结果读取时幂等迁移一次。
-- 结果生命周期：新采集会使依赖结果失效；改 180° 会作废旧外参与方向确认；重载会话可恢复已保存结果；只有“两台内参 + 已确认外参”才自动更新兼容文件 `api/calibration/calibration.json`。
+- 结果生命周期：新采集会使依赖结果失效；改 180° 会作废旧外参与方向确认；重载会话可恢复已保存结果。完整结果只按需写会话目录 `calibration.json`；旧全局兼容文件 `api/calibration/calibration.json` 及其读写逻辑已移除，不再重新生成。
 - 采集不重开相机，直接从运行中的 `CameraManager` / `SyncService` 取帧；每次要求新序号，最多等待约 1.5 s。验证同步帧对按 `(seq_a, seq_b)` 去重，外参“采集双相机图片”按 `pair_seq` 去重。
 - CLI 默认经 HTTP 复用运行中的 `preview_server.py` 相机；`--local` 才在当前进程采集；服务未运行时 `new` 可本地建会话。
 - 数据默认在 `computer_code/captures/calibration/<session_id>/`；对外写项目相对路径，内部解析为绝对路径（不依赖启动 CWD）；旧绝对路径仍可读。
-- **合成自检通过 ≠ 实机精度**。历史自检：`cd7e991` 77/77、`c353edf` 102/102、当前工作区 136/136（2026-11-17 复跑）。
+- **合成自检通过 ≠ 实机精度**。历史自检：`cd7e991` 77/77、`c353edf` 102/102、当前工作区 calibration 139/139 + LED 50/50（2026-11-17 复跑）。
 
 ## 红外 LED 检测与三角化
 

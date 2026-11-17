@@ -1,6 +1,6 @@
 # PROGRESS — 当前状态
 
-> 快照日期：**2026-11-17**。分支 `main`；上一提交 `c353edf`，本批改动已随本次提交入库（`git log -1` 可查）。
+> 快照日期：**2026-11-17**。分支 `main`；上一提交 `d74264a`，本批改动已随本次提交入库（`git log -1` 可查）。
 > 本文只描述“现在做到哪里”；长期结论见 `MEMORY.md`，决策依据见 `PROCESS.md`，操作说明见 `README.md` 与 `docs/calibration.md`。
 
 ## 当前目标
@@ -14,10 +14,10 @@
 - 双相机并发采集、MJPEG 预览、原始灰度保存：实机 1280×720@30 NV12 两路各约 30 fps；最新帧延迟约 7–35 ms，不累积。
 - 软件帧同步：60 s 实机测试 30.01 对/s、20 ms 阈值下配对率 100%、丢弃 0；`|Δt|` 均值 0.2–1.6 ms、P95 最高约 16 ms。
 - 标定链路：内参、固定板 `solvePnP` 外参、`validate_rig`、结果失效/恢复、CLI 与 HTTP 接口（已提交至 `c353edf`）。
-- 工作区改版（未提交）：内参/外参自动保存与载入、网页“采集双相机图片”、Canvas 2D 三维视图、红外 LED 检测与三角化、版本一致性、覆盖率门限放宽到 0.1%、单位修复、默认板面高 3 mm。
+- 已提交改版：内参/外参自动保存与载入、网页“采集双相机图片”、Canvas 2D 三维视图、红外 LED 检测与三角化、版本一致性、覆盖率门限放宽到 0.1%、单位修复、默认板面高 3 mm。
 - 自检（2026-11-17 在本机复跑确认）：
-  - `python -m calibration.selftest` → **136/136 通过**
-  - `python -m led.selftest` → **26/26 通过**
+  - `python -m calibration.selftest` → **139/139 通过**
+  - `python -m led.selftest` → **50/50 通过**
   - 均为合成图 / 假相机，只证明求解链路与流程，**不代表实机精度**。
 
 运行方式（无相机也可）：
@@ -34,7 +34,7 @@ python -m led.selftest
 - **内参**：`computer_code/captures/calibration/intrinsics.json`（2026-11-16 17:34，`source=migrated`，源会话 `20261116_104419`）。两台各 8 张，RMS **0.2259 / 0.077 px**，1280×720。
 - **外参**：`computer_code/captures/calibration/world_extrinsics.json`（2026-11-16 17:50，源会话 `20261116_174926`）。`orientation_confirmed=true`，基线 **560.567 mm**；每台仅 1 帧，带“外参图覆盖率偏低（s0001、s0002）”警告。
 - 以上两份新格式结果已纳入 Git 跟踪；原始采集图与 `led_params.json` 仍被 `captures/` 忽略。
-- **旧版兼容文件已删除**：`api/calibration/calibration.json` 是旧结果再保存（2026-11-16 18:23，session `20261116_182336`，`validation=null`），2026-11-17 按项目决定删除，不再作为标定结果来源。运行时只有在“两台内参 + 已确认外参”时才重新生成该兼容文件。
+- **旧版兼容文件已彻底移除**：`api/calibration/calibration.json` 及其自动写入逻辑、`/api/calib/result` 与 `/api/calib/matrices` 的默认回退读取均已删除，不再重新生成。完整结果只存在于当前会话目录的 `calibration.json`。
 - **早期实机会话**：`computer_code/captures/calibration/20261116_152637`，两台各 8 张内参图；`s0017`–`s0022` 是旧 0.8% 门限下被拒的外参样本（覆盖率 0.39–0.48%，原图已保存）。
 - 结论：**尚无“固定安装 + 人工方向确认 + 独立多位置验证”闭环的可信外参/基线**。旧 `camera-params.json` 未改写，`helpers.py` 仍按 PS3 Eye 假设，未接入当前标定输出。
 
@@ -43,7 +43,7 @@ python -m led.selftest
 - 代码：`api/calibration/{dataset,routes,service,selftest}.py`、`api/calib_cli.py`、`api/{camera_preview,index,preview_server}.py`、`api/static/preview.html`、`docs/calibration.md`。
 - 新增：`api/led/`（`detector/geometry/tracker/service/routes/selftest` 等 7 个文件）。
 - 文档：`README.md` 同步到当前实现；`memory.md` 重命名为 `MEMORY.md`，新增 `AGENTS.md`、`PROGRESS.md`、`PROCESS.md`、`CLAUDE.md`。
-- 清理：删除旧版未跟踪结果 `api/calibration/calibration.json`。
+- 清理：删除旧版全局兼容结果 `api/calibration/calibration.json` 及对应读写代码。
 - 运行产物 `captures/` 已被 `.gitignore` 忽略。
 
 ## 遗留问题与下一步

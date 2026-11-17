@@ -1191,12 +1191,6 @@ function sourceText(d) {
   if (d.source === 'computed') return '本会话计算';
   return '—';
 }
-function compatText(c) {
-  if (!c) return '';
-  if (c.updated) return '兼容文件已自动更新：' + c.path;
-  return '兼容文件未更新：' + (c.reason || '条件不满足') + '（' + c.path + '）';
-}
-
 function renderIntrinsics(st) {
   const box = el('c-intr-out');
   if (!box) return;
@@ -1294,7 +1288,6 @@ el('c-intr').onclick = async () => {
     if (r.extrinsic_invalidated) {
       cLog('  ! 内参已变化，旧世界系外参已失效，请重新解外参');
     }
-    if (r.compat) cLog(compatText(r.compat));
     refreshCalib();
   } catch (e) { cLog('内参标定失败：' + e.message); }
   finally { el('c-intr').disabled = false; }
@@ -1318,7 +1311,6 @@ el('c-intr-load').onclick = async () => {
     if (r.extrinsic_invalidated) {
       cLog('  ! 载入的内参与当前外参不兼容，旧外参已失效');
     }
-    if (r.compat) cLog(compatText(r.compat));
     refreshCalib();
   } catch (e) {
     const msg = e.message || '';
@@ -1411,7 +1403,6 @@ el('c-solex').onclick = async () => {
     if (r.latest_saved) cLog('自动保存成功：' + r.latest_path);
     else cLog('计算成功但文件保存失败：' + (r.latest_error || '未知错误'));
     (r.save_errors || []).forEach(e => cLog('  ! ' + e));
-    if (r.compat) cLog(compatText(r.compat));
     cConfirmSuppressed = false;
     if (r.flip_cam) {
       el('c-flip0').checked = !!(r.flip_cam['0'] !== undefined
@@ -1448,7 +1439,6 @@ el('c-ex-load').onclick = async () => {
          + `离地 ${c.height_above_floor_m.toFixed(3)} m  重投影 ${c.reprojection.rms_px}px`);
     });
     if (r.save_error) cLog('载入成功但会话副本保存失败：' + r.save_error);
-    if (r.compat) cLog(compatText(r.compat));
     refreshCalib();
   } catch (e) {
     const msg = e.message || '';
@@ -1473,7 +1463,6 @@ el('c-ex-load').onclick = async () => {
       });
       if (r.invalidated) {
         cLog('旧外参已作废；重新解外参后才会按当前方向自动保存');
-        cLog('兼容 calibration.json 仍保留上一次已确认配置，重新解外参后才会更新');
       }
     } catch (e) { cLog('作废旧外参失败：' + e.message); }
     if (el('c-vis-mode').value === 'axes') liveTick();

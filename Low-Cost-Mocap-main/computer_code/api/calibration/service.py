@@ -88,11 +88,6 @@ def project_relative(path: str) -> str:
     return rel.replace(os.sep, "/")
 
 
-# 统一兼容文件仍放在 api/calibration/calibration.json；测试可用
-# MOCAP_CALIB_RESULT 重定向，避免覆盖本机真实文件。
-DEFAULT_RESULT_PATH = resolve_path(
-    os.environ.get("MOCAP_CALIB_RESULT") or os.path.join(CALIB_DIR, "calibration.json"))
-
 _calib_env = os.environ.get("MOCAP_CALIB_DIR")
 _capture_env = os.environ.get("MOCAP_CAPTURE_DIR")
 if _calib_env:
@@ -304,14 +299,22 @@ class CalibrationService:
         return self._session
 
     @property
-    def result_path(self) -> str:
-        """最近一次保存的路径（项目相对，供界面展示）；没保存过则给默认路径。"""
-        return project_relative(self.result_path_abs)
+    def result_path(self) -> str | None:
+        """最近一次保存的路径（项目相对）；没有可用结果时返回 None。"""
+        path = self.result_path_abs
+        return project_relative(path) if path else None
 
     @property
-    def result_path_abs(self) -> str:
-        """内部读写用的绝对路径。"""
-        return self._result_path or DEFAULT_RESULT_PATH
+    def result_path_abs(self) -> str | None:
+        """最近一次保存的绝对路径；优先显式导出，其次当前会话副本。"""
+        if self._result_path:
+            return self._result_path
+        sess = self._session
+        if sess is not None:
+            path = os.path.join(sess.root, "calibration.json")
+            if os.path.isfile(path):
+                return path
+        return None
 
     def open_session(self, *, cols: int, rows: int, square_mm: float,
                      cameras=None, session_id: str | None = None,
@@ -827,13 +830,12 @@ class CalibrationService:
             latest_error = str(exc).strip().splitlines()[-1]
             save_errors.append("最新外参文件保存失败：%s" % latest_error)
 
-        compat = self._maybe_update_compat()
         out = dict(rig)
         out.update({
             "saved_to": saved_to,
             "latest_path": project_relative(DEFAULT_EXTRINSICS_PATH),
             "latest_saved": latest_saved, "latest_error": latest_error,
-            "save_errors": save_errors, "compat": compat,
+            "save_errors": save_errors,
         })
         return out
 
@@ -904,45 +906,6 @@ class CalibrationService:
             self._extrinsic = None
             self._validation = None
         return True
-
-    def _compat_info(self) -> dict:
-        """给界面显示兼容文件来源，避免把历史 calibration.json 当成当前结果。"""
-        path = self.result_path_abs
-        info = {"path": self.result_path, "exists": os.path.isfile(path)}
-        if not info["exists"]:
-            return info
-        try:
-            data = _read_json_file(path)
-            info["created"] = data.get("created")
-            info["session_id"] = (data.get("session") or {}).get("session_id")
-            ext = data.get("extrinsics") or {}
-            info["baseline_m"] = ext.get("baseline_m")
-            info["orientation_confirmed"] = ext.get("orientation_confirmed")
-        except (OSError, ValueError) as exc:
-            info["read_error"] = str(exc).strip().splitlines()[-1]
-        return info
-
-    def _maybe_update_compat(self) -> dict:
-        """两台内参 + 已确认世界系外参都有效时，自动更新兼容 calibration.json。"""
-        path = project_relative(DEFAULT_RESULT_PATH)
-        sess = self._session
-        if sess is None:
-            return {"updated": False, "path": path, "reason": "没有打开的会话"}
-        cams = [str(int(c)) for c in sess.cameras[:2]]
-        if len(cams) < 2 or any(c not in self._intrinsics for c in cams):
-            return {"updated": False, "path": path, "reason": "两台相机内参不完整"}
-        rig = self._extrinsic
-        if not rig:
-            return {"updated": False, "path": path, "reason": "没有世界系外参"}
-        if not rig.get("orientation_confirmed"):
-            return {"updated": False, "path": path,
-                    "reason": "世界坐标轴方向未确认（待确认结果不写入兼容文件）"}
-        try:
-            info = self.save_result(None)
-            return {"updated": True, "path": info.get("path", path), "reason": ""}
-        except Exception as exc:
-            return {"updated": False, "path": path,
-                    "reason": "写入失败：%s" % str(exc).strip().splitlines()[-1]}
 
     def load_intrinsics(self, path: str | None = None) -> dict:
         """从跨会话 intrinsics.json 恢复 K/D，不重新采集或重算。
@@ -1018,11 +981,9 @@ class CalibrationService:
             save_error = str(exc).strip().splitlines()[-1]
 
         extrinsic_invalidated = self._invalidate_extrinsic_if_intrinsics_changed()
-        compat = self._maybe_update_compat()
         return {"loaded": loaded, "errors": problems, "path": rel,
                 "saved_to": saved_to, "save_error": save_error,
-                "extrinsic_invalidated": extrinsic_invalidated,
-                "compat": compat}
+                "extrinsic_invalidated": extrinsic_invalidated}
 
     def load_extrinsics(self, path: str | None = None) -> dict:
         """从跨会话 world_extrinsics.json 恢复外参，不重新采集或求解。"""
@@ -1130,10 +1091,9 @@ class CalibrationService:
             saved_to = None
             save_error = str(exc).strip().splitlines()[-1]
 
-        compat = self._maybe_update_compat()
         out = dict(rig)
         out.update({"path": rel, "saved_to": saved_to,
-                    "save_error": save_error, "compat": compat})
+                    "save_error": save_error})
         return out
 
     def invalidate_extrinsic(self, reason: str = "180° 方向设置已修改") -> dict:
@@ -1353,14 +1313,12 @@ class CalibrationService:
             save_errors.append("最新内参文件保存失败：%s" % latest_error)
 
         extrinsic_invalidated = self._invalidate_extrinsic_if_intrinsics_changed()
-        compat = self._maybe_update_compat()
         return {"intrinsics": results, "errors": errors,
                 "saved_to": saved_to,
                 "latest_path": project_relative(DEFAULT_INTRINSICS_PATH),
                 "latest_saved": latest_saved, "latest_error": latest_error,
                 "save_errors": save_errors,
-                "extrinsic_invalidated": extrinsic_invalidated,
-                "compat": compat}
+                "extrinsic_invalidated": extrinsic_invalidated}
 
     def run_stereo(self, *, exclude=(), auto_flip: bool = True,
                    flip_b: bool | None = None) -> dict:
@@ -1511,17 +1469,27 @@ class CalibrationService:
         return result
 
     def save_result(self, path: str | None = None) -> dict:
-        result = self.build_result()
-        path = resolve_path(path or DEFAULT_RESULT_PATH)
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(to_jsonable(result), fh, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
+        """保存标定结果。
 
+        不传 ``path`` 时只写当前会话目录的 ``calibration.json``；传 ``path``
+        时才额外导出一份。旧的全局兼容文件已废弃，不会自动生成。
+        """
+        result = self.build_result()
         sess = self._require_session()
-        sess.save_result("calibration.json", result)
-        self._result_path = path
+        session_path = sess.save_result("calibration.json", result)
+
+        if path:
+            path = resolve_path(path)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            tmp = path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(to_jsonable(result), fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+            saved_path = path
+        else:
+            saved_path = session_path
+
+        self._result_path = saved_path
         ext = result["extrinsics"] or {}
         # 两台相机**各自**的重投影 RMS 取大者；与"三角化自洽残差（毫米）"不是一回事
         rms = None
@@ -1529,7 +1497,7 @@ class CalibrationService:
             vals = [c.get("reprojection_rms_px") for c in ext["cameras"].values()]
             vals = [v for v in vals if v is not None]
             rms = round(max(vals), 4) if vals else None
-        return {"path": project_relative(path),
+        return {"path": project_relative(saved_path),
                 "baseline_m": ext.get("baseline_m"),
                 "max_reprojection_rms_px": rms,
                 "consistency_max_mm": (round(ext.get("consistency", {})
@@ -1554,7 +1522,7 @@ class CalibrationService:
         sess_summary = sess.summary() if sess else None
         if sess_summary:
             sess_summary["root"] = project_relative(sess_summary["root"])
-        compat = self._compat_info()
+        result_path_abs = self.result_path_abs
         out = {
             "session": sess_summary,
             "intrinsics": {
@@ -1577,12 +1545,12 @@ class CalibrationService:
             "latest_extrinsics": {
                 "path": project_relative(DEFAULT_EXTRINSICS_PATH),
                 "exists": os.path.isfile(DEFAULT_EXTRINSICS_PATH)},
-            "compat": compat,
             "stereo": None,
             "extrinsic": None,
             "validation": None,
             "result_path": self.result_path,
-            "result_exists": compat["exists"],
+            "result_exists": bool(result_path_abs
+                                  and os.path.isfile(result_path_abs)),
             "sync": {k: sync_st.get(k) for k in
                      ("pairs_total", "pair_rate", "max_dt_ms", "last_dt_ms")}
                     if sync_st else None,
@@ -1667,9 +1635,15 @@ def _slim_intrinsic(d: dict) -> dict:
 # ---------------------------------------------------------------------------
 # 供后续三维定位用的加载接口（采集模块不需要它）
 # ---------------------------------------------------------------------------
-def load_calibration(path: str | None = None) -> dict:
-    """读取并做基本一致性检查。**不修改** calibration.json。"""
-    path = resolve_path(path or DEFAULT_RESULT_PATH)
+def load_calibration(path: str) -> dict:
+    """读取并做基本一致性检查。**不修改** calibration.json。
+
+    路径必须显式给出（会话目录下的 ``calibration.json`` 或显式导出的文件）；
+    不再回退到已废弃的全局兼容文件。
+    """
+    if not path:
+        raise ValueError("必须提供标定结果文件路径")
+    path = resolve_path(path)
     if not os.path.isfile(path):
         raise FileNotFoundError("没有标定结果文件：%s（请先完成标定并保存）" % path)
     with open(path, encoding="utf-8") as fh:

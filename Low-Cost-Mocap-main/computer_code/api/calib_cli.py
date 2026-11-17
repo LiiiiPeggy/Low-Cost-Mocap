@@ -10,8 +10,8 @@
     python api/calib_cli.py intrinsic --session <dir>
     python api/calib_cli.py stereo    --session <dir>
     python api/calib_cli.py validate-rig --session <dir> --holdout
-    python api/calib_cli.py save      --session <dir>
-    python api/calib_cli.py info
+    python api/calib_cli.py save      --session <dir> [--out <file>]
+    python api/calib_cli.py info      --result <dir>/calibration.json
 
 ``intrinsic / stereo / validate-rig / save / detect`` **不需要相机在线**：它们只读
 会话目录里的原始 PNG 和 samples.json，可以换一台机器离线重算。
@@ -35,8 +35,7 @@ import calibration.routes  # noqa: E402,F401  （确保包可导入，同时注�
 from calibration import board as B  # noqa: E402
 from calibration.dataset import Session  # noqa: E402
 from calibration.service import (  # noqa: E402
-    DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, project_relative, resolve_path,
-    service,
+    DEFAULT_SESSION_ROOT, project_relative, resolve_path, service,
 )
 
 # 相机线程只存在于跑着 preview_server 的那个进程里，所以采集默认走 HTTP。
@@ -441,11 +440,6 @@ def cmd_intrinsic(args) -> int:
               file=sys.stderr)
     for msg in (r.get("save_errors") or []):
         print("  ! %s" % msg, file=sys.stderr)
-    if r.get("compat"):
-        c = r["compat"]
-        print("兼容 calibration.json：%s"
-              % ("已更新 " + c["path"] if c.get("updated")
-                 else "未更新（%s）" % c.get("reason")))
     print("\n中间结果：%s" % (r.get("saved_to") or "未保存（见上方错误）"))
     return 0
 
@@ -506,11 +500,6 @@ def cmd_extrinsic(args) -> int:
               file=sys.stderr)
     for msg in (rig.get("save_errors") or []):
         print("  ! %s" % msg, file=sys.stderr)
-    if rig.get("compat"):
-        c = rig["compat"]
-        print("兼容 calibration.json：%s"
-              % ("已更新 " + c["path"] if c.get("updated")
-                 else "未更新（%s）" % c.get("reason")))
     print("\n中间结果：%s"
           % (rig.get("saved_to") or "未保存（见上方错误）"))
     return 0
@@ -550,7 +539,7 @@ def cmd_save(args) -> int:
 
 
 def cmd_info(args) -> int:
-    path = resolve_path(args.result or DEFAULT_RESULT_PATH)
+    path = resolve_path(args.result)
     if not os.path.isfile(path):
         _die("没有标定结果文件：%s" % path)
     with open(path, encoding="utf-8") as fh:
@@ -686,9 +675,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="强制翻转相机1角点顺序")
     sp.set_defaults(func=cmd_stereo)
 
-    sp = sub.add_parser("save", help="求解并保存 calibration.json（离线）")
+    sp = sub.add_parser("save", help="保存当前会话的标定结果（离线）")
     sp.add_argument("--session", required=True)
-    sp.add_argument("--out", default=None, help="输出路径（默认 api/calibration/calibration.json）")
+    sp.add_argument("--out", default=None,
+                    help="可选导出路径；不传时只写会话目录 calibration.json")
     sp.add_argument("--intrinsic", default=None)
     sp.add_argument("--exclude", nargs="*", default=())
     sp.add_argument("--flip180", action="store_true")
@@ -699,7 +689,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_save)
 
     sp = sub.add_parser("info", help="查看已保存的标定结果")
-    sp.add_argument("--result", default=None)
+    sp.add_argument("--result", required=True,
+                    help="会话目录下的 calibration.json 或显式导出的结果文件")
     sp.set_defaults(func=cmd_info)
     return p
 

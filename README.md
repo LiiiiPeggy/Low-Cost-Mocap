@@ -205,11 +205,13 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
   自洽残差只有约 0.6 mm，指标不会报警。两台相机可以各自独立翻转 180°。
 - 结果自动保存：内参 → `captures/calibration/intrinsics.json`，外参 →
   `captures/calibration/world_extrinsics.json`，均可从网页重新载入；这两份新格式结果已纳入 Git。
-  只有「两台内参 + 已确认外参」才会额外生成兼容文件 `api/calibration/calibration.json`
-  （schema v2，供旧下游读取）。原始采集图仍在 `captures/` 下并被忽略；旧 `camera-params.json` **未改动**。
+  完整合并结果只写当前会话目录的 `calibration.json`；旧版全局兼容文件
+  `api/calibration/calibration.json` 已删除且不会再生成。原始采集图仍在 `captures/` 下并被忽略；
+  旧 `camera-params.json` **未改动**。
 - 默认板面高 **3 mm**；数据目录为 `computer_code/captures/calibration/<session_id>/`。
-- 下游取参数：`calibration.service.load_calibration()` + `stereo_matrices(data, scaled_size=...)`，
-  或 `GET /api/calib/matrices?size=640x360`。
+- 下游取参数：`calibration.service.load_calibration(path)` + `stereo_matrices(data, scaled_size=...)`
+  （`path` 必须是会话 `calibration.json` 或显式导出文件），或 `GET /api/calib/matrices?size=640x360`
+  （默认读取当前会话结果）。
 
 **接口**
 
@@ -228,7 +230,7 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | POST | `/api/calib/validate/capture` | 采同步帧并做三维精度验证 |
 | POST | `/api/calib/validate/rig` | 用已有验证帧重新计算 |
 | POST | `/api/calib/stereo` | stereoCalibrate 交叉校验（非主路线） |
-| POST | `/api/calib/save` | 写兼容文件 `calibration.json` |
+| POST | `/api/calib/save` | 写当前会话 `calibration.json`；可选 `path` 额外导出 |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
 | GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
 | GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` 等 | LED 检测、参数、ROI、调试保存与三维定位 |
@@ -241,15 +243,15 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 ```bat
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
-python -m calibration.selftest   :: 136/136
+python -m calibration.selftest   :: 139/139
 python -m led.selftest           :: 50/50
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
-同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、兼容文件、
+同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、会话结果、
 LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
 ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存与接口。
-最近一次（2026-11-17）：**136/136 + 50/50 通过**。
+最近一次（2026-11-17）：**139/139 + 50/50 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
@@ -313,8 +315,8 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
   每对（0-1、0-2、0-3…）各建实例并汇总统计，调度层尚未实现。
 - 双相机同时拔插的热插拔恢复只做了断线重连逻辑（1 s 起指数退避），未做真实拔插实验。
 - **标定与 LED 仍只用合成数据 / 假相机验证**：曾采过实机标定图，但尚未形成“固定安装 + 人工方向确认 +
-  多位置独立验证”的可信闭环，仓库不包含可用的实拍标定结果。旧版 `api/calibration/calibration.json`
-  已删除；真实 RMS、基线、畸变系数必须现场采集后重新求解。
+  多位置独立验证”的可信闭环，仓库不包含可用的实拍标定结果。旧版全局兼容文件
+  `api/calibration/calibration.json` 及其读写代码已移除；真实 RMS、基线、畸变系数必须现场采集后重新求解。
 - 合成数据下画面**四角的畸变外推**误差约 1.6 px（补采四角后从 20 px 降到这里），
   实机需按 `radius_coverage.ratio` 自查是否覆盖足够。
 - 标定 UI 只在 Flask 自带 `/preview` 页验证过；React 侧未加标定面板，也未构建。

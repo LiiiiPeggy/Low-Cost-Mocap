@@ -12,9 +12,7 @@ from flask import Blueprint, Response, jsonify, request, send_file
 
 from calibration import board as board_mod
 from calibration import intrinsic as intr_mod
-from calibration.service import (
-    DEFAULT_RESULT_PATH, load_calibration, service, stereo_matrices,
-)
+from calibration.service import load_calibration, service, stereo_matrices
 
 bp = Blueprint("calibration", __name__)
 
@@ -417,13 +415,16 @@ def calib_save():
 
 @bp.get("/api/calib/result")
 def calib_result():
-    """查看当前标定结果（优先内存里刚算的，没有就读已保存的文件）。"""
+    """查看当前标定结果（内存优先，其次是当前会话保存的 calibration.json）。"""
     try:
-        st = service().status()
+        svc = service()
+        st = svc.status()
         if st.get("intrinsics") or st.get("stereo"):
-            return jsonify(service().build_result())
-        data = load_calibration(DEFAULT_RESULT_PATH)
-        return jsonify(data)
+            return jsonify(svc.build_result())
+        path = svc.result_path_abs
+        if not path:
+            raise FileNotFoundError("没有可用的标定结果（请先完成标定并保存）")
+        return jsonify(load_calibration(path))
     except FileNotFoundError as exc:
         return _fail(exc, 404)
     except Exception as exc:
@@ -435,8 +436,9 @@ def calib_matrices():
     """给下游三维定位用：直接给出 (K0,D0,K1,D1,R,T)，可选按新分辨率缩放。"""
     try:
         svc = service()
-        path = (request.args.get("path")
-                or getattr(svc, "result_path", None) or DEFAULT_RESULT_PATH)
+        path = request.args.get("path") or svc.result_path_abs
+        if not path:
+            raise FileNotFoundError("没有可用的标定结果（请先完成标定并保存）")
         data = load_calibration(path)
         want = request.args.get("size")
         size = tuple(int(v) for v in want.lower().split("x")) if want else None

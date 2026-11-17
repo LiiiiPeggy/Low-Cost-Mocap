@@ -1088,14 +1088,14 @@ def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
 
 
 # ---------------------------------------------------------------------------
-# 用例 13：最新内外参自动保存、跨会话载入与兼容文件
+# 用例 13：最新内外参自动保存、跨会话载入与会话结果
 # ---------------------------------------------------------------------------
 def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
     print("\n[13] 最新内外参自动保存与跨会话载入")
     import calibration.service as SVC
     from camera_manager import Frame
     from calibration.service import (
-        DEFAULT_EXTRINSICS_PATH, DEFAULT_INTRINSICS_PATH, DEFAULT_RESULT_PATH,
+        DEFAULT_EXTRINSICS_PATH, DEFAULT_INTRINSICS_PATH,
         load_calibration, stereo_matrices,
     )
 
@@ -1121,8 +1121,9 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
               "K", "D", "rms_px", "image_size", "num_views",
               "coverage_ratio", "created")) for k in ("0", "1")),
           sorted(icams))
-    check("未确认外参时不写兼容 calibration.json",
-          (r.get("compat") or {}).get("updated") is False, r.get("compat"))
+    check("内参计算不再返回/写全局兼容文件",
+          "compat" not in r
+          and not os.path.isfile(os.path.join(SVC.CALIB_DIR, "calibration.json")))
 
     # 保存失败：把目标路径换成一个目录，计算仍应返回结果
     real_intr_path = SVC.DEFAULT_INTRINSICS_PATH
@@ -1157,7 +1158,7 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
     check("载入内参在会话结果里标记 loaded_from（不冒充重新计算）",
           b_intr.get("loaded_from") == rl.get("path"), b_intr.get("loaded_from"))
 
-    # 外参：未确认 -> 待确认文件；确认 -> 兼容文件
+    # 外参：未确认/已确认都只写会话结果和最新外参文件
     C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
     img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
     img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
@@ -1179,10 +1180,11 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
                                       flip_cam={"0": False, "1": False})
         with open(DEFAULT_EXTRINSICS_PATH, encoding="utf-8") as fh:
             pdata = json.load(fh)
-        check("未确认方向的外参保存为待确认，且不写兼容文件",
+        check("未确认方向的外参保存为待确认，且不写全局兼容文件",
               pdata.get("orientation_confirmed") is False
-              and (pending.get("compat") or {}).get("updated") is False,
-              pending.get("compat"))
+              and "compat" not in pending
+              and not os.path.isfile(os.path.join(SVC.CALIB_DIR,
+                                                  "calibration.json")))
 
         rig = svc.solve_extrinsic(orientation_confirmed=True,
                                   flip_cam={"0": False, "1": False})
@@ -1201,19 +1203,36 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
               and (edata.get("relative") or {}).get("R_10") is not None
               and (edata.get("intrinsics") or {}).get("0") is not None,
               edata.get("baseline_m"))
-        check("两台内参 + 已确认外参自动更新兼容 calibration.json",
-              (rig.get("compat") or {}).get("updated") is True
-              and os.path.isfile(DEFAULT_RESULT_PATH), rig.get("compat"))
-        cdata = load_calibration(DEFAULT_RESULT_PATH)
+        check("已确认外参不再写全局兼容文件",
+              "compat" not in rig
+              and not os.path.isfile(os.path.join(SVC.CALIB_DIR,
+                                                  "calibration.json")))
+
+        saved = svc.save_result(None)
+        session_result = os.path.join(svc.session.root, "calibration.json")
+        check("save_result 默认只写当前会话副本",
+              os.path.isfile(session_result)
+              and saved.get("path") == os.path.relpath(
+                  session_result, SVC.PROJECT_DIR).replace(os.sep, "/"),
+              saved.get("path"))
+        cdata = load_calibration(session_result)
         K0, D0, K1, D1, R, T = stereo_matrices(cdata)
-        check("兼容 calibration.json 的下游矩阵读取正常",
+        check("会话 calibration.json 的下游矩阵读取正常",
               K0.shape == (3, 3) and R.shape == (3, 3) and T.shape == (3,)
               # baseline_m 落盘保留 6 位小数，T_10 未取整；差 <0.1mm 即一致
               and abs(float(np.linalg.norm(T)) - float(edata["baseline_m"])) < 1e-4,
               "baseline=%.2fmm" % (np.linalg.norm(T) * 1000))
+        try:
+            load_calibration(None)
+            no_path_error = ""
+        except ValueError as exc:
+            no_path_error = str(exc)
+        check("load_calibration 不再回退默认兼容路径",
+              "必须提供" in no_path_error, no_path_error)
+
         from preview_server import build_app
         mr = build_app().test_client().get("/api/calib/matrices")
-        check("GET /api/calib/matrices 兼容接口正常",
+        check("GET /api/calib/matrices 读取当前会话结果",
               mr.status_code == 200
               and abs(float(mr.json.get("baseline_m", 0))
                       - float(edata["baseline_m"])) < 1e-4,
@@ -1311,10 +1330,11 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
 def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     print("\n[12] 网页入口与项目相对路径")
     from calibration.service import (
-        CALIB_DIR, DEFAULT_RESULT_PATH, DEFAULT_SESSION_ROOT, MIN_COVERAGE,
+        CALIB_DIR, DEFAULT_SESSION_ROOT, MIN_COVERAGE,
         MIN_COVERAGE_EXTRINSIC, PROJECT_DIR, _normalize_validation_units,
         coverage_limit_for, project_relative,
     )
+    import calibration.service as SVC
 
     check("外参/验证覆盖率为 0.1%，内参仍为 0.8%",
           abs(MIN_COVERAGE_EXTRINSIC - 0.001) < 1e-12
@@ -1326,15 +1346,16 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     check("项目相对路径 helper 以 computer_code 为基准",
           project_relative(os.path.join(PROJECT_DIR, "captures", "calibration"))
           == "captures/calibration"
-          and project_relative(os.path.join(CALIB_DIR, "calibration.json"))
-          == "api/calibration/calibration.json",
-          project_relative(os.path.join(CALIB_DIR, "calibration.json")))
+          and project_relative(os.path.join(CALIB_DIR, "service.py"))
+          == "api/calibration/service.py",
+          project_relative(os.path.join(CALIB_DIR, "service.py")))
     if tmp:
-        check("自检把跨会话结果/兼容文件重定向到临时目录",
-              os.path.abspath(DEFAULT_SESSION_ROOT) == os.path.abspath(tmp)
-              and os.path.abspath(DEFAULT_RESULT_PATH)
-              == os.path.abspath(os.path.join(tmp, "calibration.json")),
-              DEFAULT_RESULT_PATH)
+        check("自检把跨会话结果重定向到临时目录",
+              os.path.abspath(DEFAULT_SESSION_ROOT) == os.path.abspath(tmp),
+              DEFAULT_SESSION_ROOT)
+    check("旧版全局兼容结果常量与文件已移除",
+          not hasattr(SVC, "DEFAULT_RESULT_PATH")
+          and not os.path.isfile(os.path.join(CALIB_DIR, "calibration.json")))
 
     legacy = {"aggregate": {"spacing_abs_error_mm": {
         "mean": 0.0038, "p95": 0.0112, "max": 0.2028,
@@ -1442,10 +1463,9 @@ def main(argv=None) -> int:
     spec = B.BoardSpec(11, 8, 30.0)
 
     tmp = _selftest_dir()
-    # 自检不能覆盖本机真实的最新结果/兼容文件；在第一次 import service 前
-    # 把跨会话结果与兼容 calibration.json 都重定向到临时目录。
+    # 自检不能覆盖本机真实的最新内参/外参；在第一次 import service 前
+    # 把跨会话结果目录重定向到临时目录。
     os.environ["MOCAP_CALIB_DIR"] = tmp
-    os.environ["MOCAP_CALIB_RESULT"] = os.path.join(tmp, "calibration.json")
     keep_dir = tmp if args.keep else None
     print("自检临时目录：%s" % tmp)
     print("标定板 %dx%d 内角点（%d×%d 方格），方格 %gmm，图像 %dx%d"
