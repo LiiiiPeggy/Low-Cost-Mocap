@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import os
 
+import cv2
+import numpy as np
 from flask import Blueprint, Response, jsonify, request, send_file
 
 from calibration import board as board_mod
-from calibration import intrinsic as intr_mod
 from calibration.service import load_calibration, service, stereo_matrices
 
 bp = Blueprint("calibration", __name__)
@@ -25,6 +26,17 @@ def _fail(exc: Exception, code: int = 400):
     msg = str(exc).strip().splitlines()
     return jsonify({"error": msg[-1] if msg else type(exc).__name__,
                     "type": type(exc).__name__}), code
+
+
+def _session_options(body: dict) -> dict:
+    return {
+        "cols": int(body.get("cols", board_mod.DEFAULT_COLS)),
+        "rows": int(body.get("rows", board_mod.DEFAULT_ROWS)),
+        "square_mm": float(body.get("square_mm", board_mod.DEFAULT_SQUARE_MM)),
+        "cameras": body.get("cameras") or [0, 1],
+        "pixel_format": str(body.get("format", "")),
+        "surface_height_m": float(body.get("surface_height_mm", 3.0)) / 1000.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -43,14 +55,9 @@ def calib_session_create():
     b = _body()
     try:
         return jsonify(service().open_session(
-            cols=int(b.get("cols", board_mod.DEFAULT_COLS)),
-            rows=int(b.get("rows", board_mod.DEFAULT_ROWS)),
-            square_mm=float(b.get("square_mm", board_mod.DEFAULT_SQUARE_MM)),
-            cameras=b.get("cameras") or [0, 1],
+            **_session_options(b),
             session_id=b.get("session_id"),
-            pixel_format=str(b.get("format", "")),
             note=str(b.get("note", "")),
-            surface_height_m=float(b.get("surface_height_mm", 3.0)) / 1000.0,
             root=b.get("root") or None,
         ))
     except Exception as exc:
@@ -62,14 +69,7 @@ def calib_session_ensure():
     """页面初始化用：已有会话复用，没有才创建；多标签页幂等。"""
     b = _body()
     try:
-        return jsonify(service().ensure_session(
-            cols=int(b.get("cols", board_mod.DEFAULT_COLS)),
-            rows=int(b.get("rows", board_mod.DEFAULT_ROWS)),
-            square_mm=float(b.get("square_mm", board_mod.DEFAULT_SQUARE_MM)),
-            cameras=b.get("cameras") or [0, 1],
-            pixel_format=str(b.get("format", "")),
-            surface_height_m=float(b.get("surface_height_mm", 3.0)) / 1000.0,
-        ))
+        return jsonify(service().ensure_session(**_session_options(b)))
     except Exception as exc:
         return _fail(exc)
 
@@ -148,7 +148,6 @@ def calib_samples_clear():
 @bp.get("/api/calib/sample/<sample_id>/image")
 def calib_sample_image(sample_id: str):
     """取样本原图或角点叠加图：?cam=0&overlay=1&scale=1.0"""
-    import cv2
     try:
         sess = service().session
         if sess is None:
@@ -331,8 +330,7 @@ def calib_live_info():
     """与 /live 配合：只返回检测结论（JSON），供前端显示文字。"""
     try:
         cam = int(request.args.get("camera", 0))
-        data, info = service().detect_live(cam, scale=0.25, quality=40)
-        info.pop("jpeg", None)
+        _, info = service().detect_live(cam, scale=0.25, quality=40)
         return jsonify(info)
     except Exception as exc:
         return _fail(exc, 409)
@@ -345,21 +343,19 @@ def calib_coverage():
         if sess is None:
             return jsonify({"error": "没有打开的会话"}), 400
         cam = int(request.args.get("camera", 0))
-        dets = []
         # 覆盖率只看内参阶段，不能混入外参/验证图像
+        dets = []
         for s in sess.single_samples(cam, phase="intrinsic"):
             d = s.detections.get(str(cam)) or {}
-            det = board_mod.Detection(ok=True,
-                                      corners=_corners(d.get("corners")),
-                                      method=d.get("method", ""), quality=d.get("quality") or {})
-            dets.append(det)
+            dets.append(board_mod.Detection(
+                ok=True, corners=_corners(d.get("corners")),
+                method=d.get("method", ""), quality=d.get("quality") or {}))
         return jsonify(board_mod.coverage_map(dets, tuple(sess.image_size), sess.spec))
     except Exception as exc:
         return _fail(exc, 500)
 
 
 def _corners(raw):
-    import numpy as np
     if not raw:
         return None
     return np.asarray(raw, dtype=np.float32).reshape(-1, 1, 2)
@@ -373,8 +369,8 @@ def calib_intrinsic():
     b = _body()
     try:
         cams = b.get("cameras", b.get("camera"))
-        if isinstance(cams, str):
-            cams = cams if cams != "both" else None
+        if cams == "both":
+            cams = None
         return jsonify(service().run_intrinsic(cams, exclude=b.get("exclude") or ()))
     except Exception as exc:
         return _fail(exc)

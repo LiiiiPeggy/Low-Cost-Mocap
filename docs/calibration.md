@@ -379,7 +379,7 @@ QueryInterface 后直接 GetRange/Get/Set，Media Foundation 的 SourceReader �
 成功。`GET/POST /api/cameras/controls` 返回范围、当前值、自动/手动能力和读回结果；成功设置
 按 USB 设备实例路径保存到 `captures/calibration/camera_controls.json`，相机重新打开或服务
 重启时自动恢复并读回验证（暂停/自动模式也会恢复），不再每 5 秒轮询设备属性。
-旧的 `helpers.py`（pseyepy exposure/gain）仍未使用。
+原作者的 `helpers.py` / pseyepy 通路已从运行代码删除，源码保留在 `upstream/`。
 
 ### 6.5 网页版本与刷新
 
@@ -387,7 +387,7 @@ QueryInterface 后直接 GetRange/Get/Set，Media Foundation 的 SourceReader �
   页面顶部 `#build` 显示该版本，不再写死字符串。
 - 页面每 2 s 检查一次版本；若 `git_sha` 或 `started_at` 变化（服务重启/更新），显示
   “服务已更新，请刷新页面”与刷新按钮，**不会自动刷新**。
-- API 始终同源；移除了 3001/3002 端口自动回退，普通 400/404/500 原样显示。
+- API 始终同源，网页只由 3002 提供；不再保留旧 3001 后端或端口回退。
 - `/preview`、`/api/version`、`/api/led/state`、`/api/led/overlay_pair` 使用 `no-store`；
   标定面板默认展开、页面初始化自动复用/创建会话；LED 状态 4 Hz，后台标签页降频；
   同步帧/参数变化才重新处理，避免重复三角化。
@@ -572,7 +572,7 @@ python -m calibration.selftest --keep     :: 保留渲染图
 - LED 专项：卡尔曼匀速速度/位置、短时预测、超时丢失
 - LED 服务：同一 `pair_seq` 不重复处理、新帧处理、二维叠加图、局部放大、调试帧保存
 - LED 参数：共用参数/单相机分离覆盖/ROI/动态跟踪可保存并恢复默认
-- 版本接口返回 Git 版本；页面含版本横幅/刷新按钮；前端无 3001/3002 回退
+- 版本接口返回 Git 版本；页面含版本横幅/刷新按钮；前后端同源且无旧 3001 回退
 
 **这不是实机精度**：合成图没有镜头杂散光、板面不平、运动模糊、滚动快门和 USB 传输抖动。
 实机必须自己采数据重跑。
@@ -627,21 +627,22 @@ python -m calibration.selftest --keep     :: 保留渲染图
 
 ---
 
-## 11. 与旧动捕代码的差异（本次不改，但下游必须知道）
+## 11. 与原作者旧动捕代码的差异（历史记录）
 
-`api/helpers.py` 的 `Cameras` 是原项目（pseyepy + PS3 Eye）通路，与本模块互不依赖。
-若要把标定结果接进旧动捕算法，以下位置必须适配，否则 K 与图像对不上：
+原作者基于 pseyepy / PS3 Eye、Flask-SocketIO 3001 和 ESP32 的链路已从本仓库运行代码中删除，
+完整源码见 `upstream/`。下表路径均指 upstream 原项目，只用于解释为什么新标定结果不能直接
+套进旧图像流水线：
 
-| 位置 | 问题 |
+| upstream 位置 | 问题 |
 |---|---|
 | `helpers.py:79` | `np.rot90(frames[i], k=rotation)` 旋转图像，新 K 不适用 |
 | `helpers.py:80` | `make_square()` 补边成方图，**主点被平移但 K 没改** |
-| `helpers.py:81` | `cv.undistort()` 用 `camera-params.json` 的 320×320 占位参数，对 1280×720 无效 |
+| `helpers.py:81` | `cv.undistort()` 用旧 320×320 占位参数，对 1280×720 无效 |
 | `helpers.py:82` | 去畸变后 `GaussianBlur`，会改变角点几何（标定链路没这一步） |
 | `helpers.py:238-244` | `projectPoints(..., np.array([]))` 忽略畸变，仅在输入图已去畸变时自洽 |
 | `helpers.py:314` / `361` | `P = intrinsic_matrix @ RT` 用旧 K，与当前分辨率不匹配 |
 | `index.py:274` | `cv.sfm.essentialFromFundamental` 需 opencv-contrib，当前环境 `has sfm: False` |
 | `index.py:266-297` | 旧外参对每对相机都取 `get_camera_params(0/1)`，四相机会用错内参 |
 
-结论：下游请以 `calibration.json` 为唯一来源，并遵守"原始 1280×720 未旋转、未补边、
-未去畸变"的约定；不要在旧链路的图像上直接套新 K。
+结论：下游请以当前会话 `calibration.json` 为唯一来源，并遵守“原始 1280×720 未旋转、未补边、
+未去畸变”的约定；不要复用 upstream 旧流水线。

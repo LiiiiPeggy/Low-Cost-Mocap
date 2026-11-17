@@ -25,7 +25,7 @@
 
 **实测**：两路 NV12 1280×720@30 各约 30 fps；最新帧滞后 20.7 ms 不增长；MJPEG 单路约 26–30 fps；设备独占，重复 open 报 `0xC00D3704`。
 **预览页修复**：后端自动启动相机后，`<img>` 曾没有挂上 MJPEG 流地址；现按后端状态自动挂流，首帧超时/解码失败时降级为 snapshot 轮询。
-**未验证**：React/Vite 页面（本机无 `node_modules`，npm registry 不可达）。
+**当前网页**：3002 `/preview`（`api/static/preview.html`，原生 JS + Canvas）。原 React/Vite 页面已删除，源码保留在 `upstream/`。
 
 ## 3. 软件帧同步（`96b6c7e`）
 
@@ -107,7 +107,7 @@
 - 内参迁移：`intrinsics.json` 的 RMS 0.2259/0.077 px 来自会话 `20261116_104419`，标记 `source=migrated`。该文件与世界系外参 `world_extrinsics.json` 已于 2026-11-17 纳入 Git；原始采集图仍忽略。
 - `20261116_174926`：完成“已确认”外参求解，基线 **560.567 mm**，每台仅 1 帧且覆盖率偏低。
 - 旧全局 `api/calibration/calibration.json` 于 2026-11-17 删除；其自动写入逻辑和 `/api/calib/result`、`/api/calib/matrices` 的默认回退读取也已移除，不再重新生成。完整结果只存在于会话目录 `calibration.json`。
-- 旧 `camera-params.json` 的 320 像素参数未改写；`helpers.py` 仍按 PS3 Eye 的 `rot90`、`make_square`、旧内参和 `cv2.sfm` 假设，尚未接入当前标定输出。
+- 旧 `camera-params.json`、`helpers.py`、3001 后端、React 网页和 ESP32 固件已从运行代码删除，原作者实现保留在 `upstream/`；当前标定输出不进入旧 PS3 Eye 图像流水线。
 
 ## 9. 相关提交与文档
 

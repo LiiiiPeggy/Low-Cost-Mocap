@@ -31,7 +31,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime
 
 import cv2

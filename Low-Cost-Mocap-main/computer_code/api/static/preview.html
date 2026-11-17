@@ -124,15 +124,6 @@
     position: absolute; left: 8px; top: 6px; color: #cbd5e1; font-size: 11px;
     background: rgba(16,19,26,.55); padding: 1px 6px; border-radius: 4px;
   }
-  #calib .out {
-    margin-top: 8px; font: 12px/1.65 ui-monospace, Consolas, monospace; color: #374151;
-    max-height: 240px; overflow: auto; background: #fff;
-    border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px;
-  }
-  /* 每条日志独立成行：不依赖单个 textContent 里的 \n，长行自动换行、无空行 */
-  #calib .out .logline {
-    white-space: pre-wrap; word-break: break-word; margin: 0; padding: 0;
-  }
   #calib .badge {
     font-size: 11px; padding: 1px 6px; border-radius: 999px;
     border: 1px solid #e3e9f1; background: #eef2f7; color: #51607a;
@@ -230,7 +221,6 @@
   }
   #led-section .roi-grid input[type="number"] { width: 100%; min-width: 58px; }
   #led-section .roi-grid .head { font-weight: 600; color: var(--fg); }
-  #led-section .led-legend { color: #98a1b0; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -560,7 +550,6 @@
 <script>
 const CAMERAS = [0, 1];
 let running = false;
-let timer = null;
 
 const el = (id) => document.getElementById(id);
 const panelsEl = el('panels');
@@ -606,9 +595,9 @@ buildPanels();
 // 始终同源。页面由 preview_server 自己提供，不再直连/回退到 3001、3002 等端口。
 const apiUrl = (p) => p;
 
-async function _getJson(path, opts) {
-  const o = Object.assign({ cache: 'no-store' }, opts || {});
-  const r = await fetch(apiUrl(path), o);
+// HTTP 4xx/5xx 原样反馈，不做任何端口回退。
+async function api(path, opts) {
+  const r = await fetch(path, Object.assign({ cache: 'no-store' }, opts || {}));
   const txt = await r.text();
   let data = {};
   try { data = JSON.parse(txt); } catch (e) { data = { error: txt }; }
@@ -619,11 +608,6 @@ async function _getJson(path, opts) {
     throw err;
   }
   return data;
-}
-
-async function api(path, opts) {
-  // 同源请求；HTTP 4xx/5xx 原样反馈，不做任何端口回退。
-  return _getJson(path, opts);
 }
 
 // ---------- 显示通道：优先 MJPEG，不通则降级为快照轮询 ----------
@@ -752,7 +736,6 @@ async function refresh() {
     const st = await api('/api/cameras');
     const now = Date.now() / 1000;
     const live = st.cameras.filter(c => c.state === 'streaming').length;
-    const want = (st.defaults && st.defaults.indices ? st.defaults.indices : CAMERAS).length;
     summaryEl.textContent = `在线 ${live}/${st.count} 路 · ${new Date(st.server_time * 1000).toLocaleTimeString('zh-CN', { hour12: false })}`;
 
     st.cameras.forEach(c => {
@@ -1005,6 +988,7 @@ el('btn-sync-save').onclick = async () => {
 // 页面关闭/刷新时断开长连接，后端线程不受影响
 window.addEventListener('beforeunload', () => {
   CAMERAS.forEach(i => stopChannel(i));
+  stopCalibLive();
 });
 
 refresh();
@@ -1028,7 +1012,7 @@ el('ctrl-restore').onclick = async () => {
     log('恢复曝光/增益失败：' + e.message);
   } finally { el('ctrl-restore').disabled = false; }
 };
-timer = setInterval(refresh, 1000);
+setInterval(refresh, 1000);
 
 // 版本一致性：版本号由后端 Git 信息提供，避免写死字符串。
 // 检测到服务重启或代码版本变化时只提示刷新，不自动刷新页面。
@@ -1071,7 +1055,6 @@ const cOut = el('c-out');
 let cLiveTimer = null;
 let cLiveBusy = false;
 const cLiveUrl = {};
-let cValidation = null;        // 最近一次三维精度验证结果（status/接口返回）
 let cConfirmSuppressed = false; // 改 180°/重新采集后，禁止状态轮询把“已确认”自动勾回去
 let cBackendOnline = null;      // 用于区分“后端没开”和“还没有结果”
 
@@ -1190,6 +1173,22 @@ function sourceText(d) {
   if (d.source === 'loaded') return '载入自 ' + (d.loaded_from || '历史文件');
   if (d.source === 'computed') return '本会话计算';
   return '—';
+}
+function applyResultFlags(r) {
+  cConfirmSuppressed = false;
+  if (r.flip_cam) {
+    el('c-flip0').checked = !!(r.flip_cam['0'] !== undefined
+                               ? r.flip_cam['0'] : r.flip_cam[0]);
+    el('c-flip1').checked = !!(r.flip_cam['1'] !== undefined
+                               ? r.flip_cam['1'] : r.flip_cam[1]);
+  }
+  el('c-confirmed').checked = r.orientation_confirmed === true;
+}
+function logLoadError(prefix, e) {
+  const msg = e.message || '';
+  if (/不存在/.test(msg)) cLog('文件不存在：' + msg);
+  else if (/不兼容/.test(msg)) cLog('参数不兼容：' + msg);
+  else cLog(prefix + '失败：' + msg);
 }
 function renderIntrinsics(st) {
   const box = el('c-intr-out');
@@ -1313,10 +1312,7 @@ el('c-intr-load').onclick = async () => {
     }
     refreshCalib();
   } catch (e) {
-    const msg = e.message || '';
-    if (/不存在/.test(msg)) cLog('文件不存在：' + msg);
-    else if (/不兼容/.test(msg)) cLog('参数不兼容：' + msg);
-    else cLog('载入内参失败：' + msg);
+    logLoadError('载入内参', e);
   } finally { el('c-intr-load').disabled = false; }
 };
 
@@ -1403,14 +1399,7 @@ el('c-solex').onclick = async () => {
     if (r.latest_saved) cLog('自动保存成功：' + r.latest_path);
     else cLog('计算成功但文件保存失败：' + (r.latest_error || '未知错误'));
     (r.save_errors || []).forEach(e => cLog('  ! ' + e));
-    cConfirmSuppressed = false;
-    if (r.flip_cam) {
-      el('c-flip0').checked = !!(r.flip_cam['0'] !== undefined
-                                 ? r.flip_cam['0'] : r.flip_cam[0]);
-      el('c-flip1').checked = !!(r.flip_cam['1'] !== undefined
-                                 ? r.flip_cam['1'] : r.flip_cam[1]);
-    }
-    el('c-confirmed').checked = r.orientation_confirmed === true;
+    applyResultFlags(r);
     refreshCalib();
   } catch (e) { cLog('解外参失败：' + e.message); }
   finally { el('c-solex').disabled = false; }
@@ -1424,14 +1413,7 @@ el('c-ex-load').onclick = async () => {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
     cLog('载入世界坐标系外参成功：' + r.path);
-    cConfirmSuppressed = false;
-    if (r.flip_cam) {
-      el('c-flip0').checked = !!(r.flip_cam['0'] !== undefined
-                                 ? r.flip_cam['0'] : r.flip_cam[0]);
-      el('c-flip1').checked = !!(r.flip_cam['1'] !== undefined
-                                 ? r.flip_cam['1'] : r.flip_cam[1]);
-    }
-    el('c-confirmed').checked = r.orientation_confirmed === true;
+    applyResultFlags(r);
     cLog(`  基线 ${(r.baseline_m * 1000).toFixed(2)} mm，方向已确认=`
        + (r.orientation_confirmed ? '是' : '否'));
     Object.entries(r.cameras || {}).forEach(([cam, c]) => {
@@ -1441,10 +1423,7 @@ el('c-ex-load').onclick = async () => {
     if (r.save_error) cLog('载入成功但会话副本保存失败：' + r.save_error);
     refreshCalib();
   } catch (e) {
-    const msg = e.message || '';
-    if (/不存在/.test(msg)) cLog('文件不存在：' + msg);
-    else if (/不兼容/.test(msg)) cLog('参数不兼容：' + msg);
-    else cLog('载入世界坐标系外参失败：' + msg);
+    logLoadError('载入世界坐标系外参', e);
   } finally { el('c-ex-load').disabled = false; }
 };
 
@@ -1494,7 +1473,6 @@ el('c-vis-mode').onchange = () => {
 };
 
 // ---- 红外 LED 检测与定位 ----
-let ledParams = null;
 let ledPollBusy = false;
 let ledParamsBusy = false;
 let ledHiddenTick = 0;
@@ -1518,8 +1496,11 @@ function numOrNull(id) {
 function setInput(id, value) {
   el(id).value = (value === null || value === undefined) ? '' : value;
 }
+const LED_PER_CAM_IDS = {
+  threshold: 'l-thr', min_area: 'l-mina',
+  max_area: 'l-maxa', min_peak_distance: 'l-peak',
+};
 function populateLedParams(p) {
-  ledParams = p || {};
   const c = p.params || {};
   const o = p.overrides || {};
   setInput('l-thr', c.threshold);
@@ -1537,9 +1518,7 @@ function populateLedParams(p) {
   setInput('l-epi', c.epipolar_tol_px);
   setInput('l-reproj', c.reprojection_tol_px);
   setInput('l-tri', c.triangle_tol_mm);
-  ['threshold', 'min_area', 'max_area', 'min_peak_distance'].forEach(k => {
-    const base = { threshold: 'l-thr', min_area: 'l-mina',
-                   max_area: 'l-maxa', min_peak_distance: 'l-peak' }[k];
+  Object.entries(LED_PER_CAM_IDS).forEach(([k, base]) => {
     setInput(base + '-0', (o['0'] || {})[k]);
     setInput(base + '-1', (o['1'] || {})[k]);
   });
@@ -1615,11 +1594,9 @@ function collectLedParams() {
     }
   }
   const overrides = {};
-  const map = { threshold: 'l-thr', min_area: 'l-mina',
-                max_area: 'l-maxa', min_peak_distance: 'l-peak' };
   [0, 1].forEach(cam => {
     const o = {};
-    Object.entries(map).forEach(([key, id]) => {
+    Object.entries(LED_PER_CAM_IDS).forEach(([key, id]) => {
       const v = numOrNull(id + '-' + cam);
       if (v !== null) o[key] = v;
     });
@@ -1678,9 +1655,11 @@ el('l-params-reset').onclick = async () => {
 };
 
 function applyLedState(s) {
+  const wasLocating = !!(scene.led && scene.led.locate_enabled);
   scene.led = s;
   renderLedState(s);
-  drawScene3D(scene.lastStatus);
+  // 未开启三维定位时没有 LED 需要绘制；停止定位时再重绘一次清掉旧标记。
+  if ((s && s.locate_enabled) || wasLocating) drawScene3D(scene.lastStatus);
 }
 
 function ledStatusName(s) {
@@ -1810,40 +1789,29 @@ async function ledPost(path, label) {
   }
 }
 
-el('l-detect-start').onclick = async () => {
-  el('l-detect-start').disabled = true;
+async function startLedAction(btnId, path, label) {
+  const btn = el(btnId);
+  btn.disabled = true;
   try {
-    const s = await ledPost('/api/led/detect/start', '开始二维检测');
+    const s = await ledPost(path, label);
     if (s) {
       el('c-vis-mode').value = 'led';
       updateFigCaptions();
       liveTick();
     }
-  } finally { el('l-detect-start').disabled = false; }
-};
-el('l-detect-stop').onclick = async () => {
-  await ledPost('/api/led/detect/stop', '停止二维检测');
-};
-el('l-locate-start').onclick = async () => {
-  el('l-locate-start').disabled = true;
-  try {
-    const s = await ledPost('/api/led/locate/start', '开始三维定位');
-    if (s) {
-      el('c-vis-mode').value = 'led';
-      updateFigCaptions();
-      liveTick();
-    }
-  } finally { el('l-locate-start').disabled = false; }
-};
-el('l-locate-stop').onclick = async () => {
-  await ledPost('/api/led/locate/stop', '停止三维定位');
-};
-el('l-view').onchange = () => {
+  } finally { btn.disabled = false; }
+}
+const ledTickIfActive = () => {
   if (el('c-vis-mode').value === 'led') liveTick();
 };
-el('l-zoom').onchange = () => {
-  if (el('c-vis-mode').value === 'led') liveTick();
-};
+el('l-detect-start').onclick = () => startLedAction(
+  'l-detect-start', '/api/led/detect/start', '开始二维检测');
+el('l-detect-stop').onclick = () => ledPost('/api/led/detect/stop', '停止二维检测');
+el('l-locate-start').onclick = () => startLedAction(
+  'l-locate-start', '/api/led/locate/start', '开始三维定位');
+el('l-locate-stop').onclick = () => ledPost('/api/led/locate/stop', '停止三维定位');
+el('l-view').onchange = ledTickIfActive;
+el('l-zoom').onchange = ledTickIfActive;
 el('l-roi-apply').onclick = () => {
   el('l-params-apply').click();
 };
@@ -1943,7 +1911,6 @@ function validationSummary(r) {
 }
 
 function renderValidation(r) {
-  cValidation = r || null;
   const out = el('c-val-out');
   const per = (r && r.per_placement) || [];
   const agg = (r && r.aggregate) || null;
@@ -2640,7 +2607,6 @@ refreshCalib();
 loadLedParams();
 refreshLed();
 
-window.addEventListener('beforeunload', () => stopCalibLive());
 </script>
 </body>
 </html>

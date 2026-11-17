@@ -49,6 +49,12 @@ def spots(centers, sigma=3.0, size=(720, 1280), amp=255, sat_radius=0.0):
     return np.clip(field, 0, 255).astype(np.uint8)
 
 
+def _rect(y0, y1, x0, x1):
+    img = np.zeros((720, 1280), np.uint8)
+    img[y0:y1, x0:x1] = 255
+    return img
+
+
 def look_at(C, target):
     C = np.asarray(C, np.float64)
     target = np.asarray(target, np.float64)
@@ -99,26 +105,20 @@ def test_detector():
     check("三个粘连光斑至少拆出 2 个", d3["count"] >= 2,
           "count=%d" % d3["count"])
 
-    sat = np.zeros((720, 1280), np.uint8)
-    sat[280:340, 380:480] = 255
-    d4 = detect_leds(sat, p)
+    d4 = detect_leds(_rect(280, 340, 380, 480), p)
     check("完全饱和的大亮区不伪造三点",
           d4["count"] == 0 and d4["status"] == "unresolved"
           and d4["unresolved_count"] >= 1,
           "count=%d status=%s" % (d4["count"], d4["status"]))
 
-    single_sat = np.zeros((720, 1280), np.uint8)
-    single_sat[290:310, 390:410] = 255
-    d5 = detect_leds(single_sat, p)
+    d5 = detect_leds(_rect(290, 310, 390, 410), p)
     check("单个大面积饱和亮区给过曝提示",
           d5["count"] == 1 and bool(d5["overexposed"])
           and any("饱和" in w for w in d5["warnings"]),
           d5["warnings"])
 
     # 细长灯带/地面反光：形状过滤后不应成为 LED 候选，但原始连通域仍保留
-    refl = np.zeros((720, 1280), np.uint8)
-    refl[280:288, 300:700] = 255
-    d6 = detect_leds(refl, p)
+    d6 = detect_leds(_rect(280, 288, 300, 700), p)
     check("细长反光被过滤且保留原始候选",
           d6["count"] == 0 and d6["raw_count"] >= 1
           and any("细长" in r.get("reason", "") for r in d6["rejected"]),
@@ -181,6 +181,15 @@ def _dets(points2d):
     return {"leds": [{"x": float(x), "y": float(y)} for x, y in points2d]}
 
 
+def _match(p0, p1, calib, params):
+    return match_and_triangulate(_dets(p0), _dets(p1), calib, params)
+
+
+def _edges_ok(res):
+    return bool(res.get("ok")) and max(
+        abs(v - 33.0) for v in (res.get("edges_mm") or [])) < 0.5
+
+
 def test_geometry():
     print("\n[2] 极线匹配 / 三角化 / 33 mm 等边三角形")
     K, D, R0, t0, R1, t1 = _rig()
@@ -192,16 +201,14 @@ def test_geometry():
     params = default_params()
     params.update({"epipolar_tol_px": 3.0, "reprojection_tol_px": 3.0,
                    "triangle_tol_mm": 3.0})
-    res = match_and_triangulate(_dets(p0), _dets(p1), calib, params)
+    res = _match(p0, p1, calib, params)
     check("三点匹配成功", res.get("ok") is True, res.get("reason"))
     if res.get("ok"):
         center = np.asarray(res["raw_center"])
         err = float(np.linalg.norm(center - np.asarray(world).mean(axis=0)))
         check("三角化世界中心误差 < 1mm", err < 0.001,
               "%.4f mm" % (err * 1000))
-        check("三条边均为 33 mm（±0.5mm）",
-              max(abs(v - 33.0) for v in res["edges_mm"]) < 0.5,
-              res["edges_mm"])
+        check("三条边均为 33 mm（±0.5mm）", _edges_ok(res), res["edges_mm"])
         check("重投影 < 0.2px", res["mean_reprojection_px"] < 0.2,
               res["mean_reprojection_px"])
         check("三个 LED 标签是临时编号",
@@ -224,7 +231,7 @@ def test_geometry():
     noise = rng.normal(0, 0.25, p0.shape)
     p0n = p0 + noise
     p1n = p1 + rng.normal(0, 0.25, p1.shape)
-    res_n = match_and_triangulate(_dets(p0n), _dets(p1n), calib, params)
+    res_n = _match(p0n, p1n, calib, params)
     check("带 0.25px 噪声仍能匹配", res_n.get("ok") is True, res_n.get("reason"))
     if res_n.get("ok"):
         err = float(np.linalg.norm(np.asarray(res_n["raw_center"])
@@ -234,7 +241,7 @@ def test_geometry():
     # 加一个无关亮点，仍应挑出正确三角形
     sp0 = np.vstack([p0n, [[100.0, 600.0]]])
     sp1 = np.vstack([p1n, [[900.0, 500.0]]])
-    res_sp = match_and_triangulate(_dets(sp0), _dets(sp1), calib, params)
+    res_sp = _match(sp0, sp1, calib, params)
     check("有无关亮点时仍选出三点三角形", res_sp.get("ok") is True,
           res_sp.get("reason"))
 
@@ -242,17 +249,13 @@ def test_geometry():
     rng2 = np.random.default_rng(11)
     extra0 = rng2.uniform([50, 50], [1200, 650], (6, 2))
     extra1 = rng2.uniform([50, 50], [1200, 650], (6, 2))
-    res_many = match_and_triangulate(
-        _dets(np.vstack([p0n, extra0])),
-        _dets(np.vstack([p1n, extra1])), calib, params)
-    check("多个反射候选下仍能选出 33 mm 三角形",
-          res_many.get("ok") is True
-          and max(abs(v - 33.0) for v in res_many["edges_mm"]) < 0.5,
+    res_many = _match(np.vstack([p0n, extra0]),
+                      np.vstack([p1n, extra1]), calib, params)
+    check("多个反射候选下仍能选出 33 mm 三角形", _edges_ok(res_many),
           None if not res_many.get("ok") else res_many["edges_mm"])
 
     # 少一个 LED
-    res_missing = match_and_triangulate(_dets(p0[:2]), _dets(p1[:2]),
-                                        calib, params)
+    res_missing = _match(p0[:2], p1[:2], calib, params)
     check("少于 3 个检测点时拒绝定位",
           res_missing.get("ok") is False
           and res_missing.get("status") == "insufficient_detections",
@@ -263,7 +266,7 @@ def test_geometry():
     bad_world[2] += np.array([0.0, 0.0, 0.03])
     b0 = project(bad_world, K, D, R0, t0)
     b1 = project(bad_world, K, D, R1, t1)
-    res_bad = match_and_triangulate(_dets(b0), _dets(b1), calib, params)
+    res_bad = _match(b0, b1, calib, params)
     check("33 mm 几何不一致时不输出有效中心",
           res_bad.get("ok") is False
           and res_bad.get("status") == "geometry_mismatch",
@@ -316,22 +319,21 @@ def test_camera_mapping():
     params.update({"epipolar_tol_px": 4.0, "reprojection_tol_px": 4.0,
                    "triangle_tol_mm": 8.0})
     # 物理顺序与标定一致
-    r_id = match_and_triangulate(_dets(p0), _dets(p1), c01, params)
-    r_sw = match_and_triangulate(_dets(p0), _dets(p1), c10, params)
+    r_id = _match(p0, p1, c01, params)
+    r_sw = _match(p0, p1, c10, params)
     key, chosen = _choose_mapping({"0,1": r_id, "1,0": r_sw})
     check("身份映射时选择实时0->标定0", key == "0,1" and chosen.get("ok"),
           "chosen=%s id=%s swap=%s" % (key, r_id.get("ok"), r_sw.get("ok")))
     # 物理顺序互换：实时 cam0 实际是标定 cam1
-    r_id2 = match_and_triangulate(_dets(p1), _dets(p0), c01, params)
-    r_sw2 = match_and_triangulate(_dets(p1), _dets(p0), c10, params)
+    r_id2 = _match(p1, p0, c01, params)
+    r_sw2 = _match(p1, p0, c10, params)
     key2, chosen2 = _choose_mapping({"0,1": r_id2, "1,0": r_sw2})
     check("相机互换时自动选择实时0->标定1",
           key2 == "1,0" and chosen2.get("ok"),
           "chosen=%s id=%s swap=%s" % (key2, r_id2.get("ok"),
                                        r_sw2.get("ok")))
     if chosen2.get("ok"):
-        check("自动映射后三边仍为 33 mm",
-              max(abs(v - 33.0) for v in chosen2["edges_mm"]) < 0.5,
+        check("自动映射后三边仍为 33 mm", _edges_ok(chosen2),
               chosen2["edges_mm"])
 
 

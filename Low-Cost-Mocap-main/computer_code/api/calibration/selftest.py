@@ -122,32 +122,13 @@ def render(spec: B.BoardSpec, R_b: np.ndarray, t_b: np.ndarray,
     return np.clip(img, 0, 255).astype(np.uint8)
 
 
-def board_pose(distance: float, yaw: float, pitch: float, roll: float,
-               shift_x: float = 40.0, shift_y: float = 25.0) -> tuple[np.ndarray, np.ndarray]:
-    """构造板在相机系下的位姿：板中心落在光轴附近，距离 distance。"""
-    R = cv2.Rodrigues(np.array([pitch, yaw, roll], np.float64))[0]
-    # 让板中心（板坐标几何中心）平移到 (cx, cy, distance)
-    return R, np.array([shift_x, shift_y, distance], np.float64)
-
-
-def board_center_offset(spec: B.BoardSpec) -> np.ndarray:
-    """板几何中心相对板坐标原点的偏移。
-
-    世界系原点已经在图案中心，所以这里恒为 0（保留函数是为了让调用方明确
-    "板位姿的平移就是图案中心的位置"）。
-    """
-    return np.zeros(3)
-
-
 def pose_with_centered_board(spec, distance, yaw, pitch, roll, px=0.0, py=0.0):
     """板在相机系下的位姿：``X_cam = R_b @ X_board + t_b``。
 
-    因为物点已经以图案中心为原点，``t_b`` 就是图案中心在相机系中的位置。
+    物点已以图案中心为原点，因此 ``t_b`` 就是图案中心在相机系中的位置。
     """
-    c = board_center_offset(spec)
     R = cv2.Rodrigues(np.array([pitch, yaw, roll], np.float64))[0]
-    t = np.array([px, py, distance], np.float64) - R @ c
-    return R, t
+    return R, np.array([px, py, distance], np.float64)
 
 
 def corners_in_image(spec: B.BoardSpec, R_b, t_b, K, D) -> np.ndarray:
@@ -272,9 +253,17 @@ def test_intrinsic(quick: bool, keep_dir: str | None, spec: B.BoardSpec,
 # ---------------------------------------------------------------------------
 # 用例 2：外参
 # ---------------------------------------------------------------------------
-def build_stereo_pairs(spec, size, n: int, tex, off, *, reverse_b: bool = False,
-                       flip_board_b: bool = False):
-    """生成 n 对同步帧，返回 (pairs, 真值 R, 真值 T)。"""
+class _Pair:
+    def __init__(self, sid, c0, c1):
+        self.id, self.detections = sid, {"0": {"ok": True}, "1": {"ok": True}}
+        self._0, self._1 = c0, c1
+
+    def corners(self, cam):
+        return self._0 if int(cam) == 0 else self._1
+
+
+def build_stereo_pairs(spec, size, n: int, tex, off, *, reverse_b: bool = False):
+    """生成 n 对同步帧，返回 pairs。"""
     pairs = []
     for i in range(n):
         dist = RNG.uniform(0.85, 1.25)
@@ -291,8 +280,6 @@ def build_stereo_pairs(spec, size, n: int, tex, off, *, reverse_b: bool = False,
 
         img0 = render(spec, R_b0, t_b0, TRUE_K, TRUE_D, size, tex, off)
         img1 = render(spec, R_b1, t_b1, TRUE_K, TRUE_D, size, tex, off)
-        if flip_board_b:
-            pass  # 板是中心对称的，物理翻转在渲染上无差别；这里只模拟标号差异
 
         da, db, info = B.detect_pair(img0, img1, spec)
         if not (da.ok and db.ok):
@@ -318,15 +305,7 @@ def test_stereo(spec: B.BoardSpec, size: tuple[int, int], intr0: dict, intr1: di
     if len(raw) < 4:
         return None
 
-    class Pair:
-        def __init__(self, sid, c0, c1):
-            self.id, self.detections = sid, {"0": {"ok": True}, "1": {"ok": True}}
-            self._0, self._1 = c0, c1
-
-        def corners(self, cam):
-            return self._0 if int(cam) == 0 else self._1
-
-    samples = [Pair("p%03d" % i, c0, c1) for i, (c0, c1, _, _) in enumerate(raw)]
+    samples = [_Pair("p%03d" % i, c0, c1) for i, (c0, c1, _, _) in enumerate(raw)]
     res = S.calibrate(samples, spec, size, intr0, intr1, auto_flip=True)
 
     if keep_dir:
@@ -388,15 +367,7 @@ def test_auto_flip(spec: B.BoardSpec, size: tuple[int, int],
     if len(raw) < 5:
         return
 
-    class Pair:
-        def __init__(self, sid, c0, c1):
-            self.id, self.detections = sid, {"0": {"ok": True}, "1": {"ok": True}}
-            self._0, self._1 = c0, c1
-
-        def corners(self, cam):
-            return self._0 if int(cam) == 0 else self._1
-
-    samples = [Pair("p%03d" % i, c0, c1) for i, (c0, c1, _, _) in enumerate(raw)]
+    samples = [_Pair("p%03d" % i, c0, c1) for i, (c0, c1, _, _) in enumerate(raw)]
 
     forced_off = S.calibrate(samples, spec, size, intr0, intr1, flip_b=False)
     auto = S.calibrate(samples, spec, size, intr0, intr1, auto_flip=True)
@@ -722,6 +693,12 @@ def test_cli_and_state(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
     check("新增外参样本后旧外参被作废", before is not None and svc._extrinsic is None)
 
 
+def _frame(gray, seq):
+    from camera_manager import Frame
+    return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
+                 host_ts=time.time(), mono_ts=time.perf_counter())
+
+
 class _FakeWorker:
     """最小相机替身：只有采集用得到的那几个属性/方法。"""
 
@@ -778,16 +755,11 @@ def test_capture_http(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
     """HTTP 采集 + 重复帧/重复帧对拒绝（用假相机，不碰真实设备）。"""
     print("\n[8] HTTP 采集与重复帧处理（模拟相机）")
     import calibration.service as SVC
-    from camera_manager import Frame
     from preview_server import build_app
 
     _, _, (R0, t0), (R1, t1) = _two_camera_poses()
     img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
     img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
-
-    def _frame(gray, seq):
-        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
-                     host_ts=time.time(), mono_ts=time.perf_counter())
 
     w0, w1 = _FakeWorker(_frame(img0, 100), 0), _FakeWorker(_frame(img1, 200), 1)
     orig_manager, orig_sync = SVC.manager, SVC.sync_service
@@ -896,8 +868,7 @@ def test_persistence(spec: B.BoardSpec, size: tuple[int, int],
     p0 = cv2.projectPoints(X0, np.zeros(3), np.zeros(3), TRUE_K, TRUE_D)[0].reshape(-1, 2)
     p1 = cv2.projectPoints(X1, np.zeros(3), np.zeros(3), TRUE_K, TRUE_D)[0].reshape(-1, 2)
     # 用估计的外参重投影，应与真值投影接近
-    X1_est = X0 @ np.asarray(stereo_res["R_10"]).T + np.asarray(stereo_res["T_10"])
-    p1_est = cv2.projectPoints(X1_est, np.zeros(3), np.zeros(3),
+    p1_est = cv2.projectPoints(X1, np.zeros(3), np.zeros(3),
                                np.asarray(intr["K"]), np.asarray(intr["D"]))[0].reshape(-1, 2)
     check("X_cam1 = R@X_cam0 + T 约定自洽", float(np.linalg.norm(p1_est - p1)) < 5.0,
           "重投影差 %.2fpx" % float(np.linalg.norm(p1_est - p1)))
@@ -977,7 +948,6 @@ def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
                                        tmp: str) -> None:
     print("\n[11] 双相机同帧外参采集 + 单张 solvePnP + 自动验证")
     import calibration.service as SVC
-    from camera_manager import Frame
 
     root = os.path.join(tmp, "pair_session")
     shutil.rmtree(root, ignore_errors=True)
@@ -994,10 +964,6 @@ def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
           len(intr.get("intrinsics", {})) == 2, list(intr.get("intrinsics", {})))
 
     C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
-
-    def _frame(gray, seq):
-        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
-                     host_ts=time.time(), mono_ts=time.perf_counter())
 
     img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
     img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
@@ -1093,7 +1059,6 @@ def test_extrinsic_pair_and_validation(spec: B.BoardSpec, size, tex, off,
 def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
     print("\n[13] 最新内外参自动保存与跨会话载入")
     import calibration.service as SVC
-    from camera_manager import Frame
     from calibration.service import (
         DEFAULT_EXTRINSICS_PATH, DEFAULT_INTRINSICS_PATH,
         load_calibration, stereo_matrices,
@@ -1162,10 +1127,6 @@ def test_latest_result_files(spec: B.BoardSpec, size, tex, off, tmp: str) -> Non
     C0, C1, (R0, t0), (R1, t1) = _two_camera_poses()
     img0 = render(spec, R0, t0, TRUE_K, TRUE_D, size, tex, off)
     img1 = render(spec, R1, t1, TRUE_K, TRUE_D, size, tex, off)
-
-    def _frame(gray, seq):
-        return Frame(gray=gray, seq=seq, mf_ts=seq * 333333,
-                     host_ts=time.time(), mono_ts=time.perf_counter())
 
     w0 = _FakeWorker(_frame(img0, 3100), 0)
     w1 = _FakeWorker(_frame(img1, 3200), 1)

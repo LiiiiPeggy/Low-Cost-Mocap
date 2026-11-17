@@ -1,14 +1,12 @@
-"""最小可用的红外相机预览服务（不依赖 serial / ruckig / 无人机相关代码）。
+"""红外相机与标定/LED 定位服务（当前唯一后端，端口 3002）。
 
     python api/preview_server.py                     # 默认打开 0、1 两台，端口 3002
     python api/preview_server.py --indices 0 2       # 只开 0 和 2
     python api/preview_server.py --format MJPG       # 带宽不够时换压缩格式
     python api/preview_server.py --no-autostart      # 起来后等网页点 Start
 
-浏览器打开 http://127.0.0.1:3002/preview 可以直接看双路画面（免 npm 构建）。
-
-如果还需要原项目的 socket.io / Three.js 数据链路，改用 ``python api/index.py``，
-它注册了同一套蓝图，预览接口完全一致。
+浏览器打开 http://127.0.0.1:3002/preview 可以直接看双路画面，无需前端构建。
+原作者的 3001 Socket.IO / 无人机链路已删除，源码见 ``upstream/``。
 """
 
 from __future__ import annotations

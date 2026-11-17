@@ -31,7 +31,6 @@ if _HERE not in sys.path:
 
 import cv2  # noqa: E402
 
-import calibration.routes  # noqa: E402,F401  （确保包可导入，同时注册路由模块）
 from calibration import board as B  # noqa: E402
 from calibration.dataset import Session  # noqa: E402
 from calibration.service import (  # noqa: E402

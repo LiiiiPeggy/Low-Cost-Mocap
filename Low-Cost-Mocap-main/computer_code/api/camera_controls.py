@@ -30,12 +30,10 @@ from __future__ import annotations
 import ctypes
 import json
 import os
-import re
 import threading
 import time
 import uuid
 from datetime import datetime
-from ctypes import wintypes as wt
 
 LP = ctypes.c_void_p
 COINIT_APARTMENTTHREADED = 0x2

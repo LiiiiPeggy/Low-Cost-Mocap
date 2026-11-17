@@ -1,6 +1,6 @@
 # Low-Cost-Mocap 仓库中文总结
 
-> 分析对象：[github.com/jyjblrd/Low-Cost-Mocap](https://github.com/jyjblrd/Low-Cost-Mocap)，`main` 分支（commit `8ac4d41`），查阅时间 2026-11-10。
+> 分析对象：[github.com/jyjblrd/Low-Cost-Mocap](https://github.com/jyjblrd/Low-Cost-Mocap)，`main` 分支（commit `8ac4d41`），查阅时间 2026-11-10。本文是原作者项目的历史分析；相关旧代码已从当前运行仓库删除，完整源码见 `upstream/`。
 > 依据 README、源码、配置文件、架构图、Issue 模板与仓库元数据。仅整理仓库内可查证信息；外部来源单独标注，缺失或不确定项统一写明；不补充外部背景、不扩写为操作教程、不引用代码片段。
 
 ## 1. 项目目标

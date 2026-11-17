@@ -333,8 +333,7 @@ class CalibrationService:
             sess = Session.create_or_load(path, spec, cams, size, pixel_format)
             self._session = sess
             # 切换会话时清掉上一轮求解结果，避免张冠李戴
-            self._intrinsics, self._stereo, self._validation = {}, None, None
-            self._extrinsic = None
+            self._reset_results()
         # 如果这个目录里已有求解结果（再次打开旧会话），直接恢复
         self._restore_results(sess)
         return self.status()
@@ -360,8 +359,7 @@ class CalibrationService:
         sess = Session.load(resolve_path(root))
         with self._lock:
             self._session = sess
-            self._intrinsics, self._stereo, self._validation = {}, None, None
-            self._extrinsic = None
+            self._reset_results()
         self._restore_results(sess)
         return self.status()
 
@@ -394,24 +392,53 @@ class CalibrationService:
             with self._lock:
                 self._stereo = stereo
 
+    def _reset_results(self) -> None:
+        """清空当前会话的求解结果（调用方已持锁或处于初始化阶段）。"""
+        self._intrinsics = {}
+        self._stereo = None
+        self._validation = None
+        self._extrinsic = None
+
     def _invalidate(self, phase: str) -> None:
         """新增样本后，作废依赖它的求解结果，避免把旧结果当新结果保存。"""
         with self._lock:
             if phase == "intrinsic":
                 self._intrinsics = {}
+            if phase in ("intrinsic", "extrinsic"):
                 self._extrinsic = None
-                self._validation = None
-            elif phase == "extrinsic":
-                self._extrinsic = None
-                self._validation = None
-            else:
-                self._validation = None
+            self._validation = None
+
+    @staticmethod
+    def _classify_detection(det, phase: str, *, duplicate=None, force=False,
+                            coverage_label: str = "该阶段"):
+        """把检测/清晰度/覆盖率/判重结果统一映射为样本状态。"""
+        status, reason, warning = "valid", "", ""
+        if not det.ok:
+            status, reason = "invalid", "角点检测失败：%s" % det.reason
+            return status, reason, warning
+        q = det.quality
+        limit = coverage_limit_for(phase)
+        if q["sharpness"] < MIN_SHARPNESS:
+            status, reason = "invalid", ("图像偏模糊（Laplacian 方差 %.0f < %.0f）"
+                                         % (q["sharpness"], MIN_SHARPNESS))
+        elif q["coverage"] < limit:
+            status, reason = "invalid", ("标定板在画面中太小（占画面 %.1f%%，"
+                                         "%s最低 %.1f%%）"
+                                         % (100 * q["coverage"],
+                                            coverage_label, 100 * limit))
+        elif duplicate and not force:
+            status, reason = "invalid", ("与已有样本 %s 姿态几乎相同（位移 %.3f/"
+                                         "尺度 %.2f/转角 %.1f°），换一个角度再采"
+                                         % (duplicate["sample"], duplicate["dpos"],
+                                            duplicate["dscale"], duplicate["dangle"]))
+        elif q["coverage"] < MIN_COVERAGE:
+            warning = low_coverage_warning(q["coverage"])
+        return status, reason, warning
 
     def close_session(self) -> dict:
         with self._lock:
             self._session = None
-            self._intrinsics, self._stereo, self._validation = {}, None, None
-            self._extrinsic = None
+            self._reset_results()
         return {"session": None}
 
     def _probe_image_size(self, cameras) -> tuple[int, int]:
@@ -425,9 +452,6 @@ class CalibrationService:
                 return int(f.gray.shape[1]), int(f.gray.shape[0])
             if w.requested:
                 return int(w.requested["width"]), int(w.requested["height"])
-        w = manager().worker(cameras[0]) if cameras else None
-        if w is not None and w.requested:
-            return int(w.requested["width"]), int(w.requested["height"])
         return (1280, 720)
 
     # ------------------------------------------------------------------
@@ -503,44 +527,17 @@ class CalibrationService:
         det = board_mod.detect(gray, spec)
         overlay = board_mod.draw_overlay(gray, det, spec, label_step=4)
 
-        meta = {
-            "seq": int(frame.seq),
-            "mf_ts": int(frame.mf_ts),
-            "host_ts": float(frame.host_ts),
-            "mono_ts": float(frame.mono_ts),
-            "device": (manager().worker(camera).device_name
-                       if manager().worker(camera) else None),
-            "format": (manager().worker(camera).format_info
-                       if manager().worker(camera) else None),
-            "frame_age_ms": round(age * 1000.0, 1),
-        }
+        meta = self._side_meta(frame, camera)
+        meta["frame_age_ms"] = round(age * 1000.0, 1)
 
-        status, reason, warning = "valid", "", ""
-        if not det.ok:
-            status, reason = "invalid", "角点检测失败：%s" % det.reason
-        else:
-            q = det.quality
-            sig = board_mod.pose_signature(det, spec)
-            # 外参阶段板是固定的，多拍几张本来就应该几乎一样，不做判重
-            dup = (None if phase == "extrinsic"
-                   else board_mod.is_duplicate(sig, sess.signatures(camera, phase=phase)))
-            if q["sharpness"] < MIN_SHARPNESS:
-                status, reason = "invalid", ("图像偏模糊（Laplacian 方差 %.0f < %.0f）"
-                                             % (q["sharpness"], MIN_SHARPNESS))
-            elif q["coverage"] < coverage_limit_for(phase):
-                status, reason = "invalid", ("标定板在画面中太小（占画面 %.1f%%，"
-                                             "该阶段最低 %.1f%%）"
-                                             % (100 * q["coverage"],
-                                                100 * coverage_limit_for(phase)))
-            elif dup and not force:
-                status, reason = "invalid", ("与已有样本 %s 姿态几乎相同（位移 %.3f/"
-                                             "尺度 %.2f/转角 %.1f°），换一个角度再采"
-                                             % (dup["sample"], dup["dpos"],
-                                                dup["dscale"], dup["dangle"]))
-            else:
-                meta["signature"] = sig
-                if q["coverage"] < MIN_COVERAGE:
-                    warning = low_coverage_warning(q["coverage"])
+        sig = board_mod.pose_signature(det, spec) if det.ok else {}
+        # 外参阶段板是固定的，多拍几张本来就应该几乎一样，不做判重
+        dup = (None if (not det.ok or phase == "extrinsic")
+               else board_mod.is_duplicate(sig, sess.signatures(camera, phase=phase)))
+        status, reason, warning = self._classify_detection(
+            det, phase, duplicate=dup, force=force)
+        if status == "valid":
+            meta["signature"] = sig
 
         sample = sess.add_single(camera, gray, det, meta, overlay=overlay,
                                  status=status, reason=reason, note=warning,
@@ -717,19 +714,8 @@ class CalibrationService:
             frame = frames[cam]
             det = board_mod.detect(frame.gray, spec)
             overlay = board_mod.draw_overlay(frame.gray, det, spec, label_step=3)
-            status, reason, warning = "valid", "", ""
-            if not det.ok:
-                status, reason = "invalid", "角点检测失败：%s" % det.reason
-            elif det.quality["sharpness"] < MIN_SHARPNESS:
-                status, reason = "invalid", ("图像偏模糊（Laplacian 方差 %.0f < %.0f）"
-                                             % (det.quality["sharpness"], MIN_SHARPNESS))
-            elif det.quality["coverage"] < MIN_COVERAGE_EXTRINSIC:
-                status, reason = "invalid", ("标定板在画面中太小（占画面 %.1f%%，"
-                                             "外参最低 %.1f%%）"
-                                             % (100 * det.quality["coverage"],
-                                                100 * MIN_COVERAGE_EXTRINSIC))
-            elif det.quality["coverage"] < MIN_COVERAGE:
-                warning = low_coverage_warning(det.quality["coverage"])
+            status, reason, warning = self._classify_detection(
+                det, "extrinsic", coverage_label="外参")
 
             meta = self._side_meta(frame, cam)
             meta["pair_seq"] = int(rec.pair_seq)
@@ -907,26 +893,31 @@ class CalibrationService:
             self._validation = None
         return True
 
+    def _load_result_file(self, path, default_path, schema, kind, file_label):
+        sess = self._require_session()
+        if len(sess.cameras) < 2:
+            raise ValueError("会话只登记了 %d 台相机，无法载入双相机%s"
+                             % (len(sess.cameras), kind))
+        p = resolve_path(path or default_path)
+        rel = project_relative(p)
+        if not os.path.isfile(p):
+            raise FileNotFoundError("%s不存在：%s" % (file_label, rel))
+        try:
+            data = _read_json_file(p)
+        except (OSError, ValueError) as exc:
+            raise ValueError("%s读取失败：%s" % (file_label, exc))
+        if data.get("schema") != schema:
+            raise ValueError("%s格式不兼容（schema=%r，期望 %r）"
+                             % (file_label, data.get("schema"), schema))
+        return sess, data, rel
+
     def load_intrinsics(self, path: str | None = None) -> dict:
         """从跨会话 intrinsics.json 恢复 K/D，不重新采集或重算。
 
         只应用通过校验的相机；校验失败的相机保持当前内存结果不变。
         """
-        sess = self._require_session()
-        if len(sess.cameras) < 2:
-            raise ValueError("会话只登记了 %d 台相机，无法载入双相机内参"
-                             % len(sess.cameras))
-        p = resolve_path(path or DEFAULT_INTRINSICS_PATH)
-        rel = project_relative(p)
-        if not os.path.isfile(p):
-            raise FileNotFoundError("内参文件不存在：%s" % rel)
-        try:
-            data = _read_json_file(p)
-        except (OSError, ValueError) as exc:
-            raise ValueError("内参文件读取失败：%s" % exc)
-        if data.get("schema") != INTRINSICS_SCHEMA:
-            raise ValueError("内参文件格式不兼容（schema=%r，期望 %r）"
-                             % (data.get("schema"), INTRINSICS_SCHEMA))
+        sess, data, rel = self._load_result_file(
+            path, DEFAULT_INTRINSICS_PATH, INTRINSICS_SCHEMA, "内参", "内参文件")
         cameras = data.get("cameras")
         if not isinstance(cameras, dict):
             raise ValueError("内参文件格式不兼容：缺少 cameras 对象")
@@ -987,21 +978,9 @@ class CalibrationService:
 
     def load_extrinsics(self, path: str | None = None) -> dict:
         """从跨会话 world_extrinsics.json 恢复外参，不重新采集或求解。"""
-        sess = self._require_session()
-        if len(sess.cameras) < 2:
-            raise ValueError("会话只登记了 %d 台相机，无法载入双相机外参"
-                             % len(sess.cameras))
-        p = resolve_path(path or DEFAULT_EXTRINSICS_PATH)
-        rel = project_relative(p)
-        if not os.path.isfile(p):
-            raise FileNotFoundError("世界系外参文件不存在：%s" % rel)
-        try:
-            data = _read_json_file(p)
-        except (OSError, ValueError) as exc:
-            raise ValueError("世界系外参文件读取失败：%s" % exc)
-        if data.get("schema") != EXTRINSICS_SCHEMA:
-            raise ValueError("世界系外参文件格式不兼容（schema=%r，期望 %r）"
-                             % (data.get("schema"), EXTRINSICS_SCHEMA))
+        sess, data, rel = self._load_result_file(
+            path, DEFAULT_EXTRINSICS_PATH, EXTRINSICS_SCHEMA,
+            "外参", "世界系外参文件")
 
         cams = [int(c) for c in sess.cameras[:2]]
         problems = _board_mismatch(data.get("board") or {}, sess.spec)

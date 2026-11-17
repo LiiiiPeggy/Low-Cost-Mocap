@@ -45,7 +45,6 @@ from __future__ import annotations
 
 import json
 import os
-import sys
 import threading
 import time
 import traceback
@@ -278,18 +277,6 @@ class SyncService:
             else:
                 self._dropped_b += 1
             self._recent_events.append("drop_a" if which == "a" else "drop_b")
-
-    def _drop_many(self, which: str, count: int) -> None:
-        if count <= 0:
-            return
-        with self._lock:
-            if which == "a":
-                self._dropped_a += count
-            else:
-                self._dropped_b += count
-            for _ in range(count):
-                self._recent_events.append(
-                    "drop_a" if which == "a" else "drop_b")
 
     # -- 读取 -------------------------------------------------------------
     def status(self) -> dict:

@@ -1,14 +1,10 @@
 """Flask 蓝图：多路 USB 红外相机的状态查询、MJPEG 推流与原始帧保存。
 
-挂载方式（两种入口都支持）::
+挂载方式::
 
-    # 1) 独立的最小服务（只要摄像头，不需要 serial / ruckig）
     python api/preview_server.py --indices 0 1
 
-    # 2) 复用原项目的 Flask app（index.py 里已注册）
-    python api/index.py
-
-所有路由都以 ``/api`` 开头，前端通过 Vite 代理访问。
+所有路由都以 ``/api`` 开头，页面由 3002 同源提供。
 推流只读 CameraManager 的最新帧缓存，**一个设备只打开一次**，
 浏览器刷新 / 多标签页不会重复打开摄像头。
 """

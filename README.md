@@ -1,22 +1,23 @@
 # Low-Cost-Mocap
 
 低成本红外光学动捕方案。本仓库在原项目 [jyjblrd/Low-Cost-Mocap](https://github.com/jyjblrd/Low-Cost-Mocap)
-（ESP32 红外标记 + 基站 + 上位机解算）基础上，补充了 **USB 红外相机取帧、双相机采集与同步、
-标定和 LED 定位工具**。
+的基础上，补充了 **USB 红外相机取帧、双相机采集与同步、标定和 LED 定位工具**。原作者的
+PS3 Eye、Socket.IO 无人机控制和 ESP32 链路已从运行代码中移除，源码完整保留在 `upstream/`。
 
 ## 目录结构
 
 | 路径 | 说明 |
 |---|---|
 | `Low-Cost-Mocap-main/computer_code/api/ir_camera.py` | **单相机**取帧 + 桌面实时可视化（Windows / Media Foundation，纯 ctypes） |
-| `Low-Cost-Mocap-main/` | 原始项目代码（3D 件、ESP32 收发端、上位机解算） |
+| `upstream/` | 原作者完整参考代码（PS3 Eye、Socket.IO、ESP32、React/Vite，不参与当前运行） |
+| `Low-Cost-Mocap-main/3d_files/` · `images/` | 原始 3D 文件与参考图 |
 | `Low-Cost-Mocap-main/computer_code/api/camera_manager.py` | **双/多相机并发采集**（每相机一线程，latest-frame 缓存 + 时间戳） |
 | `Low-Cost-Mocap-main/computer_code/api/camera_preview.py` | Flask 蓝图：状态 / MJPEG 推流 / 原始帧保存 |
 | `Low-Cost-Mocap-main/computer_code/api/preview_server.py` | 只含相机功能的最小服务（无需 serial / ruckig） |
 | `Low-Cost-Mocap-main/computer_code/api/calibration/` | **双相机内参 / 固定棋盘格世界系外参**（`calibrateCamera` + `solvePnP`；`stereoCalibrate` 仅作交叉校验） |
 | `Low-Cost-Mocap-main/computer_code/api/led/` | **红外 LED 检测、极线匹配与三维定位**（三 LED 标记，L0–L2 临时编号） |
 | `Low-Cost-Mocap-main/computer_code/api/calib_cli.py` | 标定命令行：采集 / 重检测 / 求解 / 验证 / 保存 |
-| `Low-Cost-Mocap-main/computer_code/src/components/CameraPreview.tsx` | React 双路预览面板 |
+| `Low-Cost-Mocap-main/computer_code/api/static/preview.html` | 当前 3002 `/preview` 网页（原生 JS + Canvas 三维视图） |
 | `AGENTS.md` / `PROGRESS.md` / `MEMORY.md` / `PROCESS.md` | AI Agent 公共工作规则与项目记忆 |
 | `docs/calibration.md` | **标定使用说明、坐标约定、精度指标、局限** |
 | `docs/` | 方案调研笔记与配图 |
@@ -57,10 +58,9 @@ python ir_camera.py --no-display --frames 120   # 无窗口压测
 api/ir_camera.py             ← 单相机取帧（未改动）
   └── api/camera_manager.py  ← 每相机一个线程；latest 缓存 + 定长历史缓存；三时间戳
         ├── api/camera_preview.py   ← Flask 蓝图：/api/cameras、MJPEG、save、sync
-        │     ├── api/preview_server.py   独立入口（3002，无需 serial/ruckig）
-        │     └── api/index.py            原后端（3001）注册同一份蓝图
+        │     └── api/preview_server.py   唯一入口（3002）
         └── api/sync.py             ← 帧同步：主机单调时间戳最近邻配对 + 统计 + 保存成对原图
-              └── src/components/CameraPreview.tsx ← 挂在 App.tsx 的一个新卡片里
+              └── api/static/preview.html ← 当前网页（原生 JS + Canvas 三维视图）
 ```
 
 关键设计：
@@ -75,35 +75,20 @@ api/ir_camera.py             ← 单相机取帧（未改动）
 - **历史缓存与最新帧共享同一个 ndarray**：入缓存时把 NV12 的跨步 Y 平面（`[:, ::2]`）
   转成连续数组，45 帧只占 45×0.92 MB，且不会连带持有整块 1.38 MB 的 NV12 buffer。
 
-### 启动后端（二选一）
+### 启动服务
 
 ```bash
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main/computer_code
 
-# A. 只做相机预览（推荐先跑这个，端口 3002）
 python api/preview_server.py --indices 0 1
-#   → 免构建页面： http://127.0.0.1:3002/preview
-#   → 状态接口  ： http://127.0.0.1:3002/api/cameras
-
-# B. 复用原项目 Flask 后端（端口 3001，含 socket.io / 三维可视化链路）
-python api/index.py
+#   → 网页： http://127.0.0.1:3002/preview
+#   → 状态： http://127.0.0.1:3002/api/cameras
 ```
 
 常用参数：`--width 1280 --height 720 --fps 30 --format NV12|MJPG --no-autostart`。
 带宽或 CPU 吃紧时可用环境变量 `MOCAP_JPEG_QUALITY=60` 降低推流单帧体积（默认 80）。
-
-### 启动前端
-
-```bash
-cd Low-Cost-Mocap-main/computer_code
-npm install
-npm run dev          # http://localhost:5173
-```
-
-Vite 代理已在 `vite.config.ts` 配好：`/api` → `http://127.0.0.1:3002`（可用
-`MOCAP_PREVIEW_URL` 改成 3001），`/socket.io` → `http://127.0.0.1:3001`。
-原来的三维视图、工具栏、相机参数面板全部保留，双相机卡片插在 "Camera Stream" 下方。
+网页是 `api/static/preview.html`，无需 npm 构建。
 
 ### 接口
 
@@ -286,7 +271,6 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
 | 重复 open 同一设备 | `409 设备已在采集中` |
 | 停止 / 重启 | `count 0` → 重新 start 正常出图 |
 | 保存原始帧 | 1280×720 **uint8 单通道** PNG（无拉伸、无伪彩色） |
-| 原后端 `api/index.py` | 缺 `pyserial` / `ruckig` 时可启动，`/api/cameras` 正常，`socket.io` 握手正常 |
 
 **帧同步实测（阈值 20 ms；历史 60 s 连续运行，另见 2026-11-17 LED 运行统计）**
 
@@ -310,25 +294,21 @@ ROI、极线/三角化、33 mm 三边、自动相机映射、卡尔曼跟踪、�
 
 ### 尚未验证
 
-- **React 前端未能在本机构建/运行**：该机器没有 `node_modules`，且 npm registry 不可达
-  （`registry.npmjs.org`、`registry.npmmirror.com` 均连接失败）。`CameraPreview.tsx` 与 Vite 代理
-  只是按现有代码风格写好，**没有在浏览器里跑过**，请在有网环境 `npm install && npm run dev` 后自查。
-  同步状态显示同样只在 Flask 自带的 `/preview` 页上验证过。
 - **帧同步只做了 60 s 连续验证**：小时级长跑时两路相位可能周期性穿越阈值（实测 60 s 内 Δt 已在
   0–16.7 ms 往复摆动），长跑时建议盯 `dropped` 是否持续增长。
 - **四相机未实现**：`SyncService` 是"A/B 两路"的一对配对器，本身无全局耦合，扩展到四路需要为
   每对（0-1、0-2、0-3…）各建实例并汇总统计，调度层尚未实现。
 - 双相机同时拔插的热插拔恢复只做了断线重连逻辑（1 s 起指数退避），未做真实拔插实验。
-- **标定与 LED 仍只用合成数据 / 假相机验证**：曾采过实机标定图，但尚未形成“固定安装 + 人工方向确认 +
-  多位置独立验证”的可信闭环，仓库不包含可用的实拍标定结果。旧版全局兼容文件
-  `api/calibration/calibration.json` 及其读写代码已移除；真实 RMS、基线、畸变系数必须现场采集后重新求解。
+- **标定仍只用合成数据 / 假相机验证**：曾采过实机标定图，但尚未形成“固定安装 + 人工方向确认 +
+  多位置独立验证”的可信闭环，仓库不包含可用的实拍标定结果。LED 已有实机三点跟踪成功记录，
+  但尚未完成全场景精度验收。旧版全局兼容文件 `api/calibration/calibration.json` 及其读写代码已移除；
+  真实 RMS、基线、畸变系数必须现场采集后重新求解。
 - 合成数据下画面**四角的畸变外推**误差约 1.6 px（补采四角后从 20 px 降到这里），
   实机需按 `radius_coverage.ratio` 自查是否覆盖足够。
-- 标定 UI 只在 Flask 自带 `/preview` 页验证过；React 侧未加标定面板，也未构建。
 - **棋盘格方向（180°）只能人工确认**：矩形板的 D2 四重对称在几何上不可分辨，
   单侧反向还会把基线改掉 20% 而不触发任何残差告警（详见 `docs/calibration.md` 第 6 节）。
   若需要完全自动，需要在板上加 ArUco / 缺角标记，本次未做。
-- **LED 只完成链路与合成验证**：现场仍需调阈值/面积/峰距，并确认 850 nm LED 的实际亮度与曝光；
+- **LED 已有实机三点跟踪记录，但尚未完成全场景精度验收**：现场仍需按距离/曝光调整阈值、面积和峰距；
   L0–L2 为临时编号，尚不能输出唯一航向。
 - Go2 / 机器狗控制与 ROS 2 输出未实现（标定与世界系已建立，见上文）。
 
