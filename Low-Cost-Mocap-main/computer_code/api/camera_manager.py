@@ -77,17 +77,33 @@ class Frame:
         }
 
 
-def _resolve_mf_index(device_key: str | None) -> int | None:
-    """按设备实例 key 找当前枚举索引；找不到返回 None（相机离线）。"""
+def _resolve_device(device_key: str | None):
+    """按设备实例 key 一次性取得 (枚举索引, 名称, symbolic link)。
+
+    每次打开只枚举一次：``ir_camera.list_devices`` 会 MFStartup/MFShutdown，
+    在 4 路并发时反复枚举会增加启动抖动。
+    """
     if not device_key:
         return None
     try:
-        for index, _friendly, link in irc.list_devices():
+        for index, friendly, link in irc.list_devices():
             if camera_controls.device_key(link) == device_key:
-                return int(index)
+                return int(index), friendly, link
     except Exception:
         return None
     return None
+
+
+def _resolve_mf_index(device_key: str | None) -> int | None:
+    resolved = _resolve_device(device_key)
+    return resolved[0] if resolved else None
+
+
+def _error_hint(message: str) -> str:
+    """把常见 HRESULT 翻译成可操作提示；日志只打印一次/分钟，提示要够清楚。"""
+    if "0xC00D3704" in message:
+        return "；设备被其他程序占用或无法启动取流，请关闭其它相机程序/预览实例"
+    return ""
 
 
 class CameraWorker:
@@ -138,6 +154,7 @@ class CameraWorker:
         self._opened_at: float | None = None
         self._offline_since: float | None = None
         self._last_logged_error: str | None = None
+        self._last_logged_at = 0.0
 
     # -- 生命周期 ---------------------------------------------------------
     def start(self) -> "CameraWorker":
@@ -173,10 +190,21 @@ class CameraWorker:
         while not self._stop_evt.is_set():
             cam = None
             try:
-                mf_index = (_resolve_mf_index(self.device_key)
-                            if self.device_key else self.mf_index)
+                friendly = link = None
+                if self.device_key:
+                    resolved = _resolve_device(self.device_key)
+                    if resolved is None:
+                        self._mark_offline("设备未连接（按设备实例标识未找到）")
+                        if not self.reconnect:
+                            break
+                        self._sleep_backoff(backoff)
+                        backoff = min(backoff * 2, 5.0)
+                        continue
+                    mf_index, friendly, link = resolved
+                else:
+                    mf_index = self.mf_index
                 if mf_index is None:
-                    self._mark_offline("设备未连接（按设备实例标识未找到）")
+                    self._mark_offline("设备未连接（没有枚举索引）")
                     if not self.reconnect:
                         break
                     self._sleep_backoff(backoff)
@@ -195,12 +223,17 @@ class CameraWorker:
                 self.state = "streaming"
                 self.error = None
                 self._offline_since = None
-                self._last_logged_error = None
                 self.format_info = cam.info
-                self.device_name = self._device_name(mf_index)
-                self.device_link = self._device_link(mf_index)
-                if self.device_key is None and self.device_link:
-                    self.device_key = camera_controls.device_key(self.device_link)
+                # 名称/link 来自打开前的同一次枚举，避免 open 之后再
+                # MFStartup/MFShutdown 两次（4 路并发时会造成启动抖动）。
+                self.device_name = friendly
+                self.device_link = link
+                if self.device_key is None:
+                    self.device_name = self._device_name(mf_index)
+                    self.device_link = self._device_link(mf_index)
+                    if self.device_link:
+                        self.device_key = camera_controls.device_key(
+                            self.device_link)
                 self._opened_at = time.time()
                 # 按设备实例路径恢复上一次成功设置的曝光/增益；即使 USB
                 # 枚举顺序变化，也不会把 cam0 的参数写到 cam1。
@@ -228,12 +261,17 @@ class CameraWorker:
                 self.state = "error"
                 self.error = "%s: %s" % (type(exc).__name__, exc)
                 self.format_info = None
-                # 重连循环里同一个错误只打印一次；完整 traceback 只在
-                # MOCAP_DEBUG=1 时输出，避免设备被占用时刷屏。
-                if self.error != self._last_logged_error:
-                    print("[cam %d] 采集异常：%s（将自动重连）"
-                          % (self.index, self.error), file=sys.stderr)
+                # 同一个错误最多每分钟打印一次：设备被其它程序占用时，
+                # 重连循环会反复“打开成功 → ReadSample 失败”，只在错误
+                # 变化时打印仍会每秒刷屏。
+                now = time.time()
+                if (self.error != self._last_logged_error
+                        or now - self._last_logged_at > 60.0):
+                    print("[cam %d] 采集异常：%s%s（将自动重连）"
+                          % (self.index, self.error,
+                             _error_hint(self.error)), file=sys.stderr)
                     self._last_logged_error = self.error
+                    self._last_logged_at = now
                     if os.environ.get("MOCAP_DEBUG"):
                         traceback.print_exc()
             finally:
