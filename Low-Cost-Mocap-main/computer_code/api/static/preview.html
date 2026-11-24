@@ -225,7 +225,7 @@
 </head>
 <body>
 <header>
-  <h1>双路红外相机预览</h1>
+  <h1>多路红外相机预览</h1>
   <span class="meta" id="summary">连接中…</span>
   <span class="meta" id="build"></span>
   <span class="spacer"></span>
@@ -239,18 +239,18 @@
 </div>
 
 <section id="syncbar">
-  <b>帧同步</b>
+  <b>帧同步（多相机帧组）</b>
   <span class="pill">软件级 · 主机单调时钟</span>
   <label>阈值 <input id="maxdt" type="number" min="1" max="200" step="1" value="20"> ms</label>
-  <span>累计配对率 <b id="s-rate">—</b></span>
+  <span>累计分组率 <b id="s-rate">—</b></span>
   <span>最近300 <b id="s-recent">—</b></span>
-  <span>|Δt| 均值 <b id="s-mean">—</b></span>
+  <span>组内跨度均值 <b id="s-mean">—</b></span>
   <span>P95 <b id="s-p95">—</b></span>
   <span>最大 <b id="s-max">—</b></span>
   <span>丢弃 <b id="s-drop">—</b></span>
   <span>缓存 <b id="s-buf">—</b></span>
   <span class="spacer"></span>
-  <span class="note">Δt 为帧交付时刻差，非曝光中心时刻</span>
+  <span class="note">组内跨度 = 最大−最小交付时刻，非曝光中心</span>
   <button id="btn-sync-save">保存同步对</button>
 </section>
 
@@ -359,7 +359,13 @@
             <option value="detect">最终检测叠加</option>
             <option value="binary">二值化</option>
             <option value="raw">原始灰度</option>
+            <option value="undistort">去畸变图像</option>
             <option value="epipolar">去畸变 + 候选极线诊断</option>
+          </select>
+        </label>
+        <label>极线相机对
+          <select id="l-pair">
+            <option value="0,1">相机0 ↔ 相机1</option>
           </select>
         </label>
         <label>局部放大
@@ -374,16 +380,12 @@
         <span class="hintline">曝光/增益在上方每台相机卡片内控制（DirectShow UVC）</span>
       </div>
       <div class="row">
-        <b>相机映射</b>
-        <select id="l-camera-map">
-          <option value="auto">自动（推荐，按 34/79/79 mm 三角判定）</option>
-          <option value="0,1">实时0 → 标定0 / 实时1 → 标定1</option>
-          <option value="1,0">实时0 → 标定1 / 实时1 → 标定0</option>
-        </select>
+        <b>相机身份绑定</b>
         <span id="l-map-msg" class="badge">—</span>
         <button id="l-diagnose">匹配诊断</button>
-        <span class="hintline">两台相机同名，USB 枚举顺序可能互换；自动模式用正深度 + 34/79/79 mm 三角选择映射</span>
+        <span class="hintline">逻辑编号 ↔ USB 设备实例固定绑定；枚举顺序变化不影响编号。未确认的相机不会套用历史标定。</span>
       </div>
+      <div id="cam-identity" class="roi-grid" style="grid-template-columns:auto 1fr auto auto"></div>
       <div id="l-diag" class="result-grid"></div>
       <div class="row">
         <b>相机曝光 / 增益</b>
@@ -556,7 +558,9 @@
 </section>
 
 <script>
-const CAMERAS = [0, 1];
+const CAMERAS = [0, 1, 2, 3];
+let ACTIVE_CAMERAS = [0, 1, 2, 3];
+let CONFIG_READY = false;
 let running = false;
 
 const el = (id) => document.getElementById(id);
@@ -573,6 +577,127 @@ const pollUrl = {};    // index -> 当前 objectURL
 function log(msg) {
   const t = new Date().toLocaleTimeString('zh-CN', { hour12: false });
   logEl.textContent = `[${t}] ${msg}\n` + logEl.textContent;
+}
+
+function expandUiForCameras() {
+  // 曝光/增益：克隆相机1的控件块给相机2/3
+  const ctrlHost = el('led-controls');
+  const tpl = ctrlHost ? ctrlHost.querySelector('.cam-controls[data-cam="1"]') : null;
+  if (ctrlHost && tpl) {
+    [2, 3].forEach(cam => {
+      if (ctrlHost.querySelector(`.cam-controls[data-cam="${cam}"]`)) return;
+      const node = tpl.cloneNode(true);
+      node.dataset.cam = String(cam);
+      node.querySelectorAll('[id]').forEach(x => {
+        x.id = x.id.replace(/-1$/, '-' + cam);
+        if (x.tagName === 'INPUT') x.value = '';
+      });
+      node.querySelector('b').textContent = '相机 ' + cam;
+      ctrlHost.appendChild(node);
+    });
+  }
+  // 世界轴方向：为相机2/3 克隆独立的“反向 180°”复选框
+  const flipRow = el('c-flip1') ? el('c-flip1').closest('label') : null;
+  if (flipRow) {
+    [2, 3].forEach(cam => {
+      if (el('c-flip' + cam)) return;
+      const node = document.createElement('label');
+      node.innerHTML = `<input type="checkbox" id="c-flip${cam}"> `
+        + `相机${cam} 反向 180°`;
+      flipRow.parentNode.appendChild(node);
+    });
+  }
+  // 标定实时图：必须克隆 **相机1** 的 figure（id 以 1 结尾），
+  // 再替换末尾数字；克隆相机0 会产生重复 id，导致相机2/3 永远不更新。
+  const live = document.querySelector('#calib .live');
+  const figs = live ? live.querySelectorAll('figure') : [];
+  const tplFig = figs.length >= 2 ? figs[1] : null;
+  if (live && tplFig) {
+    [2, 3].forEach(cam => {
+      if (el('c-img' + cam)) return;      // 已经展开过
+      const node = tplFig.cloneNode(true);
+      node.querySelectorAll('[id]').forEach(x => {
+        x.id = x.id.replace(/1$/, String(cam));
+      });
+      const cap = node.querySelector('figcaption');
+      if (cap) cap.textContent = '相机 ' + cam;
+      const img = node.querySelector('img');
+      if (img) { img.alt = 'cam' + cam + ' view'; img.removeAttribute('src'); }
+      live.appendChild(node);
+    });
+  }
+  // LED 参数表：增加相机2/3覆盖列
+  const table = document.querySelector('.led-params table');
+  if (table) {
+    const head = table.querySelector('thead tr');
+    [2, 3].forEach(cam => {
+      const th = document.createElement('th');
+      th.textContent = '相机' + cam + '覆盖';
+      head.appendChild(th);
+    });
+    table.querySelectorAll('tbody tr').forEach(tr => {
+      const cells = [...tr.children];
+      const last = cells[cells.length - 1];
+      if (last.hasAttribute('colspan')) {
+        last.colSpan = 4;
+        return;
+      }
+      const src = cells[cells.length - 1];
+      [2, 3].forEach(cam => {
+        const td = src.cloneNode(true);
+        td.querySelectorAll('[id]').forEach(x => {
+          x.id = x.id.replace(/-1$/, '-' + cam);
+          if (x.tagName === 'INPUT') x.value = '';
+          if (x.tagName === 'SELECT') x.value = '';
+        });
+        tr.appendChild(td);
+      });
+    });
+  }
+  // 手动 ROI：增加相机2/3行
+  const grid = document.querySelector('#led-section .roi-grid');
+  if (grid) {
+    [2, 3].forEach(cam => {
+      if (el('l-roi' + cam + '-x0')) return;
+      const label = document.createElement('span');
+      label.textContent = '相机' + cam;
+      grid.appendChild(label);
+      ['x0', 'y0', 'x1', 'y1'].forEach(k => {
+        const input = document.createElement('input');
+        input.type = 'number';
+        input.id = 'l-roi' + cam + '-' + k;
+        input.min = '0'; input.max = '1'; input.step = '0.01';
+        input.placeholder = k.startsWith('x') ? (k === 'x0' ? '0' : '1')
+                                             : (k === 'y0' ? '0' : '1');
+        grid.appendChild(input);
+      });
+    });
+  }
+}
+
+function applyActiveCameras(list) {
+  const active = (list && list.length) ? list.slice() : [0, 1];
+  ACTIVE_CAMERAS = active;
+  CAMERAS.forEach(i => {
+    const panel = document.querySelector(`.panel[data-cam="${i}"]`);
+    if (panel) panel.style.display = active.includes(i) ? '' : 'none';
+    const fig = document.querySelector(`#calib .live figure:nth-of-type(${i + 1})`);
+    if (fig) fig.style.display = active.includes(i) ? '' : 'none';
+  });
+  const sel = el('l-pair');
+  if (sel && active.length >= 2) {
+    const cur = sel.value;
+    sel.innerHTML = '';
+    for (let a = 0; a < active.length; a++) {
+      for (let b = a + 1; b < active.length; b++) {
+        const o = document.createElement('option');
+        o.value = active[a] + ',' + active[b];
+        o.textContent = `相机${active[a]} ↔ 相机${active[b]}`;
+        sel.appendChild(o);
+      }
+    }
+    if ([...sel.options].some(o => o.value === cur)) sel.value = cur;
+  }
 }
 
 function buildPanels() {
@@ -714,25 +839,27 @@ function fmtNum(v, unit, digits) {
 async function refreshSync() {
   try {
     const s = await api('/api/sync/status');
-    el('s-rate').textContent = s.pair_rate === null ? '—'
-      : (s.pair_rate * 100).toFixed(0) + '%';
+    el('s-rate').textContent = s.group_rate === null ? '—'
+      : (s.group_rate * 100).toFixed(0) + '%';
     if (s.recent) {
-      const rr = s.recent.pair_rate === null ? '—'
-        : (s.recent.pair_rate * 100).toFixed(0) + '%';
-      el('s-recent').textContent = rr + ' (对' + s.recent.pairs
-        + ' 丢' + s.recent.dropped.a + '/' + s.recent.dropped.b + ')';
+      const rr = s.recent.group_rate === null ? '—'
+        : (s.recent.group_rate * 100).toFixed(0) + '%';
+      const rd = Object.values(s.recent.dropped || {});
+      el('s-recent').textContent = rr + ' (组' + s.recent.groups
+        + ' 丢' + rd.join('/') + ')';
     } else {
       el('s-recent').textContent = '—';
     }
-    el('s-mean').textContent = fmtNum(s.dt_ms.mean, ' ms');
-    el('s-p95').textContent = fmtNum(s.dt_ms.p95, ' ms');
-    el('s-max').textContent = fmtNum(s.dt_ms.max, ' ms');
-    el('s-drop').textContent = `${s.dropped.a} / ${s.dropped.b}`;
-    el('s-buf').textContent = `${s.buffered.a} / ${s.buffered.b}`;
+    el('s-mean').textContent = fmtNum(s.span_ms.mean, ' ms');
+    el('s-p95').textContent = fmtNum(s.span_ms.p95, ' ms');
+    el('s-max').textContent = fmtNum(s.span_ms.max, ' ms');
+    el('s-drop').textContent = Object.values(s.dropped || {}).join(' / ') || '—';
+    el('s-buf').textContent = Object.values(s.buffered || {}).join(' / ') || '—';
     // 用户正在输入时不要覆盖输入框
     if (document.activeElement !== el('maxdt')) el('maxdt').value = s.max_dt_ms;
   } catch (e) {
-    ['s-rate', 's-recent', 's-mean', 's-p95', 's-max'].forEach(id => { el(id).textContent = '—'; });
+    ['s-rate', 's-recent', 's-mean', 's-p95', 's-max'].forEach(
+      id => { el(id).textContent = '—'; });
     el('s-drop').textContent = '—';
     el('s-buf').textContent = '—';
   }
@@ -743,8 +870,21 @@ async function refresh() {
   try {
     const st = await api('/api/cameras');
     const now = Date.now() / 1000;
+    if (!CONFIG_READY) {
+      const cfg = st.camera_config && st.camera_config.cameras;
+      if (cfg && cfg.length) {
+        applyActiveCameras(cfg.map(c => c.index));
+      } else if (st.count) {
+        applyActiveCameras(st.cameras.map(c => c.index));
+      }
+      CONFIG_READY = true;
+      api('/api/cameras/config').then(cfg => refreshCameraIdentity(cfg))
+        .catch(() => refreshCameraIdentity(st.camera_config));
+    }
     const live = st.cameras.filter(c => c.state === 'streaming').length;
-    summaryEl.textContent = `在线 ${live}/${st.count} 路 · ${new Date(st.server_time * 1000).toLocaleTimeString('zh-CN', { hour12: false })}`;
+    const configured = ACTIVE_CAMERAS.length;
+    summaryEl.textContent = `在线 ${live}/${configured} 路 · `
+      + new Date(st.server_time * 1000).toLocaleTimeString('zh-CN', { hour12: false });
 
     st.cameras.forEach(c => {
       const i = c.index;
@@ -932,10 +1072,10 @@ CAMERAS.forEach(cam => {
 // ---------- 操作 ----------
 el('btn-start').onclick = async () => {
   try {
-    log('启动相机 ' + CAMERAS.join(', ') + ' …');
+    log('启动相机 ' + ACTIVE_CAMERAS.join(', ') + ' …');
     await api('/api/cameras/start', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ indices: CAMERAS })
+      body: JSON.stringify({ indices: ACTIVE_CAMERAS })
     });
     await refresh();
   } catch (e) { log('启动失败：' + e.message); }
@@ -944,7 +1084,7 @@ el('btn-start').onclick = async () => {
 el('btn-stop').onclick = async () => {
   try {
     log('停止采集…');
-    CAMERAS.forEach(i => stopChannel(i, '已停止'));
+    ACTIVE_CAMERAS.forEach(i => stopChannel(i, '已停止'));
     await api('/api/cameras/stop', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
     });
@@ -995,10 +1135,12 @@ el('btn-sync-save').onclick = async () => {
 
 // 页面关闭/刷新时断开长连接，后端线程不受影响
 window.addEventListener('beforeunload', () => {
-  CAMERAS.forEach(i => stopChannel(i));
+  ACTIVE_CAMERAS.forEach(i => stopChannel(i));
   stopCalibLive();
 });
 
+expandUiForCameras();
+buildPanels();
 refresh();
 ensureCalibSession();
 refreshCameraControls();
@@ -1008,7 +1150,7 @@ el('ctrl-restore').onclick = async () => {
   try {
     const r = await api('/api/cameras/controls/restore', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ indices: CAMERAS })
+      body: JSON.stringify({ indices: ACTIVE_CAMERAS })
     });
     const ok = (r.results || []).filter(x => x.restored).length;
     log(`曝光/增益恢复：${ok}/${(r.results || []).length} 台设备成功`);
@@ -1185,10 +1327,13 @@ function sourceText(d) {
 function applyResultFlags(r) {
   cConfirmSuppressed = false;
   if (r.flip_cam) {
-    el('c-flip0').checked = !!(r.flip_cam['0'] !== undefined
-                               ? r.flip_cam['0'] : r.flip_cam[0]);
-    el('c-flip1').checked = !!(r.flip_cam['1'] !== undefined
-                               ? r.flip_cam['1'] : r.flip_cam[1]);
+    CAMERAS.forEach(cam => {
+      const box = el('c-flip' + cam);
+      if (!box) return;
+      const v = (r.flip_cam[String(cam)] !== undefined
+                 ? r.flip_cam[String(cam)] : r.flip_cam[cam]);
+      box.checked = !!v;
+    });
   }
   el('c-confirmed').checked = r.orientation_confirmed === true;
 }
@@ -1204,8 +1349,8 @@ function renderIntrinsics(st) {
   const intr = (st && st.intrinsics) || {};
   const latest = (st && st.latest_intrinsics) || {};
   let html = '';
-  ['0', '1'].forEach(cam => {
-    const d = intr[cam];
+  CAMERAS.forEach(cam => {
+    const d = intr[String(cam)];
     if (!d) {
       html += resCard('相机 ' + cam + ' 内参', '尚未计算或载入。');
       return;
@@ -1372,7 +1517,11 @@ el('c-ex-pair').onclick = async () => {
 };
 
 el('c-solex').onclick = async () => {
-  const flipCam = { 0: el('c-flip0').checked, 1: el('c-flip1').checked };
+  const flipCam = {};
+  CAMERAS.forEach(cam => {
+    const box = el('c-flip' + cam);
+    if (box) flipCam[cam] = box.checked;
+  });
   const confirmed = el('c-confirmed').checked;
   cLog(`解外参（solvePnP，IPPE+LM）flip_cam=${JSON.stringify(flipCam)} 已确认=${confirmed}`);
   el('c-solex').disabled = true;
@@ -1435,9 +1584,12 @@ el('c-ex-load').onclick = async () => {
   } finally { el('c-ex-load').disabled = false; }
 };
 
-['c-flip0', 'c-flip1'].forEach((id, cam) => {
-  el(id).onchange = async () => {
-    const on = el(id).checked;
+function bindFlipHandlers() {
+  CAMERAS.forEach(cam => {
+    const box = el('c-flip' + cam);
+    if (!box) return;
+    box.onchange = async () => {
+    const on = box.checked;
     // 改了任一相机的 180° 方向，旧外参与“已确认”都不再可信
     cConfirmSuppressed = true;
     el('c-confirmed').checked = false;
@@ -1454,8 +1606,10 @@ el('c-ex-load').onclick = async () => {
     } catch (e) { cLog('作废旧外参失败：' + e.message); }
     if (el('c-vis-mode').value === 'axes') liveTick();
     refreshCalib();
-  };
-});
+    };
+  });
+}
+bindFlipHandlers();
 
 el('c-confirmed').onchange = () => {
   const on = el('c-confirmed').checked;
@@ -1530,13 +1684,13 @@ function populateLedParams(p) {
     setInput(base + '-0', (o['0'] || {})[k]);
     setInput(base + '-1', (o['1'] || {})[k]);
   });
-  [0, 1].forEach(cam => {
+  CAMERAS.forEach(cam => {
     const v = (o[String(cam)] || {}).split_blobs;
     el('l-split-' + cam).value = v === undefined ? ''
       : (v ? '1' : '0');
   });
   const rois = p.rois || {};
-  [0, 1].forEach(cam => {
+  CAMERAS.forEach(cam => {
     const r = rois[String(cam)];
     ['x0', 'y0', 'x1', 'y1'].forEach((key, idx) => {
       setInput('l-roi' + cam + '-' + key,
@@ -1544,19 +1698,15 @@ function populateLedParams(p) {
     });
   });
   el('l-roi-track').checked = p.roi_tracking !== false;
-  const cm = p.camera_map;
-  el('l-camera-map').value = (cm === 'auto' || cm === null || cm === undefined)
-    ? 'auto' : (Array.isArray(cm) ? cm.join(',') : String(cm));
   const mapMsg = el('l-map-msg');
   if (mapMsg) {
-    const eff = p.camera_map_effective;
-    mapMsg.textContent = eff ? ('当前 ' + eff.join(','))
-      : (cm === 'auto' ? '待三维定位确认' : '未生效');
-    mapMsg.className = 'badge ' + (eff ? 'ok' : '');
+    const cams = p.cameras || [];
+    mapMsg.textContent = cams.length ? ('定位相机 ' + cams.join(',')) : '未载入标定';
+    mapMsg.className = 'badge ' + (cams.length ? 'ok' : '');
   }
   const roiMsg = el('l-roi-msg');
   if (roiMsg) {
-    const manual = [0, 1].filter(cam => rois[String(cam)]).length;
+    const manual = CAMERAS.filter(cam => rois[String(cam)]).length;
     roiMsg.textContent = manual ? ('手动 ROI：' + manual + ' 台') : '手动 ROI：全图';
     roiMsg.className = 'badge ' + (manual ? 'ok' : '');
   }
@@ -1602,7 +1752,7 @@ function collectLedParams() {
     }
   }
   const overrides = {};
-  [0, 1].forEach(cam => {
+  CAMERAS.forEach(cam => {
     const o = {};
     Object.entries(LED_PER_CAM_IDS).forEach(([key, id]) => {
       const v = numOrNull(id + '-' + cam);
@@ -1614,7 +1764,7 @@ function collectLedParams() {
     if (Object.keys(o).length) overrides[String(cam)] = o;
   });
   const rois = {};
-  [0, 1].forEach(cam => {
+  CAMERAS.forEach(cam => {
     const vals = ['x0', 'y0', 'x1', 'y1'].map(k =>
       numOrNull('l-roi' + cam + '-' + k));
     const filled = vals.filter(v => v !== null).length;
@@ -1624,11 +1774,8 @@ function collectLedParams() {
     }
     rois[String(cam)] = vals;
   });
-  const mapVal = el('l-camera-map').value;
-  const cameraMap = mapVal === 'auto' ? 'auto'
-    : mapVal.split(',').map(Number);
   return { params: common, overrides, rois,
-           roi_tracking: el('l-roi-track').checked, camera_map: cameraMap };
+           roi_tracking: el('l-roi-track').checked };
 }
 
 el('l-params-apply').onclick = async () => {
@@ -1723,6 +1870,73 @@ function renderLedRecording(r) {
   if (el('l-record-stop')) el('l-record-stop').disabled = !active;
 }
 
+let camIdentityBusy = false;
+
+function refreshCameraIdentity(cfg) {
+  const box = el('cam-identity');
+  if (!box) return;
+  const cams = (cfg && cfg.cameras) || [];
+  if (!cams.length) {
+    box.innerHTML = '<span class="hintline">没有相机配置</span>';
+    return;
+  }
+  box.innerHTML = '';
+  cams.forEach(c => {
+    const name = document.createElement('span');
+    name.textContent = `相机${c.index}`;
+    box.appendChild(name);
+    const sel = document.createElement('select');
+    sel.id = 'id-dev-' + c.index;
+    sel.style.minWidth = '320px';
+    box.appendChild(sel);
+    const badge = document.createElement('span');
+    badge.className = 'badge ' + (c.confirmed ? 'ok' : 'warn');
+    badge.textContent = c.confirmed ? '已确认' : '待确认';
+    box.appendChild(badge);
+    const btn = document.createElement('button');
+    btn.textContent = c.confirmed ? '重新确认' : '确认绑定';
+    btn.onclick = async () => {
+      if (camIdentityBusy) return;
+      camIdentityBusy = true;
+      btn.disabled = true;
+      try {
+        const key = sel.value;
+        await api('/api/cameras/config', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ index: c.index, device_key: key,
+                                 confirmed: true })
+        });
+        cLog(`相机${c.index} 已绑定并确认：${key}`);
+        const st = await api('/api/cameras');
+        refreshCameraIdentity(st.camera_config);
+      } catch (e) {
+        cLog('绑定失败：' + e.message);
+      } finally {
+        camIdentityBusy = false;
+        btn.disabled = false;
+      }
+    };
+    box.appendChild(btn);
+    // 设备下拉：当前配置 + 在线设备
+    const devs = (cfg.devices || []);
+    const seen = new Set();
+    const add = (key, label, selected) => {
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      const o = document.createElement('option');
+      o.value = key;
+      o.textContent = label;
+      if (selected) o.selected = true;
+      sel.appendChild(o);
+    };
+    add(c.device_key, `当前：${c.device_key}`, true);
+    devs.forEach(d => add(d.device_key,
+      `${d.name || '设备'}  ${d.device_key}`
+      + (d.logical_index !== null && d.logical_index !== undefined
+        ? `（已绑定相机${d.logical_index}）` : ''), false));
+  });
+}
+
 function renderLedState(s) {
   renderLedRecording(s && s.recording);
   const tag = el('l-state');
@@ -1735,67 +1949,58 @@ function renderLedState(s) {
     tag.className = 'badge ' + (ok ? 'ok' : (bad ? 'err' : (s
       && s.detect_enabled ? 'warn' : '')));
   }
-  const mapBadge = el('l-map-msg');
-  if (mapBadge && s && s.mapping) {
-    const eff = s.mapping.effective;
-    mapBadge.textContent = eff ? ('当前 ' + eff.join(',')) : '待三维定位确认';
-    mapBadge.className = 'badge ' + (eff && s.mapping.confirmed ? 'ok' : 'warn');
-  }
   const box = el('l-out');
   if (!box) return;
   if (!s || (!s.detect_enabled && !s.locate_enabled)) {
-    box.innerHTML = resCard('红外检测', '未启动。先启动双相机并载入内外参，'
+    box.innerHTML = resCard('红外检测', '未启动。先启动相机并载入内外参，'
       + '再点「开始二维检测」。');
     return;
   }
   const pair = s.pair || {};
-  const d0 = (s.detections || {})['0'] || {};
-  const d1 = (s.detections || {})['1'] || {};
-  const camText = (d) => {
+  const dets = s.detections || {};
+  const cams = pair.cameras || Object.keys(dets).map(Number);
+  const camText = (c) => {
+    const d = dets[String(c)] || {};
     const roiMode = d.roi_mode === 'track' ? '动态ROI'
       : (d.roi_mode === 'manual' ? '手动ROI'
       : (d.roi_mode === 'full_fallback' ? '全图回退' : '全图'));
     const warns = (d.warnings || []).length ? ' · 警告 ' + d.warnings.length : '';
-    return '原始 ' + (d.raw_count || 0) + ' · 候选 ' + (d.count || 0)
-      + ' · ' + (LED_STATUS_NAMES[d.status] || d.status || '—')
-      + ' · ' + roiMode + warns;
+    return `相机${c}：原始 ${d.raw_count || 0} · 候选 ${d.count || 0} · `
+      + `${LED_STATUS_NAMES[d.status] || d.status || '—'} · ${roiMode}${warns}`
+      + ((d.reason) ? ('\n  ' + d.reason) : '')
+      + ((d.warnings || []).length ? ('\n  警告：' + d.warnings[0]) : '');
   };
-  const camWarn = (d) => ((d.warnings || []).length
-    ? '\n  警告：' + d.warnings[0] : '');
-  const detText = '相机0：' + camText(d0) + ((d0.reason) ? '\n  ' + d0.reason : '')
-    + camWarn(d0)
-    + '\n相机1：' + camText(d1) + ((d1.reason) ? '\n  ' + d1.reason : '')
-    + camWarn(d1)
-    + '\n同步帧对：' + (pair.pair_seq === undefined ? '—' : pair.pair_seq)
-    + '  Δt=' + (pair.dt_ms === undefined ? '—' : pair.dt_ms) + ' ms\n'
-    + '处理帧数：' + (s.processed_pairs || 0)
-    + '  耗时 ' + (s.processing_ms || 0).toFixed(1) + ' ms';
+  const detText = cams.map(camText).join('\n')
+    + '\n同步帧组：' + (pair.group_seq === undefined ? '—' : pair.group_seq)
+    + `（${cams.length} 台）`
+    + '  跨度=' + (pair.span_ms === undefined ? '—' : pair.span_ms) + ' ms\n'
+    + '处理帧组：' + (s.processed_pairs || 0)
+    + '  跳过 ' + (s.groups_skipped || 0)
+    + '  耗时 ' + (s.processing_ms || 0).toFixed(1) + ' ms'
+    + (s.stage_ms ? ('（检测 ' + (s.stage_ms.detect_ms || 0)
+      + ' / 匹配 ' + (s.stage_ms.match_ms || 0) + ' ms）') : '');
   let html = resCard('二维检测', detText);
   if (!s.locate_enabled) {
-    html += resCard('三维定位', '未启动。两台相机稳定检测到 3 个 LED 后，'
+    html += resCard('三维定位', '未启动。至少两台相机稳定检测到 3 个 LED 后，'
       + '再点「开始三维定位」。');
     box.innerHTML = html;
     return;
   }
   let loc = '状态：' + (LED_STATUS_NAMES[s.status] || s.status) + '\n';
-  if (s.mapping) {
-    loc += '相机映射：' + (s.mapping.effective
-      ? ('实时0→标定' + s.mapping.effective[0] + ' / 实时1→标定' + s.mapping.effective[1])
-      : '待确认')
-      + ' · ' + (s.mapping.confirmed ? '已确认' : '未确认')
-      + ' · 模式 ' + s.mapping.mode + '\n';
+  if (s.cameras_used && s.cameras_used.length) {
+    loc += '参与定位的相机：' + s.cameras_used.join(', ') + '\n';
   }
   if (s.diagnostics) {
     const dg = s.diagnostics;
-    loc += '匹配阶段：epi ' + (dg.epipolar_pass || 0)
-      + ' / 正深度 ' + (dg.depth_pass || 0)
-      + ' / 重投影 ' + (dg.reprojection_pass || 0)
-      + ' / 候选 ' + (dg.candidate_count || 0) + '\n';
+    loc += '匹配阶段：3D 候选 ' + (dg.candidate_count || 0)
+      + ' · 相机对候选 ' + (dg.pair_hypotheses || 0)
+      + ' · 合法三角 ' + (dg.valid_triangles || 0) + '\n';
   }
   if (s.reason) loc += '原因：' + s.reason + '\n';
   if (s.leds && s.leds.length === 3) {
     s.leds.forEach(l => {
-      loc += 'L' + l.label + '：' + fmtVec(l.xyz, 3) + ' m\n';
+      loc += 'L' + l.label + '：' + fmtVec(l.xyz, 3) + ' m  '
+        + `（${(l.observations || []).map(o => 'C' + o.camera + '#' + o.index).join(' ')}）\n`;
     });
   }
   if (s.edges_mm) {
@@ -1803,7 +2008,7 @@ function renderLedState(s) {
          + '边长误差：' + fmtVec(s.edge_errors_mm, 2) + ' mm\n';
   }
   if (s.orientation_consistent !== undefined && s.orientation_consistent !== null) {
-    loc += '两相机三点绕向：' + (s.orientation_consistent ? '一致' : '不一致（检查标定/翻转）') + '\n';
+    loc += '多相机三点绕向：' + (s.orientation_consistent ? '一致' : '不一致（检查标定/翻转）') + '\n';
   }
   if (s.mean_reprojection_px !== null && s.mean_reprojection_px !== undefined) {
     loc += '重投影 mean ' + s.mean_reprojection_px + ' px · 极线 mean '
@@ -1881,38 +2086,36 @@ async function showLedDiagnostics() {
     const d = await api('/api/led/diagnose');
     const box = el('l-diag');
     const diag = d.diagnostics || {};
-    const maps = diag.mappings || {};
     const lines = [];
-    lines.push('帧对：' + ((d.pair || {}).pair_seq === undefined ? '—' : d.pair.pair_seq)
-      + '  Δt=' + ((d.pair || {}).dt_ms === undefined ? '—' : d.pair.dt_ms) + ' ms');
-    lines.push('映射模式：' + d.camera_map_mode + ' · 当前 '
-      + ((d.camera_map || []).join(',') || '—'));
-    Object.keys(maps).sort().forEach(key => {
-      const m = maps[key] || {};
-      lines.push('');
-      lines.push('映射 ' + key + '（实时0→标定' + key.split(',')[0]
-        + '，实时1→标定' + key.split(',')[1] + '）');
-      lines.push('  epi通过 ' + (m.epipolar_pass || 0)
-        + ' · 正深度 ' + (m.depth_pass || 0)
-        + ' · 重投影通过 ' + (m.reprojection_pass || 0)
-        + ' · 候选 ' + (m.candidate_count || 0)
-        + ' · 合法三角 ' + (m.valid_triangles || 0));
-      if (m.epipolar_distances) {
-        lines.push('  极线距离矩阵(px)：');
-        m.epipolar_distances.forEach(row => lines.push('    ' + row.join('  ')));
-      }
-      if (m.raw_points_0) lines.push('  cam0 原始：' + JSON.stringify(m.raw_points_0));
-      if (m.raw_points_1) lines.push('  cam1 原始：' + JSON.stringify(m.raw_points_1));
-      if (m.ideal_points_0) lines.push('  cam0 去畸变：' + JSON.stringify(m.ideal_points_0));
-      if (m.ideal_points_1) lines.push('  cam1 去畸变：' + JSON.stringify(m.ideal_points_1));
-      if (m.best_edges_mm) lines.push('  最佳三边(mm, 排序)：'
-        + m.best_edges_mm.join(' / ') + ' · 期望 34/79/79'
-        + ' · 误差 ' + (m.best_edge_errors_mm || []).join(' / '));
-      if (m.best_reprojection_px !== undefined && m.best_reprojection_px !== null) {
-        lines.push('  最佳重投影 ' + m.best_reprojection_px + ' px · 极线 '
-          + m.best_epipolar_px + ' px');
+    lines.push('帧组：' + ((d.pair || {}).group_seq === undefined
+      ? '—' : (d.pair || {}).group_seq)
+      + '  ' + (((d.pair || {}).cameras) || []).length + ' 台'
+      + '  跨度=' + ((d.pair || {}).span_ms === undefined
+        ? '—' : (d.pair || {}).span_ms) + ' ms');
+    lines.push('相机：' + ((d.cameras || []).join(', ') || '—'));
+    lines.push('3D 候选 ' + (diag.candidate_count || 0)
+      + ' · 相机对候选 ' + (diag.pair_hypotheses || 0)
+      + ' · 合法三角 ' + (diag.valid_triangles || 0));
+    (diag.points || []).forEach((p, i) => {
+      lines.push(`  P${i}  ${(p.xyz || []).map(v => v.toFixed(3)).join(', ')}`
+        + '  观测 ' + Object.entries(p.observations || {})
+          .map(([c, idx]) => `C${c}#${idx}`).join(' ')
+        + '  重投影 ' + Object.values(p.reproj_px || {}).join('/'));
+    });
+    const pairs = diag.pairwise || {};
+    Object.keys(pairs).sort().forEach(key => {
+      const m = pairs[key] || {};
+      const mat = m.epipolar_distances || [];
+      const pass = mat.flat().filter(v => v <= (diag.epipolar_tol_px || 5)).length;
+      lines.push(`  相机对 ${key}：极线通过 ${pass} / ${mat.flat().length}`);
+      if (mat.length && mat.length <= 8) {
+        mat.forEach(row => lines.push('    ' + row.join('  ')));
       }
     });
+    if (diag.best_edges_mm) {
+      lines.push('最佳三边(mm)：' + diag.best_edges_mm.join(' / ')
+        + ' · 误差 ' + (diag.best_edge_errors_mm || []).join(' / '));
+    }
     if (box) box.innerHTML = resCard('匹配诊断', lines.join('\n'));
     cLog('匹配诊断：' + lines.slice(0, 3).join(' | '));
   } catch (e) {
@@ -2099,19 +2302,22 @@ async function liveTick() {
       // cam0 显示 9464、cam1 显示 9466。内部三角化一直使用同一帧对。
       const view = el('l-view') ? el('l-view').value : 'detect';
       const zoom = el('l-zoom') ? el('l-zoom').value : '1';
+      const pairSel = el('l-pair') ? el('l-pair').value : '0,1';
       const r = await fetch(apiUrl(
         `/api/led/overlay_pair?scale=0.55&view=${encodeURIComponent(view)}`
-        + `&zoom=${encodeURIComponent(zoom)}&t=${Date.now()}`),
+        + `&zoom=${encodeURIComponent(zoom)}`
+        + `&cameras=${encodeURIComponent(ACTIVE_CAMERAS.join(','))}`
+        + `&pair=${encodeURIComponent(pairSel)}&t=${Date.now()}`),
         { cache: 'no-store' });
       if (!r.ok) {
-        CAMERAS.forEach(cam => {
+        ACTIVE_CAMERAS.forEach(cam => {
           const img = el('c-img' + cam);
           if (img) img.removeAttribute('src');
         });
         return;
       }
       const d = await r.json();
-      CAMERAS.forEach(cam => {
+      ACTIVE_CAMERAS.forEach(cam => {
         const img = el('c-img' + cam);
         if (!img) return;
         const b64 = (d.images || {})[String(cam)];
@@ -2127,10 +2333,11 @@ async function liveTick() {
       });
       return;
     }
-    for (const cam of CAMERAS) {
+    for (const cam of ACTIVE_CAMERAS) {
       const img = el('c-img' + cam);
       if (!img) continue;
-      const flip = el(cam === 0 ? 'c-flip0' : 'c-flip1').checked ? 1 : 0;
+      const flipBox = el('c-flip' + cam);
+      const flip = (flipBox && flipBox.checked) ? 1 : 0;
       const qs = `camera=${cam}&scale=0.55&t=${Date.now()}`;
       let feed;
       if (mode === 'axes') {
@@ -2167,7 +2374,7 @@ function startCalibLive() {
 
 function stopCalibLive() {
   if (cLiveTimer) { clearInterval(cLiveTimer); cLiveTimer = null; }
-  CAMERAS.forEach(c => {
+  ACTIVE_CAMERAS.forEach(c => {
     const img = el('c-img' + c);
     if (img) img.removeAttribute('src');
   });
@@ -2216,10 +2423,11 @@ function sceneCams(st) {
   if (ex && ex.cameras) {
     Object.entries(ex.cameras).forEach(([k, c]) => {
       const f = (intr[k] && intr[k].focal_px) || [900, 900];
+      const isz = (intr[k] && intr[k].image_size) || size;
       out.push({
         k, C: c.centre_m || [0, 0, 0], R: c.R_cam_to_world || null,
         fx: f[0] || 900, fy: f[1] || 900,
-        imgW: size[0] || 1280, imgH: size[1] || 720,
+        imgW: isz[0] || 1280, imgH: isz[1] || 720,
         rms: c.reprojection_rms_px,
         height: c.height_above_floor_m,
       });
