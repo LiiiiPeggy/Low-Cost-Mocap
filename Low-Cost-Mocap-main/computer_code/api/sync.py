@@ -1,44 +1,32 @@
-"""双相机软件帧同步：基于**主机单调时间戳**的流式最近邻配对。
+"""多相机软件帧同步：基于**主机单调时间戳**的流式最近邻分组。
 
 ==========================================================================
 时间戳的边界（这一节决定了本模块能声称什么、不能声称什么）
 ==========================================================================
-1. 配对只用 ``time.perf_counter()``（monotonic）——同一进程、同一时钟、同一
+1. 分组只用 ``time.perf_counter()``（monotonic）——同一进程、同一时钟、同一
    时间基准。**不用** Wall clock，避免系统对时导致时间轴跳变。
 
 2. ``mf_timestamp`` 是每台相机**各自**的 Media Foundation 流时间轴，起点由
-   驱动/会话决定（本机实测两台从 67289s 这种"开机以来"的量级起步，但起点
-   是否一致没有保证）。因此**跨设备直接相减是没有意义的**，它只用于：
-     - 单机内检测丢帧 / 间隔抖动（同设备相邻 mf_ts 之差 ≈ 帧周期）；
-     - 作为溯源信息随图保存，便于事后回放。
-   本次配对**完全不使用** mf_ts。
+   驱动/会话决定，**跨设备直接相减没有意义**，只用于单机内检测丢帧和溯源。
+   分组**完全不使用** mf_ts。
 
-3. 时间戳记录的是**帧交付给用户态的时刻**（``ReadSample`` 返回、解码完成的
-   时刻），**不是曝光中心时刻**：
+3. 时间戳记录的是**帧交付给用户态**的时刻，**不是曝光中心时刻**：
        交付时刻 = 曝光中心 + 曝光时长 + 传感器读出 + USB 传输 + 驱动缓冲
-   注意 USB 2.0/3.0 的传输抖动、MJPEG 解码耗时都会进入这个差值，而且它随
-   曝光参数、帧率、负载变化，**不是常数偏移**，所以无法用一个固定量补偿。
+   该差值随曝光参数、帧率、负载变化，不是常数偏移，无法固定补偿。
 
-4. 因此这里实现的是**软件级近似同步**，不是硬件同步：
-     - 本机 30fps 下，帧周期 33.3ms，时间量化误差本身就有 ±16.7ms 量级；
-     - 加上第 3 条的交付延迟差，单对帧的"真实曝光时间差"可能比报告的
-       Δt 更大，且方向未知；
-     - 结论：可满足"同一时刻的两视角大致对应"（标定板静止、低速运动），
-       **不能**用于快速运动目标的亚毫秒三角化。要更高精度需要硬件触发
-       （共享时钟/闪光同步）或 LED 检测做偏差标定，本模块不涉及。
+4. 因此这里是**软件级近似同步**，不是硬件同步：30fps 下半帧量化误差就有
+   ±16.7ms。适用于静止标定板 / 低速目标，**不能**用于快速运动目标的亚毫秒
+   三角化。
 
-配对策略
+分组策略
 --------------------------------------------------------------------------
 * 每台相机维护定长环形缓存（默认 45 帧，约 1.5s@30fps）；
-* 两路各自有一个"已消费指针"（按 seq 单调推进），保证**帧不重复使用**、
-  **配对时间戳单调不减**；
-* 双指针贪心：比较两路各自最老的未消费帧，
-    |Δt| ≤ max_dt        → 配对，双双前进；
-    Δt > 0（A 更老）     → A 落单，丢弃 A 并计入 dropped；
-    Δt < 0（B 更老）     → B 落单，丢弃 B 并计入 dropped。
-  因为始终丢掉"更老的那一帧"，所以留下的最新帧对必然是时间上最接近的，
-  这就是流式条件下的最近邻；
-* 一路停流超过 ``stall_s`` 时，把另一路积压的帧全部计为丢弃，避免统计失真。
+* 每台相机一个"已消费指针"（按 seq 单调推进），帧不重复使用；
+* 每次取**最老的未消费帧**作为锚点，其他相机各取与锚点时间差 ≤ ``max_dt``
+  的最近一帧；组内至少 2 台相机才输出；
+* 组内跨度 = 最大时间戳 − 最小时间戳；
+* 某台相机离线/丢帧时，剩余相机照常组成三相机或双相机帧组，不长期等待；
+* 一路停流超过 ``stall_s`` 时，积压帧按丢弃计，避免统计失真。
 """
 
 from __future__ import annotations
@@ -49,7 +37,7 @@ import threading
 import time
 import traceback
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 
 import cv2
@@ -64,39 +52,68 @@ DEFAULT_WINDOW = int(os.environ.get("MOCAP_SYNC_WINDOW", "300"))
 DEFAULT_RECENT = int(os.environ.get("MOCAP_SYNC_RECENT", "16"))
 DEFAULT_OUT_DIR = os.environ.get("MOCAP_SYNC_DIR", os.path.join(
     os.environ.get("MOCAP_CAPTURE_DIR", os.path.abspath("captures")), "sync"))
+MAX_GROUP_CAMERAS = 4
 
 
 @dataclass
-class PairRecord:
-    """一对已配对的帧。持有 Frame 引用，所以只保留最近若干对（默认 16）。"""
+class GroupRecord:
+    """一组已同步的帧（2..N 台相机）。持有 Frame 引用，只保留最近若干组。"""
 
-    pair_seq: int
-    dt_ms: float                 # b.mono - a.mono，有符号，正数表示 B 更晚
-    frame_a: Frame
-    frame_b: Frame
+    group_seq: int
+    frames: dict[int, Frame]          # 逻辑相机编号 -> 帧
+    span_ms: float                    # max(mono) - min(mono)
     created_mono: float
+    dropped_before: dict[int, int] = field(default_factory=dict)
+
+    @property
+    def pair_seq(self) -> int:
+        """兼容旧字段名。"""
+        return self.group_seq
+
+    @property
+    def dt_ms(self) -> float:
+        return self.span_ms
+
+    @property
+    def cameras(self) -> list[int]:
+        return sorted(self.frames)
+
+    @property
+    def frame_a(self) -> Frame:
+        return self.frames[self.cameras[0]]
+
+    @property
+    def frame_b(self) -> Frame:
+        return self.frames[self.cameras[1]]
+
+    def frame(self, camera: int) -> Frame | None:
+        return self.frames.get(int(camera))
 
     def meta(self) -> dict:
+        cams = self.cameras
         return {
-            "pair_seq": self.pair_seq,
-            "dt_ms": round(self.dt_ms, 3),
-            "dt_definition": "b.monotonic_timestamp - a.monotonic_timestamp",
-            "a": dict(self.frame_a.meta(), index=None),
-            "b": dict(self.frame_b.meta(), index=None),
+            "group_seq": self.group_seq,
+            "pair_seq": self.group_seq,      # 兼容旧字段名
+            "cameras": cams,
+            "span_ms": round(self.span_ms, 3),
+            "span_definition": "max(monotonic) - min(monotonic) within the group",
+            "frames": {str(c): dict(self.frames[c].meta(), index=c)
+                       for c in cams},
+            "dropped_before": {str(k): int(v)
+                               for k, v in self.dropped_before.items()},
         }
 
 
 class SyncService:
-    """后台常驻的配对线程 + 统计。线程安全：统计只在自身线程写，读端拿快照。"""
+    """后台常驻的分组线程 + 统计。线程安全：统计只在自身线程写，读端拿快照。"""
 
-    def __init__(self, idx_a: int = 0, idx_b: int = 1,
-                 max_dt_ms: float = DEFAULT_MAX_DT_MS,
+    def __init__(self, indices=None, max_dt_ms: float = DEFAULT_MAX_DT_MS,
                  window: int = DEFAULT_WINDOW,
                  recent: int = DEFAULT_RECENT,
                  poll_interval: float = 0.01,
                  stall_s: float = 0.5):
-        self.idx_a = int(idx_a)
-        self.idx_b = int(idx_b)
+        self.indices: list[int] = []
+        self.set_indices(indices or [0, 1])
         self.max_dt_ms = float(max_dt_ms)
         self.window = int(window)
         self.stall_s = float(stall_s)
@@ -105,31 +122,39 @@ class SyncService:
         self._lock = threading.Lock()
         self._stop = threading.Event()
 
-        # 已消费指针（seq，单调递增）
-        self._last_a = 0
-        self._last_b = 0
+        # 已消费指针（每台相机一个 seq，单调递增）
+        self._last: dict[int, int] = {i: 0 for i in self.indices}
 
         # 统计
-        self._pairs_total = 0
-        self._dt_ms: deque[float] = deque(maxlen=self.window)        # |Δt|
-        self._dt_signed: deque[float] = deque(maxlen=self.window)    # 有符号 Δt
-        self._dropped_a = 0
-        self._dropped_b = 0
-        self._recent: deque[PairRecord] = deque(maxlen=int(recent))
-        # 最近 300 个配对/丢弃事件，用于区分历史累计与当前实时状态
+        self._groups_total = 0
+        self._span_ms: deque[float] = deque(maxlen=self.window)
+        self._signed_span: deque[float] = deque(maxlen=self.window)
+        self._dropped: dict[int, int] = {i: 0 for i in self.indices}
+        self._recent: deque[GroupRecord] = deque(maxlen=int(recent))
         self._recent_events: deque[str] = deque(maxlen=300)
+        self._group_sizes: dict[str, int] = {}
 
-        # 配对率基线：同步启动那一刻两路各已产出多少帧
-        self._base_a: int | None = None
-        self._base_b: int | None = None
+        # 基线：同步启动那一刻各相机已产出多少帧
+        self._base: dict[int, int | None] = {i: None for i in self.indices}
 
-        self._last_pair_mono: float | None = None
+        self._last_group_mono: float | None = None
         self._error: str | None = None
 
-        self._thread = threading.Thread(target=self._loop, name="sync-pairer", daemon=True)
+        self._thread = threading.Thread(target=self._loop, name="sync-grouper",
+                                        daemon=True)
         self._thread.start()
 
     # -- 生命周期 ---------------------------------------------------------
+    def set_indices(self, indices) -> list[int]:
+        idxs = [int(i) for i in indices]
+        with getattr(self, "_lock", threading.Lock()):
+            self.indices = idxs
+            if hasattr(self, "_last"):
+                self._last = {i: self._last.get(i, 0) for i in idxs}
+                self._dropped = {i: self._dropped.get(i, 0) for i in idxs}
+                self._base = {i: self._base.get(i) for i in idxs}
+        return idxs
+
     def stop(self) -> None:
         self._stop.set()
 
@@ -140,17 +165,15 @@ class SyncService:
     def reset_pointers(self) -> None:
         """相机重启后调用：清空指针与统计（历史缓存也不会再增长）。"""
         with self._lock:
-            self._last_a = 0
-            self._last_b = 0
-            self._pairs_total = 0
-            self._dt_ms.clear()
-            self._dt_signed.clear()
-            self._dropped_a = 0
-            self._dropped_b = 0
+            self._last = {i: 0 for i in self.indices}
+            self._groups_total = 0
+            self._span_ms.clear()
+            self._signed_span.clear()
+            self._dropped = {i: 0 for i in self.indices}
             self._recent.clear()
             self._recent_events.clear()
-            self._base_a = None
-            self._base_b = None
+            self._base = {i: None for i in self.indices}
+            self._group_sizes = {}
 
     def set_max_dt(self, max_dt_ms: float) -> float:
         v = max(1.0, min(500.0, float(max_dt_ms)))
@@ -158,7 +181,7 @@ class SyncService:
             self.max_dt_ms = v
         return v
 
-    # -- 配对线程 ---------------------------------------------------------
+    # -- 分组线程 ---------------------------------------------------------
     def _loop(self) -> None:
         while not self._stop.is_set():
             try:
@@ -171,214 +194,243 @@ class SyncService:
 
     def _tick(self) -> None:
         m = manager()
-        wa = m.worker(self.idx_a)
-        wb = m.worker(self.idx_b)
-        if wa is None or wb is None:
-            return
-        if wa.state != "streaming" or wb.state != "streaming":
-            return
-
-        la = wa.latest()
-        lb = wb.latest()
-        if la is None or lb is None:
+        workers = {}
+        for i in self.indices:
+            w = m.worker(i)
+            if w is not None and w.state == "streaming":
+                workers[i] = w
+        if len(workers) < 2:
             return
 
-        # 配对率基线取"缓存里最老的帧之前"，否则缓存中早于首次 tick 的帧会被配对
+        # 基线取"缓存里最老的帧之前"，否则缓存中早于首次 tick 的帧会被配对
         # 却不计入分母，导致配对数 > 产生数（>100% 的假值）。
-        if self._base_a is None or self._base_b is None:
-            ha = wa.history_after(0)
-            hb = wb.history_after(0)
-            with self._lock:
-                if self._base_a is None:
-                    self._base_a = (ha[0].seq - 1) if ha else wa.frames_total
-                if self._base_b is None:
-                    self._base_b = (hb[0].seq - 1) if hb else wb.frames_total
-
         with self._lock:
-            last_a, last_b = self._last_a, self._last_b
+            base_missing = [i for i in workers if self._base.get(i) is None]
+        for i in base_missing:
+            w = workers[i]
+            h = w.history_after(0)
+            with self._lock:
+                if self._base.get(i) is None:
+                    self._base[i] = (h[0].seq - 1) if h else w.frames_total
+
+        # 每台相机：取未消费帧；检测 seq 倒退（相机重启）
+        buffers: dict[int, list[Frame]] = {}
+        with self._lock:
+            last_map = dict(self._last)
             max_dt = self.max_dt_ms / 1000.0
-
-        # 相机重启后 seq 从 1 重新计数，若指针还在旧的大值上，配对会永久停摆。
-        # 检测到倒退就就地重置（不依赖调用方显式通知）。
-        if la.seq < last_a:
-            with self._lock:
-                self._last_a = 0
-                self._base_a = wa.frames_total
-            last_a = 0
-        if lb.seq < last_b:
-            with self._lock:
-                self._last_b = 0
-                self._base_b = wb.frames_total
-            last_b = 0
-
-        A = wa.history_after(last_a)
-        B = wb.history_after(last_b)
-        if not A and not B:
+        for i, w in workers.items():
+            last = last_map.get(i, 0)
+            latest = w.latest()
+            if latest is not None and latest.seq < last:
+                with self._lock:
+                    self._last[i] = 0
+                    self._base[i] = w.frames_total
+                last = 0
+            buffers[i] = w.history_after(last)
+        if not any(buffers.values()):
             return
 
         now = time.perf_counter()
-        i = j = 0
-        while i < len(A) and j < len(B):
-            a, b = A[i], B[j]
-            dt = b.mono_ts - a.mono_ts          # 有符号：正数表示 B 更晚
-            if abs(dt) <= max_dt:
-                self._emit(a, b, dt)
-                i += 1
-                j += 1
-            elif dt > 0:
-                self._drop("a")
-                i += 1                            # A 太老，丢掉
-            else:
-                self._drop("b")
-                j += 1                            # B 太老，丢掉
+        # 停流相机：积压帧不可能再配上，直接计入丢弃
+        for i, w in workers.items():
+            latest = w.latest()
+            if latest is not None and (now - latest.mono_ts) > self.stall_s:
+                frames = buffers.get(i) or []
+                if frames:
+                    self._drop_many(i, len(frames))
+                    with self._lock:
+                        self._last[i] = frames[-1].seq
+                    buffers[i] = []
 
-        # 一路停流：另一路的积压帧不可能再配上，按丢弃计，避免配对率虚高
-        if i < len(A) and (now - lb.mono_ts) > self.stall_s:
-            with self._lock:
-                cnt = len(A) - i
-                self._dropped_a += cnt
-                for _ in range(cnt):
-                    self._recent_events.append("drop_a")
-                self._last_a = A[-1].seq
-            i = len(A)
-        elif i:
-            with self._lock:
-                self._last_a = A[i - 1].seq
+        while True:
+            heads = [(buf[0].mono_ts, i) for i, buf in buffers.items() if buf]
+            if not heads:
+                break
+            # 以每台相机的最老未消费帧作为候选窗口起点，选**参与相机最多、
+            # 跨度最小**的一组；这样不会因为固定以某台相机为锚点而漏掉
+            # 其它相机（4 台相机相位不同时尤其明显）。
+            best = None            # (n_cameras, -span, start, group{ cam: (j, frame) })
+            for start, _cam in heads:
+                group = {}
+                for i, buf in buffers.items():
+                    j = 0
+                    while j < len(buf) and buf[j].mono_ts < start - 1e-9:
+                        j += 1
+                    if j < len(buf) and buf[j].mono_ts <= start + max_dt:
+                        group[i] = (j, buf[j])
+                if len(group) < 2:
+                    continue
+                times = [f.mono_ts for _j, f in group.values()]
+                span = max(times) - min(times)
+                key = (len(group), -span)
+                if best is None or key > best[0]:
+                    best = (key, start, group)
+            if best is None:
+                # 最老的帧无法与任何相机配对：丢掉一帧后继续
+                _, cam = min(heads)
+                self._drop_many(cam, 1)
+                with self._lock:
+                    self._last[cam] = buffers[cam][0].seq
+                del buffers[cam][:1]
+                continue
+            _key, _start, group = best
+            self._emit({c: f for c, (_j, f) in group.items()})
+            for i, (j, frame) in group.items():
+                with self._lock:
+                    self._last[i] = frame.seq
+                del buffers[i][:j + 1]
+            # 未被选中的相机：丢掉已经比窗口起点还老、且不会再被任何窗口
+            # 选中的帧（它们比当前窗口早超过 max_dt）。
+            horizon = _start + max_dt
+            for i, buf in buffers.items():
+                if i in group:
+                    continue
+                k = 0
+                while k < len(buf) and buf[k].mono_ts < _start:
+                    k += 1
+                if k:
+                    self._drop_many(i, k)
+                    with self._lock:
+                        self._last[i] = buf[k - 1].seq
+                    del buf[:k]
+                _ = horizon
 
-        if j < len(B) and (now - la.mono_ts) > self.stall_s:
-            with self._lock:
-                cnt = len(B) - j
-                self._dropped_b += cnt
-                for _ in range(cnt):
-                    self._recent_events.append("drop_b")
-                self._last_b = B[-1].seq
-            j = len(B)
-        elif j:
-            with self._lock:
-                self._last_b = B[j - 1].seq
-
-    def _emit(self, a: Frame, b: Frame, dt: float) -> None:
-        dt_ms = dt * 1000.0
+    def _emit(self, group: dict[int, Frame]) -> None:
+        times = [f.mono_ts for f in group.values()]
+        span_ms = (max(times) - min(times)) * 1000.0
+        signed = (max(times) - min(times)) * 1000.0
         with self._lock:
-            self._pairs_total += 1
-            self._dt_ms.append(abs(dt_ms))
-            self._dt_signed.append(dt_ms)
-            self._recent_events.append("pair")
-            self._last_pair_mono = time.perf_counter()
-            self._recent.append(PairRecord(
-                pair_seq=self._pairs_total, dt_ms=dt_ms,
-                frame_a=a, frame_b=b, created_mono=self._last_pair_mono,
+            self._groups_total += 1
+            self._span_ms.append(abs(span_ms))
+            self._signed_span.append(signed)
+            self._recent_events.append("group")
+            self._last_group_mono = time.perf_counter()
+            key = ",".join(str(c) for c in sorted(group))
+            self._group_sizes[key] = self._group_sizes.get(key, 0) + 1
+            self._recent.append(GroupRecord(
+                group_seq=self._groups_total, frames=dict(group),
+                span_ms=span_ms, created_mono=self._last_group_mono,
             ))
 
-    def _drop(self, which: str) -> None:
+    def _drop_many(self, camera: int, count: int) -> None:
+        if count <= 0:
+            return
         with self._lock:
-            if which == "a":
-                self._dropped_a += 1
-            else:
-                self._dropped_b += 1
-            self._recent_events.append("drop_a" if which == "a" else "drop_b")
+            self._dropped[camera] = self._dropped.get(camera, 0) + int(count)
+            for _ in range(min(int(count), 300)):
+                self._recent_events.append("drop_%d" % int(camera))
 
     # -- 读取 -------------------------------------------------------------
     def status(self) -> dict:
         m = manager()
-        wa = m.worker(self.idx_a)
-        wb = m.worker(self.idx_b)
+        workers = {i: m.worker(i) for i in self.indices}
 
         with self._lock:
-            dt = np.asarray(self._dt_ms, dtype=np.float64)
-            signed = np.asarray(self._dt_signed, dtype=np.float64)
-            pairs_total = self._pairs_total
-            dropped_a, dropped_b = self._dropped_a, self._dropped_b
+            span = np.asarray(self._span_ms, dtype=np.float64)
+            signed = np.asarray(self._signed_span, dtype=np.float64)
+            groups_total = self._groups_total
+            dropped = dict(self._dropped)
             max_dt = self.max_dt_ms
-            base_a, base_b = self._base_a, self._base_b
-            last_pair = self._last_pair_mono
+            base = dict(self._base)
+            last_group = self._last_group_mono
             recent = list(self._recent)
             recent_events = list(self._recent_events)
-
-        produced_a = (wa.frames_total - base_a) if (wa and base_a is not None) else 0
-        produced_b = (wb.frames_total - base_b) if (wb and base_b is not None) else 0
-
-        # 配对率 = 配对数 / 已消费帧数。每帧要么配对要么被丢弃，所以这个分母
-        # 与分子同源，不会出现 >100% 的假值（produced 仅作参考展示）。
-        consumed_a = pairs_total + dropped_a
-        consumed_b = pairs_total + dropped_b
-        denom = max(consumed_a, consumed_b)
+            group_sizes = dict(self._group_sizes)
 
         stats = {
-            "mean": float(dt.mean()) if dt.size else None,
-            "p95": float(np.percentile(dt, 95)) if dt.size else None,
-            "max": float(dt.max()) if dt.size else None,
-            "min": float(dt.min()) if dt.size else None,
+            "mean": float(span.mean()) if span.size else None,
+            "p95": float(np.percentile(span, 95)) if span.size else None,
+            "max": float(span.max()) if span.size else None,
+            "min": float(span.min()) if span.size else None,
             "signed_mean": float(signed.mean()) if signed.size else None,
         }
+        consumed = {i: groups_total + dropped.get(i, 0) for i in self.indices}
+        denom = max(consumed.values()) if consumed else 0
+
         now = time.perf_counter()
-        rp = recent_events.count("pair")
-        rda = recent_events.count("drop_a")
-        rdb = recent_events.count("drop_b")
-        rden = max(rp + rda, rp + rdb)
+        rp = recent_events.count("group")
+        rd = {i: recent_events.count("drop_%d" % i) for i in self.indices}
+        rden = max([rp + v for v in rd.values()] or [0])
         recent_stats = {
             "events": len(recent_events),
-            "pairs": rp,
-            "dropped": {"a": rda, "b": rdb},
-            "pair_rate": round(rp / rden, 4) if rden else None,
-            "definition": "最近 300 个配对/丢弃事件；与累计值分开显示",
-            "dt_ms": {k: (round(v, 3) if v is not None else None)
-                      for k, v in stats.items()},
+            "groups": rp,
+            "dropped": {str(k): v for k, v in rd.items()},
+            "group_rate": round(rp / rden, 4) if rden else None,
+            "definition": "最近 300 个分组/丢弃事件；与累计值分开显示",
+            "span_ms": {k: (round(v, 3) if v is not None else None)
+                        for k, v in stats.items()},
         }
         camera_stats = {}
-        for idx, worker in ((self.idx_a, wa), (self.idx_b, wb)):
+        produced = {}
+        buffered = {}
+        for i in self.indices:
+            worker = workers.get(i)
             if worker is None:
-                camera_stats[str(idx)] = None
+                camera_stats[str(i)] = None
+                produced[i] = 0
+                buffered[i] = 0
                 continue
             st = worker.status()
-            camera_stats[str(idx)] = {
+            camera_stats[str(i)] = {
                 "state": st.get("state"),
                 "fps": st.get("fps"),
                 "frame_interval_ms": st.get("frame_interval_ms"),
                 "frames_total": st.get("frames_total"),
                 "buffered": st.get("buffered"),
+                "device_key": st.get("device_key"),
             }
+            b = base.get(i)
+            produced[i] = (worker.frames_total - b) if b is not None else 0
+            buffered[i] = worker.buffered
         return {
             "running": self.alive,
             "error": self._error,
-            "cameras": [self.idx_a, self.idx_b],
+            "cameras": list(self.indices),
             "max_dt_ms": round(max_dt, 2),
             "buffer_frames": DEFAULT_BUFFER,
-            "window_pairs": self.window,
-            "pairs_total": pairs_total,
-            "pairs_in_window": int(dt.size),
-            "dt_ms": {k: (round(v, 3) if v is not None else None) for k, v in stats.items()},
-            "pair_rate": round(pairs_total / denom, 4) if denom else None,
-            "pair_rate_definition": "配对成功数 / 已消费帧数（配对+丢弃），两路取较大者",
+            "window_groups": self.window,
+            "groups_total": groups_total,
+            "groups_in_window": int(span.size),
+            "group_sizes": group_sizes,
+            "span_ms": {k: (round(v, 3) if v is not None else None)
+                        for k, v in stats.items()},
+            # 兼容旧字段名（页面/工具仍可能读取）
+            "pairs_total": groups_total,
+            "dt_ms": {k: (round(v, 3) if v is not None else None)
+                      for k, v in stats.items()},
+            "group_rate": round(groups_total / denom, 4) if denom else None,
+            "pair_rate": round(groups_total / denom, 4) if denom else None,
+            "group_rate_definition": "成功帧组数 / 已消费帧数（分组+丢弃），各相机取较大者",
             "recent": recent_stats,
             "camera_stats": camera_stats,
-            "produced": {"a": produced_a, "b": produced_b},
-            "consumed": {"a": consumed_a, "b": consumed_b},
-            "dropped": {"a": dropped_a, "b": dropped_b},
-            "buffered": {
-                "a": wa.buffered if wa else 0,
-                "b": wb.buffered if wb else 0,
-            },
-            "last_dt_ms": round(recent[-1].dt_ms, 3) if recent else None,
-            "last_pair_age_ms": (round((now - last_pair) * 1000.0, 1)
-                                 if last_pair is not None else None),
-            "savable_pairs": len(recent),
+            "produced": {str(k): v for k, v in produced.items()},
+            "consumed": {str(k): v for k, v in consumed.items()},
+            "dropped": {str(k): v for k, v in dropped.items()},
+            "buffered": {str(k): v for k, v in buffered.items()},
+            "last_span_ms": round(recent[-1].span_ms, 3) if recent else None,
+            "last_group_age_ms": (round((now - last_group) * 1000.0, 1)
+                                  if last_group is not None else None),
+            "savable_groups": len(recent),
             "notes": [
-                "Δt = b.monotonic_timestamp - a.monotonic_timestamp（同一主机同一时钟）",
-                "mf_timestamp 为各设备自身的 MF 流时间轴，跨设备不可相减，未参与配对",
+                "组内时间跨度 = max(monotonic) - min(monotonic)（同一主机同一时钟）",
+                "mf_timestamp 为各设备自身的 MF 流时间轴，跨设备不可相减，未参与分组",
                 "时间戳是帧交付时刻，非曝光中心时刻；本功能为软件级近似同步，非硬件同步",
             ],
         }
 
     # -- 保存 -------------------------------------------------------------
-    def recent_pairs(self, count: int = 1) -> list[PairRecord]:
-        """取最近若干对配对结果（供标定模块取帧用，只读，不改指针）。"""
+    def recent_groups(self, count: int = 1) -> list[GroupRecord]:
+        """取最近若干组同步帧（供标定/LED 取帧用，只读，不改指针）。"""
         count = max(1, int(count))
         with self._lock:
             return list(self._recent)[-count:]
 
-    def save_pairs(self, out_dir: str | None = None, count: int = 8) -> dict:
-        """保存最近若干对同步帧：原图 PNG（未拉伸/未伪彩色）+ 时间戳 JSON。"""
+    # 兼容旧调用
+    def recent_pairs(self, count: int = 1) -> list[GroupRecord]:
+        return self.recent_groups(count)
+
+    def save_groups(self, out_dir: str | None = None, count: int = 8) -> dict:
+        """保存最近若干组同步帧：每台相机原始灰度 PNG + 时间戳 JSON。"""
         out_dir = out_dir or DEFAULT_OUT_DIR
         count = max(1, int(count))
         with self._lock:
@@ -387,29 +439,24 @@ class SyncService:
 
         if not recs:
             return {"saved": [], "count": 0, "out_dir": os.path.abspath(out_dir),
-                    "message": "还没有配对成功的帧（相机是否在采集？）"}
+                    "message": "还没有同步帧组（相机是否在采集？）"}
 
         os.makedirs(out_dir, exist_ok=True)
         saved = []
         for k, rec in enumerate(recs, 1):
-            tag = "pair_%03d" % k
-            name_a = "%s_A_cam%d.png" % (tag, self.idx_a)
-            name_b = "%s_B_cam%d.png" % (tag, self.idx_b)
-            path_a = os.path.abspath(os.path.join(out_dir, name_a))
-            path_b = os.path.abspath(os.path.join(out_dir, name_b))
-            # 8bit 单通道原样写入
-            if not cv2.imwrite(path_a, rec.frame_a.gray):
-                raise OSError("写入失败：%s" % path_a)
-            if not cv2.imwrite(path_b, rec.frame_b.gray):
-                raise OSError("写入失败：%s" % path_b)
-
-            entry = {
-                "pair_seq": rec.pair_seq,
-                "dt_ms": round(rec.dt_ms, 3),
-                "max_dt_ms": round(max_dt, 2),
-                "a": self._side_meta(rec.frame_a, self.idx_a, name_a),
-                "b": self._side_meta(rec.frame_b, self.idx_b, name_b),
-            }
+            tag = "group_%03d" % k
+            entry = {"group_seq": rec.group_seq,
+                     "span_ms": round(rec.span_ms, 3),
+                     "max_dt_ms": round(max_dt, 2),
+                     "cameras": rec.cameras,
+                     "frames": {}}
+            for cam in rec.cameras:
+                name = "%s_cam%d.png" % (tag, cam)
+                path = os.path.abspath(os.path.join(out_dir, name))
+                if not cv2.imwrite(path, rec.frames[cam].gray):
+                    raise OSError("写入失败：%s" % path)
+                entry["frames"][str(cam)] = self._side_meta(
+                    rec.frames[cam], cam, name)
             with open(os.path.abspath(os.path.join(out_dir, tag + ".json")), "w",
                       encoding="utf-8") as fh:
                 json.dump(entry, fh, ensure_ascii=False, indent=2)
@@ -417,14 +464,14 @@ class SyncService:
 
         manifest = {
             "created": datetime.now().isoformat(),
-            "pairs": len(saved),
+            "groups": len(saved),
             "out_dir": os.path.abspath(out_dir),
             "max_dt_ms": round(max_dt, 2),
             "time_base": "host monotonic (time.perf_counter), same process",
-            "dt_definition": "b.monotonic_timestamp - a.monotonic_timestamp",
+            "span_definition": "max(monotonic) - min(monotonic) within the group",
             "caveats": [
                 "时间戳为帧交付时刻（ReadSample 返回），不是曝光中心时刻",
-                "真实曝光时刻差 = 交付时刻差 + 两路(曝光+读出+传输+缓冲)延迟之差，该差值非常数",
+                "真实曝光时刻差 = 交付时刻差 + 各路(曝光+读出+传输+缓冲)延迟之差，该差值非常数",
                 "mf_timestamp 属各设备自身时间轴，跨设备不可相减",
                 "本数据为软件级近似同步，未使用硬件触发/共享时钟",
             ],
@@ -437,6 +484,9 @@ class SyncService:
         return {"saved": saved, "count": len(saved),
                 "out_dir": os.path.abspath(out_dir)}
 
+    def save_pairs(self, out_dir: str | None = None, count: int = 8) -> dict:
+        return self.save_groups(out_dir=out_dir, count=count)
+
     def _side_meta(self, frame: Frame, index: int, filename: str) -> dict:
         worker = manager().worker(index)
         meta = frame.meta()
@@ -445,12 +495,13 @@ class SyncService:
             "file": filename,
             "host_time_iso": datetime.fromtimestamp(frame.host_ts).isoformat(),
             "device": worker.device_name if worker else None,
+            "device_key": worker.device_key if worker else None,
             "format": worker.format_info if worker else None,
         })
         return meta
 
 
-# 进程级单例（Flask 多请求共享同一条配对线程）
+# 进程级单例（Flask 多请求共享同一条分组线程）
 _instance: SyncService | None = None
 _instance_lock = threading.Lock()
 
@@ -459,5 +510,11 @@ def sync_service() -> SyncService:
     global _instance
     with _instance_lock:
         if _instance is None:
-            _instance = SyncService()
+            indices = os.environ.get("MOCAP_CAM_INDICES", "0,1")
+            _instance = SyncService([int(x) for x in indices.split(",") if x != ""])
         return _instance
+
+
+def set_sync_cameras(indices) -> None:
+    """相机集合变化时更新同步线程的逻辑编号。"""
+    sync_service().set_indices(indices)

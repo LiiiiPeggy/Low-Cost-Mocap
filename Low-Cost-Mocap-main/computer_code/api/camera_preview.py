@@ -19,6 +19,7 @@ from datetime import datetime
 from flask import Blueprint, Response, jsonify, request, send_from_directory
 
 import camera_controls
+import camera_config
 from camera_manager import manager
 from sync import sync_service
 from sync import DEFAULT_OUT_DIR as SYNC_OUT_DIR
@@ -27,7 +28,7 @@ bp = Blueprint("camera_preview", __name__)
 
 _STATIC_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static")
 
-DEFAULT_INDICES = os.environ.get("MOCAP_CAM_INDICES", "0,1")
+DEFAULT_INDICES = os.environ.get("MOCAP_CAM_INDICES", "")
 DEFAULT_WIDTH = int(os.environ.get("MOCAP_CAM_WIDTH", "1280"))
 DEFAULT_HEIGHT = int(os.environ.get("MOCAP_CAM_HEIGHT", "720"))
 DEFAULT_FPS = float(os.environ.get("MOCAP_CAM_FPS", "30"))
@@ -72,10 +73,43 @@ def api_version():
 
 def _parse_indices(raw) -> list[int]:
     if raw is None or raw == "":
-        raw = DEFAULT_INDICES
+        if DEFAULT_INDICES:
+            raw = DEFAULT_INDICES
+        else:
+            # 默认使用 camera_config 里的全部逻辑相机
+            try:
+                return camera_config.logical_indices()
+            except Exception:
+                return [0, 1]
     if isinstance(raw, (list, tuple)):
         return [int(x) for x in raw]
     return [int(x) for x in str(raw).replace(" ", "").split(",") if x != ""]
+
+
+def _camera_start_configs(indices, body: dict) -> list[dict]:
+    """把请求里的逻辑编号展开成带设备身份与独立采集格式的启动配置。"""
+    cfg = camera_config.load()
+    by_index = {c["index"]: c for c in cfg["cameras"]}
+    entries = []
+    for i in indices:
+        item = by_index.get(int(i))
+        if item is None:
+            entries.append({"index": int(i), "device_key": None,
+                            "width": int(body.get("width", DEFAULT_WIDTH)),
+                            "height": int(body.get("height", DEFAULT_HEIGHT)),
+                            "fps": float(body.get("fps", DEFAULT_FPS)),
+                            "format": str(body.get("format",
+                                                   DEFAULT_FORMAT))})
+            continue
+        entry = dict(item)
+        # 请求里显式给了格式才覆盖配置
+        for key, cast in (("width", int), ("height", int), ("fps", float)):
+            if key in body and body[key] is not None:
+                entry[key] = cast(body[key])
+        if body.get("format") or body.get("pixel_format"):
+            entry["format"] = str(body.get("format") or body.get("pixel_format"))
+        entries.append(entry)
+    return entries
 
 
 # ---------------------------------------------------------------------------
@@ -90,7 +124,50 @@ def cameras_status():
         "width": DEFAULT_WIDTH, "height": DEFAULT_HEIGHT,
         "fps": DEFAULT_FPS, "format": DEFAULT_FORMAT,
     }
+    try:
+        cfg = camera_config.load(create=False)
+        st["camera_config"] = {"path": cfg.get("path"),
+                               "cameras": camera_config.resolve(cfg)}
+    except Exception as exc:
+        st["camera_config"] = {"error": str(exc).strip().splitlines()[-1]}
     return jsonify(st)
+
+
+# ---------------------------------------------------------------------------
+# 逻辑编号 ↔ 物理设备 固定绑定
+# ---------------------------------------------------------------------------
+@bp.get("/api/cameras/config")
+def cameras_config_get():
+    try:
+        cfg = camera_config.load()
+        return jsonify({"path": cfg.get("path"),
+                        "cameras": camera_config.resolve(cfg),
+                        "devices": manager().devices()})
+    except Exception as exc:
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
+
+
+@bp.post("/api/cameras/config")
+def cameras_config_set():
+    """人工确认/修改绑定：{index, device_key, confirmed, width, height, fps, format}"""
+    body = request.get_json(silent=True) or {}
+    try:
+        index = int(body.get("index"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "缺少 index（逻辑编号）"}), 400
+    patch = {k: body.get(k) for k in
+             ("device_key", "device_name", "confirmed",
+              "width", "height", "fps", "format") if k in body}
+    if not patch:
+        return jsonify({"error": "没有要修改的字段"}), 400
+    try:
+        cfg = camera_config.update(index, patch)
+        return jsonify({"ok": True, "path": cfg.get("path"),
+                        "cameras": camera_config.resolve(cfg)})
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
 
 
 @bp.get("/api/cameras/devices")
@@ -146,11 +223,12 @@ def _runtime_snapshot() -> dict:
             "frame_interval_ms": c.get("frame_interval_ms"),
         } for c in st.get("cameras", [])],
         "sync": {
-            "pair_rate": sync.get("pair_rate"),
+            "group_rate": sync.get("group_rate"),
             "recent": sync.get("recent"),
-            "dt_ms": sync.get("dt_ms"),
+            "span_ms": sync.get("span_ms"),
             "dropped": sync.get("dropped"),
             "produced": sync.get("produced"),
+            "group_sizes": sync.get("group_sizes"),
         },
     }
 
@@ -237,19 +315,14 @@ def cameras_start():
     if not indices:
         return jsonify({"error": "没有指定相机索引"}), 400
     try:
-        st = manager().start(
-            indices,
-            width=int(body.get("width", DEFAULT_WIDTH)),
-            height=int(body.get("height", DEFAULT_HEIGHT)),
-            fps=float(body.get("fps", DEFAULT_FPS)),
-            pixel_format=str(body.get("format", body.get("pixel_format", DEFAULT_FORMAT))),
-        )
+        st = manager().start(_camera_start_configs(indices, body))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 409
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
     # 新会话：清空配对指针与统计（相机 seq 从 1 重新计数）
     try:
+        sync_service().set_indices(indices)
         sync_service().reset_pointers()
     except Exception:
         pass
@@ -262,6 +335,8 @@ def cameras_stop():
     indices = body.get("indices")
     try:
         st = manager().stop(None if indices is None else _parse_indices(indices))
+        remaining = [w.index for w in manager().workers()]
+        sync_service().set_indices(remaining or _parse_indices(None))
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
     return jsonify(st)

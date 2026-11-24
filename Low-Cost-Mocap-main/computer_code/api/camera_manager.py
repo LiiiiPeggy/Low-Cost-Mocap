@@ -4,14 +4,15 @@
 --------------------------------------------------------------------------
 * 复用同目录的 ``ir_camera.py``（设备枚举 + 单相机取帧 + COM/MF 资源管理），
   本模块只负责“多路调度”，不改动单相机 CLI 的行为。
+* **逻辑编号**（0..3）是采集、同步、标定、LED、录制共用的身份；每台相机按
+  ``camera_config.json`` 里的设备实例 key 打开，不依赖枚举顺序。
 * Media Foundation 的采集对象按 COM STA 规则“谁创建谁释放”，所以**每台相机
   一个线程，open() / grab() / close() 全部在该线程内完成**，主线程只读缓存。
 * 只保留**最新一帧**（latest-frame cache）：读端永远拿到最新数据，网页卡顿或
   刷新都不会造成延迟累积。
-* 另外维护一份**定长历史缓存**（默认 45 帧，约 1.5s@30fps）供帧同步配对使用；
+* 另外维护一份**定长历史缓存**（默认 45 帧，约 1.5s@30fps）供帧同步使用；
   两份缓存共享同一份 ndarray，不额外占内存（见 ``_publish``）。
-* 一个 worker 只打开一次设备；多个浏览器请求同一个 MJPEG 源时只是多读几份
-  缓存 + 复用同一份已编码 JPEG，不会重复打开摄像头。
+* 一台相机离线时保留逻辑编号并持续重连，其他相机不补位。
 
 帧数据
 --------------------------------------------------------------------------
@@ -37,13 +38,14 @@ from datetime import datetime
 import cv2
 import numpy as np
 
+import camera_controls
 import ir_camera as irc
 
 
 MF_TICK_SECONDS = 1e-7  # Media Foundation 时间单位是 100ns
 
 # 历史缓存深度：45 帧 ≈ 1.5s@30fps。1280x720 uint8 单帧 0.92MB，
-# 两路合计约 83MB；内存紧张可用 MOCAP_SYNC_BUFFER=30 调小。
+# 四路合计约 166MB；内存紧张可用 MOCAP_SYNC_BUFFER=30 调小。
 DEFAULT_HISTORY = int(os.environ.get("MOCAP_SYNC_BUFFER", "45"))
 
 
@@ -75,14 +77,30 @@ class Frame:
         }
 
 
+def _resolve_mf_index(device_key: str | None) -> int | None:
+    """按设备实例 key 找当前枚举索引；找不到返回 None（相机离线）。"""
+    if not device_key:
+        return None
+    try:
+        for index, _friendly, link in irc.list_devices():
+            if camera_controls.device_key(link) == device_key:
+                return int(index)
+    except Exception:
+        return None
+    return None
+
+
 class CameraWorker:
     """一台相机的采集线程。start() 之后用 latest()/wait_frame() 读最新帧。"""
 
     def __init__(self, index: int, width: int = 1280, height: int = 720,
                  fps: float = 30.0, pixel_format: str = "NV12",
                  name: str | None = None, reconnect: bool = True,
-                 jpeg_quality: int = 80, history_len: int = DEFAULT_HISTORY):
-        self.index = int(index)
+                 jpeg_quality: int = 80, history_len: int = DEFAULT_HISTORY,
+                 device_key: str | None = None, mf_index: int | None = None):
+        self.index = int(index)                     # 逻辑编号
+        self.device_key = camera_controls.device_key(device_key) or None
+        self.mf_index = mf_index                    # 最近一次解析到的枚举索引
         self.requested = {
             "width": int(width), "height": int(height),
             "fps": float(fps), "pixel_format": pixel_format.upper(),
@@ -110,13 +128,16 @@ class CameraWorker:
         self._last_frame_mono: float | None = None
         self._intervals_ms: deque[float] = deque(maxlen=120)
 
-        self.state = "idle"          # idle / opening / streaming / error / stopped
+        # idle / offline / opening / streaming / error / stopped
+        self.state = "idle"
         self.error: str | None = None
         self.format_info: str | None = None
         self.device_name: str | None = None
         self.device_link: str | None = None
         self.control_restore: dict | None = None
         self._opened_at: float | None = None
+        self._offline_since: float | None = None
+        self._last_logged_error: str | None = None
 
     # -- 生命周期 ---------------------------------------------------------
     def start(self) -> "CameraWorker":
@@ -142,14 +163,28 @@ class CameraWorker:
     def alive(self) -> bool:
         return bool(self._thread and self._thread.is_alive())
 
+    @property
+    def streaming(self) -> bool:
+        return self.state == "streaming"
+
     # -- 采集线程 ---------------------------------------------------------
     def _run(self) -> None:
         backoff = 0.5
         while not self._stop_evt.is_set():
             cam = None
             try:
+                mf_index = (_resolve_mf_index(self.device_key)
+                            if self.device_key else self.mf_index)
+                if mf_index is None:
+                    self._mark_offline("设备未连接（按设备实例标识未找到）")
+                    if not self.reconnect:
+                        break
+                    self._sleep_backoff(backoff)
+                    backoff = min(backoff * 2, 5.0)
+                    continue
+                self.mf_index = mf_index
                 # 注意：必须在**本线程**内 open/close，COM STA 要求同线程创建与释放
-                cam = irc.IRCamera(index=self.index, name=self.name_filter,
+                cam = irc.IRCamera(index=mf_index, name=self.name_filter,
                                    verbose=False, **{
                                        "width": self.requested["width"],
                                        "height": self.requested["height"],
@@ -159,15 +194,19 @@ class CameraWorker:
                 cam.open()
                 self.state = "streaming"
                 self.error = None
+                self._offline_since = None
+                self._last_logged_error = None
                 self.format_info = cam.info
-                self.device_name = self._device_name()
-                self.device_link = self._device_link()
+                self.device_name = self._device_name(mf_index)
+                self.device_link = self._device_link(mf_index)
+                if self.device_key is None and self.device_link:
+                    self.device_key = camera_controls.device_key(self.device_link)
                 self._opened_at = time.time()
                 # 按设备实例路径恢复上一次成功设置的曝光/增益；即使 USB
                 # 枚举顺序变化，也不会把 cam0 的参数写到 cam1。
                 try:
-                    import camera_controls
-                    self.control_restore = camera_controls.restore_controls(
+                    import camera_controls as _controls
+                    self.control_restore = _controls.restore_controls(
                         self.index, self.device_link)
                 except BaseException as exc:
                     self.control_restore = {
@@ -189,8 +228,14 @@ class CameraWorker:
                 self.state = "error"
                 self.error = "%s: %s" % (type(exc).__name__, exc)
                 self.format_info = None
-                print("[cam %d] 采集异常：%s" % (self.index, self.error), file=sys.stderr)
-                traceback.print_exc()
+                # 重连循环里同一个错误只打印一次；完整 traceback 只在
+                # MOCAP_DEBUG=1 时输出，避免设备被占用时刷屏。
+                if self.error != self._last_logged_error:
+                    print("[cam %d] 采集异常：%s（将自动重连）"
+                          % (self.index, self.error), file=sys.stderr)
+                    self._last_logged_error = self.error
+                    if os.environ.get("MOCAP_DEBUG"):
+                        traceback.print_exc()
             finally:
                 if cam is not None:
                     try:
@@ -202,27 +247,38 @@ class CameraWorker:
                 break
             # 断线重连（拔插 / 被其它程序占用后释放）
             self.state = "reconnecting"
-            slept = 0.0
-            while slept < backoff and not self._stop_evt.is_set():
-                time.sleep(0.1)
-                slept += 0.1
+            self._sleep_backoff(backoff)
             backoff = min(backoff * 2, 5.0)
 
         self.state = "stopped"
 
-    def _device_name(self) -> str | None:
+    def _mark_offline(self, reason: str) -> None:
+        if self.state != "offline":
+            print("[cam %d] %s" % (self.index, reason), file=sys.stderr)
+        self.state = "offline"
+        self.error = reason
+        if self._offline_since is None:
+            self._offline_since = time.time()
+
+    def _sleep_backoff(self, seconds: float) -> None:
+        slept = 0.0
+        while slept < seconds and not self._stop_evt.is_set():
+            time.sleep(0.1)
+            slept += 0.1
+
+    def _device_name(self, mf_index: int) -> str | None:
         try:
             for i, friendly, _link in irc.list_devices():
-                if i == self.index:
+                if i == mf_index:
                     return friendly
         except BaseException:
             pass
         return None
 
-    def _device_link(self) -> str | None:
+    def _device_link(self, mf_index: int) -> str | None:
         try:
             for i, _friendly, link in irc.list_devices():
-                if i == self.index:
+                if i == mf_index:
                     return link
         except BaseException:
             pass
@@ -330,7 +386,10 @@ class CameraWorker:
         else:
             interval = None
         return {
-            "index": self.index,
+            "index": self.index,                 # 逻辑编号
+            "logical_index": self.index,
+            "mf_index": self.mf_index,
+            "device_key": self.device_key,
             "name": self.device_name,
             "device_link": self.device_link,
             "control_restore": self.control_restore,
@@ -348,7 +407,7 @@ class CameraWorker:
 
 
 class CameraManager:
-    """按设备索引管理多路相机。索引全局唯一，同一设备不会被打开两次。"""
+    """按**逻辑编号**管理多路相机。逻辑编号全局唯一，同一设备不会被打开两次。"""
 
     def __init__(self, jpeg_quality: int = 80):
         self._lock = threading.RLock()
@@ -359,34 +418,62 @@ class CameraManager:
     # -- 启停 -------------------------------------------------------------
     @property
     def stopping(self) -> bool:
-        """进程是否正在退出（MJPEG 生成器据此收尾）。"""
         return self._shutdown.is_set()
 
-    def start(self, indices, width=1280, height=720, fps=30.0,
-              pixel_format="NV12", names=None, history_len=None) -> dict:
-        indices = [int(i) for i in indices]
-        if len(set(indices)) != len(indices):
-            raise ValueError("设备索引重复：%s" % indices)
+    def start(self, configs, width=None, height=None, fps=None,
+              pixel_format=None, names=None, history_len=None) -> dict:
+        """启动相机。
+
+        ``configs`` 可以是 ``[{index, device_key, width, height, fps, format}]``
+        （推荐），也可以是旧的整数索引列表（此时用 width/height/fps/format）。
+        """
+        if configs and isinstance(configs[0], dict):
+            entries = []
+            for item in configs:
+                entries.append({
+                    "index": int(item["index"]),
+                    "device_key": camera_controls.device_key(
+                        item.get("device_key")) or None,
+                    "width": int(item.get("width", width or 1280)),
+                    "height": int(item.get("height", height or 720)),
+                    "fps": float(item.get("fps", fps or 30.0)),
+                    "format": str(item.get("format")
+                                  or pixel_format or "NV12").upper(),
+                })
+        else:
+            entries = [{"index": int(i), "device_key": None,
+                        "width": int(width or 1280),
+                        "height": int(height or 720),
+                        "fps": float(fps or 30.0),
+                        "format": str(pixel_format or "NV12").upper()}
+                       for i in configs]
+        idxs = [e["index"] for e in entries]
+        if len(set(idxs)) != len(idxs):
+            raise ValueError("逻辑编号重复：%s" % idxs)
+        keys = [e["device_key"] for e in entries if e["device_key"]]
+        if len(set(keys)) != len(keys):
+            raise ValueError("同一台物理设备不能绑定两个逻辑编号")
 
         hist = DEFAULT_HISTORY if history_len is None else int(history_len)
 
         self._shutdown.clear()
         with self._lock:
             running = {i for i, w in self._workers.items() if w.alive}
-            dup = running & set(indices)
+            dup = running & set(idxs)
             if dup:
-                raise ValueError("设备 %s 已在采集中，不能重复打开" % sorted(dup))
+                raise ValueError("相机 %s 已在采集中，不能重复打开" % sorted(dup))
 
-            for idx in indices:
+            for entry in entries:
+                idx = entry["index"]
                 old = self._workers.pop(idx, None)
                 if old is not None:
                     old.stop()
                 worker = CameraWorker(
-                    index=idx, width=width, height=height, fps=fps,
-                    pixel_format=pixel_format,
+                    index=idx, width=entry["width"], height=entry["height"],
+                    fps=entry["fps"], pixel_format=entry["format"],
                     name=(names or {}).get(str(idx)) or (names or {}).get(idx),
                     jpeg_quality=self._jpeg_quality,
-                    history_len=hist,
+                    history_len=hist, device_key=entry["device_key"],
                 )
                 self._workers[idx] = worker
                 worker.start()
@@ -410,23 +497,30 @@ class CameraManager:
         with self._lock:
             return self._workers.get(int(index))
 
+    def workers(self) -> list[CameraWorker]:
+        with self._lock:
+            return [self._workers[k] for k in sorted(self._workers)]
+
     def status(self) -> dict:
         with self._lock:
-            workers = list(self._workers.values())
+            workers = [self._workers[k] for k in sorted(self._workers)]
         return {
             "cameras": [w.status() for w in workers],
             "count": len(workers),
+            "indices": [w.index for w in workers],
         }
 
     def devices(self) -> list[dict]:
-        """枚举当前系统里的视频采集设备（不打开它们）。"""
+        """枚举当前系统里的视频采集设备（不打开它们），并标出逻辑绑定。"""
+        with self._lock:
+            bound = {w.device_key: w.index for w in self._workers.values()
+                     if w.device_key}
         out = []
         for i, friendly, link in irc.list_devices():
-            busy = False
-            with self._lock:
-                w = self._workers.get(i)
-                busy = bool(w and w.alive)
-            out.append({"index": i, "name": friendly, "symbolic_link": link, "in_use": busy})
+            key = camera_controls.device_key(link)
+            out.append({"mf_index": i, "name": friendly, "symbolic_link": link,
+                        "device_key": key, "logical_index": bound.get(key),
+                        "in_use": key in bound})
         return out
 
     # -- 保存原始帧 -------------------------------------------------------
@@ -448,7 +542,8 @@ class CameraManager:
             meta = frame.meta()
             meta.update({"index": idx, "path": path,
                          "host_time_iso": datetime.fromtimestamp(frame.host_ts).isoformat(),
-                         "format": worker.format_info, "device": worker.device_name})
+                         "format": worker.format_info, "device": worker.device_name,
+                         "device_key": worker.device_key})
             saved.append(meta)
         return saved
 
