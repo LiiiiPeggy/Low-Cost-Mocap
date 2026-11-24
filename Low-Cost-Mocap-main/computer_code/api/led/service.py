@@ -44,13 +44,12 @@ DEFAULT_PARAMS_PATH = os.path.join(DEFAULT_SESSION_ROOT, "led_params.json")
 DEFAULT_DEBUG_ROOT = os.path.join(os.path.dirname(DEFAULT_SESSION_ROOT),
                                    "led_debug")
 MAX_PAIR_AGE_S = 0.5
-MAX_PROCESS_FPS = 25.0
 MAX_TRAJECTORY = 300
 OVERLAY_SCALE = 0.6
 ROI_TRACK_PAD_PX = 80
 ROI_MAX_MISS = 12
 PARAMS_SCHEMA = "lowcost-mocap/led-params"
-CAMS = (0, 1)
+CAMS = (0, 1, 2, 3)      # 参数/ROI 容器支持最多 4 台逻辑相机
 
 
 def _now_iso() -> str:
@@ -148,85 +147,27 @@ def _validate_rois(raw) -> dict:
     return out
 
 
-def _parse_camera_map(raw):
-    """``auto`` 或 [live0→calib, live1→calib] 的 0/1 排列。"""
-    if raw in (None, "", "auto", "自动"):
-        return "auto"
-    if isinstance(raw, dict):
-        vals = [raw.get("0", raw.get(0)), raw.get("1", raw.get(1))]
-    else:
-        try:
-            vals = list(raw)
-        except TypeError:
-            raise ValueError("camera_map 必须是 auto 或 [0,1]/[1,0]")
-    try:
-        out = [int(vals[0]), int(vals[1])]
-    except (TypeError, ValueError, IndexError):
-        raise ValueError("camera_map 必须是 auto 或 [0,1]/[1,0]")
-    if sorted(out) != [0, 1]:
-        raise ValueError("camera_map 必须是 auto 或 [0,1]/[1,0]")
-    return out
-
-
 def _compact_diag(diag: dict | None) -> dict | None:
-    """状态轮询只带紧凑诊断；完整 3x3/配对明细放在 /api/led/diagnose。"""
+    """状态轮询只带紧凑诊断；完整配对明细放在 /api/led/diagnose。"""
     if not diag:
         return None
-    keep = ("camera_map", "detected_counts", "epipolar_tol_px",
-            "reprojection_tol_px", "triangle_tol_mm", "epipolar_pass",
-            "depth_pass", "reprojection_pass", "candidate_count",
-            "triangle_combinations", "valid_triangles", "best_edges_mm",
-            "best_edge_errors_mm", "best_reprojection_px",
+    keep = ("cameras", "detected_counts", "epipolar_tol_px",
+            "reprojection_tol_px", "triangle_tol_mm", "pair_hypotheses",
+            "candidate_count", "triangle_combinations", "valid_triangles",
+            "best_edges_mm", "best_edge_errors_mm", "best_reprojection_px",
             "best_epipolar_px", "best_triangle_indices",
-            "expected_edges_mm", "triangle_sides_m")
+            "expected_edges_mm", "triangle_sides_m", "stage", "reason")
     out = {k: diag.get(k) for k in keep if k in diag}
-    epi = diag.get("epipolar_distances") or []
-    if epi and len(epi) <= 8 and all(len(r) <= 8 for r in epi):
-        out["epipolar_distances"] = epi
+    pts = diag.get("points") or []
+    if len(pts) <= 12:
+        out["points"] = pts
+    pairs = diag.get("pairwise") or {}
+    if len(pairs) <= 6:
+        out["pairwise"] = {k: {"pass": sum(
+            1 for row in v.get("epipolar_distances") or []
+            for d in row if d <= diag.get("epipolar_tol_px", 5.0))}
+            for k, v in pairs.items()}
     return out
-
-
-def _mapping_result_score(result: dict | None) -> float:
-    """越小越好：优先真实三角形边长/重投影，其次候选数量。"""
-    if not result:
-        return float("inf")
-    if result.get("ok"):
-        err = float(np.mean(result.get("edge_errors_mm") or [999.0]))
-        rep = float(result.get("mean_reprojection_px") or 999.0)
-        epi = float(result.get("mean_epipolar_px") or 999.0)
-        return err + 0.5 * rep + 0.2 * epi
-    diag = result.get("diagnostics") or {}
-    cand = int(diag.get("candidate_count", result.get("candidate_count", 0)) or 0)
-    depth = int(diag.get("depth_pass", 0) or 0)
-    best_err = diag.get("best_edge_errors_mm")
-    edge = (float(np.mean(best_err)) if best_err else 999.0)
-    # 没有合法三角形时，有候选/正深度的一侧优先；仍保持有限分值
-    return 10000.0 - 100.0 * cand - 10.0 * depth + edge
-
-
-def _mapping_strong(result: dict | None) -> bool:
-    """有足够正深度/重投影候选；即使三边暂时超容差，也足以锁定映射。"""
-    diag = (result or {}).get("diagnostics") or {}
-    return (int(diag.get("candidate_count", 0) or 0) >= 3
-            and int(diag.get("depth_pass", 0) or 0) >= 3
-            and int(diag.get("reprojection_pass", 0) or 0) >= 3)
-
-
-def _choose_mapping(results: dict) -> tuple[str, dict] | tuple[None, None]:
-    """从 {"0,1": result, "1,0": result} 选一个映射。
-
-    没有“合法三角形”或“正深度/重投影候选”的一侧不参与选择，避免两路都
-    只有 2 个 LED 时把已确认的映射切回错误编号。
-    """
-    if not results:
-        return None, None
-    eligible = {k: r for k, r in results.items()
-                if (r or {}).get("ok") or _mapping_strong(r)}
-    if not eligible:
-        return None, None
-    ranked = sorted(eligible.items(), key=lambda kv: _mapping_result_score(kv[1]))
-    key, res = ranked[0]
-    return key, res
 
 
 def _roi_norm_to_px(norm, shape) -> list[int] | None:
@@ -242,23 +183,19 @@ def _roi_norm_to_px(norm, shape) -> list[int] | None:
     return [x0, y0, x1 - x0, y1 - y0]
 
 
-def _build_calibration(snapshot: dict,
-                       camera_map: tuple[int, int] = (0, 1)) -> dict:
-    """从 CalibrationService 快照提取 LED 定位需要的矩阵，并做完整性检查。
+def _build_calibration(snapshot: dict, cameras=None) -> dict:
+    """从 CalibrationService 快照提取多相机定位矩阵，并做完整性检查。
 
-    ``camera_map`` 把**实时相机索引**映射到**标定结果里的相机编号**：
-    ``camera_map[0]`` 是实时 cam0 使用的标定相机，``camera_map[1]`` 同理。
-    两台相机硬件完全相同、枚举顺序可能在重启后互换，因此不能假设实时 0/1
-    永远对应标定 0/1；LED 服务会同时尝试 (0,1) 和 (1,0) 并自动选择。
+    逻辑相机编号同时用于采集、标定和 LED 定位（设备身份在 camera_config 里
+    固定绑定），因此**不再需要**运行时猜测 live0↔calib0 / live1↔calib1 的
+    映射。每台相机可以使用自己的分辨率、K、D 和世界系 R/t。
     """
     intr = snapshot.get("intrinsics") or {}
     rig = snapshot.get("extrinsic")
-    try:
-        cal_ids = (int(camera_map[0]), int(camera_map[1]))
-    except (TypeError, ValueError):
-        raise ValueError("camera_map 必须是两个相机编号")
-    if cal_ids[0] == cal_ids[1] or set(cal_ids) != {0, 1}:
-        raise ValueError("camera_map 必须是 0/1 的一个排列")
+    cams = [int(c) for c in (cameras or snapshot.get("cameras")
+                             or sorted(int(intr_key) for intr_key in intr))]
+    if len(cams) < 2:
+        raise ValueError("至少需要 2 台相机才能定位（当前 %s）" % cams)
 
     problems = []
     if not rig:
@@ -266,11 +203,11 @@ def _build_calibration(snapshot: dict,
     else:
         if not rig.get("orientation_confirmed"):
             problems.append("世界坐标轴方向未确认；请人工确认后重新解外参")
-        cams = rig.get("cameras") or {}
-        for c in cal_ids:
-            if str(c) not in cams:
+        rig_cams = rig.get("cameras") or {}
+        for c in cams:
+            if str(c) not in rig_cams:
                 problems.append("外参缺少相机 %d" % c)
-    for c in cal_ids:
+    for c in cams:
         d = intr.get(str(c))
         if not isinstance(d, dict):
             problems.append("缺少相机 %d 内参；请先载入内参" % c)
@@ -281,36 +218,36 @@ def _build_calibration(snapshot: dict,
     if problems:
         raise ValueError("；".join(problems))
 
-    def kd(c):
+    per_camera = {}
+    for c in cams:
         d = intr[str(c)]
-        return (np.asarray(d["K"], np.float64),
-                np.asarray(d["D"], np.float64).reshape(-1),
-                [int(v) for v in d["image_size"]])
+        K = np.asarray(d["K"], np.float64)
+        D = np.asarray(d["D"], np.float64).reshape(-1)
+        size = [int(v) for v in d["image_size"]]
+        entry = rig["cameras"][str(c)]
+        try:
+            R = np.asarray(entry["R"], np.float64)
+            t = np.asarray(entry["t"], np.float64).reshape(3)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("相机 %d 外参缺少有效的 R/t：%s" % (c, exc))
+        if R.shape != (3, 3):
+            raise ValueError("相机 %d 外参 R 不是 3x3 矩阵" % c)
+        if K.shape != (3, 3):
+            raise ValueError("相机 %d 内参 K 不是 3x3 矩阵" % c)
+        per_camera[c] = {
+            "K": K.tolist(), "D": D.tolist(),
+            "R": R.tolist(), "t": t.tolist(),
+            "P": (K @ np.c_[R, t]).tolist(),
+            "image_size": size,
+            "device_key": entry.get("device_key"),
+        }
 
-    K0, D0, size0 = kd(cal_ids[0])
-    K1, D1, size1 = kd(cal_ids[1])
-    if size0 != size1:
-        raise ValueError("两台相机内参图像尺寸不一致：%s vs %s" % (size0, size1))
-    cams = rig["cameras"]
-    try:
-        R0 = np.asarray(cams[str(cal_ids[0])]["R"], np.float64)
-        t0 = np.asarray(cams[str(cal_ids[0])]["t"], np.float64).reshape(3)
-        R1 = np.asarray(cams[str(cal_ids[1])]["R"], np.float64)
-        t1 = np.asarray(cams[str(cal_ids[1])]["t"], np.float64).reshape(3)
-    except (KeyError, TypeError, ValueError) as exc:
-        raise ValueError("外参缺少有效的 R/t：%s" % exc)
-    if (R0.shape != (3, 3) or R1.shape != (3, 3)):
-        raise ValueError("外参 R 不是 3x3 矩阵")
-    R10, T10 = relative_pose(R0, t0, R1, t1)
-    F = fundamental_from_pose(K0, K1, R10, T10)
     calib = {
-        "K0": K0, "D0": D0, "K1": K1, "D1": D1,
-        "R0": R0, "t0": t0, "R1": R1, "t1": t1,
-        "R10": R10, "T10": T10, "F": F,
-        "image_size": size0,
-        "R_10": R10.tolist(), "T_10": T10.tolist(),
-        "camera_map": [int(cal_ids[0]), int(cal_ids[1])],
-        "calibration_ids": [int(cal_ids[0]), int(cal_ids[1])],
+        "cameras": cams,
+        "per_camera": per_camera,
+        "image_sizes": {str(c): per_camera[c]["image_size"] for c in cams},
+        # 兼容旧字段：逻辑编号即标定编号
+        "calibration_ids": cams,
         "board": rig.get("board") or snapshot.get("board"),
         "world_frame": rig.get("world_frame"),
         "source": rig.get("source"),
@@ -320,13 +257,32 @@ def _build_calibration(snapshot: dict,
         "orientation_confirmed": bool(rig.get("orientation_confirmed")),
         "convention": "X_cam = R @ X_world + t; triangulation uses P = K[R|t] in world",
     }
+    first = cams[0]
+    second = cams[1]
+    R0 = np.asarray(per_camera[first]["R"], np.float64)
+    t0 = np.asarray(per_camera[first]["t"], np.float64).reshape(3)
+    R1 = np.asarray(per_camera[second]["R"], np.float64)
+    t1 = np.asarray(per_camera[second]["t"], np.float64).reshape(3)
+    R10, T10 = relative_pose(R0, t0, R1, t1)
+    K0 = np.asarray(per_camera[first]["K"], np.float64)
+    K1 = np.asarray(per_camera[second]["K"], np.float64)
+    calib.update({
+        "R0": R0, "t0": t0, "R1": R1, "t1": t1,
+        "K0": K0,
+        "D0": np.asarray(per_camera[first]["D"], np.float64),
+        "K1": K1,
+        "D1": np.asarray(per_camera[second]["D"], np.float64),
+        "R10": R10, "T10": T10,
+        "F": fundamental_from_pose(K0, K1, R10, T10),
+        "R_10": R10.tolist(), "T_10": T10.tolist(),
+        "image_size": per_camera[first]["image_size"],
+    })
     calib["signature"] = _json_sig({
-        "K0": K0.tolist(), "D0": D0.tolist(),
-        "K1": K1.tolist(), "D1": D1.tolist(),
-        "R0": R0.tolist(), "t0": t0.tolist(),
-        "R1": R1.tolist(), "t1": t1.tolist(),
-        "image_size": size0,
-        "camera_map": calib["camera_map"],
+        "cameras": cams,
+        "per_camera": {str(c): {
+            "K": per_camera[c]["K"], "D": per_camera[c]["D"],
+            "R": per_camera[c]["R"], "t": per_camera[c]["t"],
+            "image_size": per_camera[c]["image_size"]} for c in cams},
         "orientation_confirmed": calib["orientation_confirmed"],
     })
     return calib
@@ -343,21 +299,20 @@ class LedService:
         self._force_reprocess = False
         self._last_process_mono = 0.0
         self._processing_ms = None
+        self._processing_stage_ms: dict = {}
         self._processed_pairs = 0
+        self._groups_seen = 0
+        self._groups_skipped = 0
         self._last_error = ""
         self._params_path = DEFAULT_PARAMS_PATH
         self._global_params = default_params()
-        self._overrides = {"0": {}, "1": {}}
-        self._rois = {"0": None, "1": None}
+        self._overrides = {str(c): {} for c in CAMS}
+        self._rois = {str(c): None for c in CAMS}
         self._roi_tracking = True
-        self._roi_track = {"0": None, "1": None}
-        self._roi_miss = {"0": 0, "1": 0}
-        self._roi_force_full = {"0": False, "1": False}
-        # 实时相机 → 标定相机映射。硬件名称相同，USB 枚举顺序可能在重启后
-        # 互换；auto 模式下用 34/79/79 mm 三角化结果自动判别。
-        self._camera_map_mode = "auto"
-        self._calib_options: dict[str, dict] = {}
-        self._mapping_confirmed = False
+        self._roi_track = {str(c): None for c in CAMS}
+        self._roi_miss = {str(c): 0 for c in CAMS}
+        self._roi_force_full = {str(c): False for c in CAMS}
+        # 逻辑编号 ↔ 物理设备由 camera_config.json 固定；不再运行时猜测映射。
         self._last_diag = None
         self._params_updated = None
         self._params_warning = ""
@@ -369,8 +324,8 @@ class LedService:
         self._tracker_state = "idle"
         self._last_led_points = None
         self._trajectory = []
-        self._raw = {0: None, 1: None}
-        self._det_internal = {0: None, 1: None}
+        self._raw = {c: None for c in CAMS}
+        self._det_internal = {c: None for c in CAMS}
         self._load_params()
         self._state = self._idle_state()
 
@@ -394,7 +349,6 @@ class LedService:
             }
             self._rois = _validate_rois(data.get("rois"))
             self._roi_tracking = bool(data.get("roi_tracking", True))
-            self._camera_map_mode = _parse_camera_map(data.get("camera_map"))
             self._params_updated = data.get("updated")
         except Exception as exc:
             self._params_warning = ("led_params.json 读取失败，使用默认参数：%s"
@@ -408,7 +362,6 @@ class LedService:
             "overrides": self._overrides,
             "rois": self._rois,
             "roi_tracking": self._roi_tracking,
-            "camera_map": self._camera_map_mode,
         }
         atomic_json_write(self._params_path, payload)
         self._params_updated = payload["updated"]
@@ -418,7 +371,6 @@ class LedService:
         return merge_params(self._global_params, self._overrides.get(str(int(camera))))
 
     def _reset_runtime_after_params_locked(self, *, clear_warning: bool) -> None:
-        self._mapping_confirmed = False
         self._last_diag = None
         self._clear_track_rois()
         self._param_version += 1
@@ -459,25 +411,20 @@ class LedService:
         roi_tracking = self._roi_tracking
         if "roi_tracking" in payload:
             roi_tracking = bool(payload.get("roi_tracking"))
-        camera_map = self._camera_map_mode
-        if "camera_map" in payload:
-            camera_map = _parse_camera_map(payload.get("camera_map"))
         with self._lock:
             self._global_params = global_params
             self._overrides = overrides
             self._rois = rois
             self._roi_tracking = roi_tracking
-            self._camera_map_mode = camera_map
             self._reset_runtime_after_params_locked(clear_warning=True)
         return self._persist_params()
 
     def reset_params(self) -> dict:
         with self._lock:
             self._global_params = default_params()
-            self._overrides = {"0": {}, "1": {}}
-            self._rois = {"0": None, "1": None}
+            self._overrides = {str(c): {} for c in CAMS}
+            self._rois = {str(c): None for c in CAMS}
             self._roi_tracking = True
-            self._camera_map_mode = "auto"
             self._reset_runtime_after_params_locked(clear_warning=False)
         return self._persist_params()
 
@@ -489,10 +436,7 @@ class LedService:
             "effective": {str(c): self.effective_params(c) for c in CAMS},
             "rois": copy.deepcopy(self._rois),
             "roi_tracking": bool(self._roi_tracking),
-            "camera_map": copy.deepcopy(self._camera_map_mode),
-            "camera_map_effective": (copy.deepcopy(self._calib.get("camera_map"))
-                                     if self._calib else None),
-            "camera_map_confirmed": bool(self._mapping_confirmed),
+            "cameras": (list(self._calib.get("cameras")) if self._calib else None),
             "path": project_relative(self._params_path),
             "exists": os.path.isfile(self._params_path),
             "updated": self._params_updated,
@@ -508,44 +452,25 @@ class LedService:
     # 标定
     # ------------------------------------------------------------------
     def _load_calibration(self, *, force: bool = False) -> tuple[dict | None, bool]:
-        """读取并校验当前标定；同时准备两种相机映射。
+        """读取并校验当前标定（逻辑编号 = 标定相机编号）。
 
-        返回 ``(active_calib, changed)``。auto 模式下先沿用当前映射；
-        真正选择由 ``_process`` 用 34/79/79 mm 三角化结果完成。
+        返回 ``(calib, changed)``。相机身份由 camera_config 固定，不再做
+        live0/live1 的排列猜测。
         """
         try:
             snapshot = calibration_service().localization_snapshot()
-            options = {
-                "0,1": _build_calibration(snapshot, (0, 1)),
-                "1,0": _build_calibration(snapshot, (1, 0)),
-            }
+            active = _build_calibration(snapshot)
         except Exception as exc:
             with self._lock:
                 self._calib = None
-                self._calib_options = {}
                 self._calib_warning = str(exc).strip().splitlines()[-1]
             raise
         with self._lock:
-            mode = self._camera_map_mode
             current = self._calib
-            if mode == "auto":
-                keep = current.get("camera_map") if current else [0, 1]
-                key = "%d,%d" % tuple(keep)
-                active = options.get(key, options["0,1"])
-            else:
-                key = "%d,%d" % (mode[0], mode[1])
-                active = options[key]
             old_sig = current.get("signature") if current else None
-            changed = (force or old_sig != active["signature"]
-                       or (current is not None
-                           and current.get("camera_map") != active["camera_map"]))
-            self._calib_options = options
+            changed = force or old_sig != active["signature"]
             self._calib = active
             self._calib_warning = ""
-            if mode != "auto":
-                self._mapping_confirmed = True
-            elif changed or not self._mapping_confirmed:
-                self._mapping_confirmed = False
             if changed:
                 self._reset_tracking_locked()
                 self._last_diag = None
@@ -597,9 +522,9 @@ class LedService:
         return det
 
     def _clear_track_rois(self) -> None:
-        self._roi_track = {"0": None, "1": None}
-        self._roi_miss = {"0": 0, "1": 0}
-        self._roi_force_full = {"0": False, "1": False}
+        self._roi_track = {str(c): None for c in CAMS}
+        self._roi_miss = {str(c): 0 for c in CAMS}
+        self._roi_force_full = {str(c): False for c in CAMS}
 
     def _reset_tracking_locked(self, *, new_tracker: bool = False) -> None:
         if new_tracker:
@@ -610,26 +535,28 @@ class LedService:
         self._last_led_points = None
         self._trajectory = []
 
-    def _update_track_rois(self, det0: dict, det1: dict, match: dict) -> None:
+    def _update_track_rois(self, dets: dict, match: dict) -> None:
         if not self._roi_tracking:
             return
-        for cam, det, key in ((0, det0, "cam0_index"),
-                              (1, det1, "cam1_index")):
-            pts = []
-            leds = det.get("leds") or []
-            for m in match.get("matches") or []:
-                idx = m.get(key)
+        per_cam: dict[int, list] = {}
+        for m in match.get("matches") or []:
+            for cam_s, idx in (m.get("obs") or {}).items():
+                cam = int(cam_s)
+                leds = (dets.get(cam) or {}).get("leds") or []
                 if isinstance(idx, int) and 0 <= idx < len(leds):
-                    pts.append((float(leds[idx]["x"]), float(leds[idx]["y"])))
+                    per_cam.setdefault(cam, []).append(
+                        (float(leds[idx]["x"]), float(leds[idx]["y"])))
+        for cam, pts in per_cam.items():
             if len(pts) < 3:
                 continue
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            pad = ROI_TRACK_PAD_PX
+            det = dets.get(cam) or {}
             size = det.get("image_size") or [0, 0]
             h, w = int(size[1]), int(size[0])
             if w <= 0 or h <= 0:
                 continue
+            xs = [p[0] for p in pts]
+            ys = [p[1] for p in pts]
+            pad = ROI_TRACK_PAD_PX
             x0 = max(0, int(round(min(xs))) - pad)
             y0 = max(0, int(round(min(ys))) - pad)
             x1 = min(w, int(round(max(xs))) + pad)
@@ -640,7 +567,7 @@ class LedService:
                 self._roi_force_full[str(cam)] = False
 
     def _note_match_failure(self) -> None:
-        for c in CAMS:
+        for c in self._active_cameras():
             key = str(c)
             self._roi_miss[key] = self._roi_miss.get(key, 0) + 1
             if self._roi_miss[key] > ROI_MAX_MISS:
@@ -652,26 +579,37 @@ class LedService:
                "manual": copy.deepcopy(self._rois)}
         return out
 
+    def _active_cameras(self) -> list[int]:
+        """当前配置里实际在采样的逻辑相机编号。"""
+        try:
+            return [w.index for w in manager().workers()]
+        except Exception:
+            return [0, 1]
+
     def _check_cameras(self) -> None:
         m = manager()
         missing = []
-        for c in CAMS:
+        for c in self._active_cameras():
             w = m.worker(c)
             if w is None or w.state != "streaming":
                 missing.append(str(c))
         if missing:
-            raise RuntimeError("相机 %s 未处于 streaming；请先启动双相机" % ", ".join(missing))
+            raise RuntimeError("相机 %s 未处于 streaming；请先启动相机"
+                               % ", ".join(missing))
 
     def _check_frame_sizes(self, calib: dict) -> None:
         m = manager()
-        for c in CAMS:
+        per = calib.get("per_camera") or {}
+        for c in calib.get("cameras") or []:
             w = m.worker(c)
             f = w.latest() if w else None
-            if f is not None:
-                got = [int(f.gray.shape[1]), int(f.gray.shape[0])]
-                if got != list(calib["image_size"]):
-                    raise ValueError("相机 %d 当前分辨率 %s 与标定图像尺寸 %s 不一致"
-                                     % (c, got, calib["image_size"]))
+            if f is None or c not in per:
+                continue
+            got = [int(f.gray.shape[1]), int(f.gray.shape[0])]
+            want = [int(v) for v in per[c]["image_size"]]
+            if got != want:
+                raise ValueError("相机 %d 当前分辨率 %s 与内标定尺寸 %s 不一致"
+                                 % (c, got, want))
 
     # ------------------------------------------------------------------
     # 启停
@@ -698,8 +636,8 @@ class LedService:
             self._stop.set()
             self._reset_tracking_locked()
             self._clear_track_rois()
-            self._raw = {0: None, 1: None}
-            self._det_internal = {0: None, 1: None}
+            self._raw = {c: None for c in CAMS}
+            self._det_internal = {c: None for c in CAMS}
             self._state = self._idle_state()
             self._state["status"] = "stopped"
             self._state["reason"] = "二维检测已停止"
@@ -718,7 +656,6 @@ class LedService:
             self._locate = True
             self._reset_tracking_locked(new_tracker=True)
             self._clear_track_rois()
-            self._mapping_confirmed = (self._camera_map_mode != "auto")
             self._last_diag = None
             self._last_error = ""
             self._last_calib_check = time.perf_counter()
@@ -769,6 +706,7 @@ class LedService:
     # 后台处理
     # ------------------------------------------------------------------
     def _loop(self, stop_event: threading.Event) -> None:
+        """由新的同步帧组驱动；不做固定 FPS 限频，也不重复处理旧帧。"""
         while not stop_event.is_set():
             with self._lock:
                 detect, locate = self._detect, self._locate
@@ -776,218 +714,202 @@ class LedService:
                 stop_event.set()
                 break
             try:
-                recs = sync_service().recent_pairs(1)
+                recs = sync_service().recent_groups(1)
                 if not recs:
-                    self._set_status("waiting_sync", "还没有配对成功的同步帧对")
-                    time.sleep(0.03)
+                    self._set_status("waiting_sync", "还没有同步帧组")
+                    time.sleep(0.01)
                     continue
                 rec = recs[0]
                 now = time.perf_counter()
                 age = now - rec.created_mono
                 with self._lock:
-                    same = (self._last_pair_seq == rec.pair_seq)
+                    same = (self._last_pair_seq == rec.group_seq)
                     force = self._force_reprocess
-                    last_t = self._last_process_mono
+                    if (not same and self._last_pair_seq is not None
+                            and rec.group_seq > self._last_pair_seq + 1):
+                        # 处理能力不足时明确统计跳过的帧组，而不是积压历史帧
+                        self._groups_skipped += (rec.group_seq
+                                                 - self._last_pair_seq - 1)
+                    self._groups_seen = max(self._groups_seen, rec.group_seq)
                 if same and not force:
-                    # 没有新帧对：当前结果会随时间变旧，明确标记为过期
                     if age > MAX_PAIR_AGE_S:
                         self._set_status(
                             "sync_stale",
-                            "最近同步帧已过期 %.0f ms" % (age * 1000))
-                    time.sleep(0.01)
+                            "最近同步帧组已过期 %.0f ms" % (age * 1000))
+                    time.sleep(0.004)
                     continue
-                # force 对应“刚启动定位/刚改参数”，允许对同一最新帧重算一次；
-                # 除此之外，过期帧不做三角化
+                # force 对应“刚启动定位/刚改参数”，允许对同一最新帧组重算一次
                 if not force and age > MAX_PAIR_AGE_S:
                     self._set_status("sync_stale",
-                                     "最近同步帧已过期 %.0f ms" % (age * 1000))
-                    time.sleep(0.03)
-                    continue
-                if not force and now - last_t < 1.0 / MAX_PROCESS_FPS:
-                    time.sleep(0.005)
+                                     "最近同步帧组已过期 %.0f ms" % (age * 1000))
+                    time.sleep(0.01)
                     continue
                 self._process(rec, now)
                 with self._lock:
-                    self._last_pair_seq = rec.pair_seq
+                    self._last_pair_seq = rec.group_seq
                     self._force_reprocess = False
                     self._last_process_mono = now
             except Exception as exc:
                 self._last_error = str(exc).strip().splitlines()[-1]
                 self._set_status("error", self._last_error)
-                time.sleep(0.1)
+                time.sleep(0.05)
 
     def _process(self, rec, now: float) -> None:
-        fa, fb = rec.frame_a, rec.frame_b
-        t0 = time.perf_counter()
+        t_start = time.perf_counter()
         with self._lock:
-            p0 = self.effective_params(0)
-            p1 = self.effective_params(1)
             locate = self._locate
             calib = self._calib
+        cams = [int(c) for c in rec.cameras]
+        params = {c: self.effective_params(c) for c in cams}
         need = 3 if locate else 1
-        det0 = self._detect_camera(fa.gray, p0, 0, need)
-        det1 = self._detect_camera(fb.gray, p1, 1, need)
-        raw0 = np.ascontiguousarray(fa.gray).copy()
-        raw1 = np.ascontiguousarray(fb.gray).copy()
 
-        if locate:
-            # 标定可能在运行期间被重新载入/修改。每秒检查一次签名；变化时
-            # 重置跟踪和轨迹，避免旧外参/旧内参与新帧混用。
-            with self._lock:
-                calib = self._calib
-                need_check = (calib is None
-                              or time.perf_counter() - self._last_calib_check > 1.0)
-            if need_check:
-                try:
-                    self._load_calibration()
-                    with self._lock:
-                        calib = self._calib
-                        self._last_calib_check = time.perf_counter()
-                    if calib is None:
-                        raise ValueError(self._calib_warning
-                                         or "没有可用的标定参数")
-                    if [int(raw0.shape[1]), int(raw0.shape[0])] != list(calib["image_size"]):
-                        raise ValueError("相机 0 分辨率与标定不一致")
-                    if [int(raw1.shape[1]), int(raw1.shape[0])] != list(calib["image_size"]):
-                        raise ValueError("相机 1 分辨率与标定不一致")
-                except Exception as exc:
-                    with self._lock:
-                        self._locate = False
-                        self._tracker.reset()
-                        self._tracker_state = "idle"
-                        self._trajectory = []
-                        self._clear_track_rois()
-                    self._store_result(rec, det0, det1, raw0, raw1, t0,
-                                       status="calibration_invalid",
-                                       reason=str(exc).strip().splitlines()[-1],
-                                       locate=False, calib=None)
-                    return
+        dets, raws = {}, {}
+        t_det = 0.0
+        for c in cams:
+            frame = rec.frames[c]
+            t0 = time.perf_counter()
+            dets[c] = self._detect_camera(frame.gray, params[c], c, need)
+            t_det += time.perf_counter() - t0
+            raws[c] = np.ascontiguousarray(frame.gray).copy()
 
-            with self._lock:
-                pred_center = None
-                if self._tracker_state == "predicted" and self._state.get("filtered_center"):
-                    pred_center = self._state["filtered_center"]
-                prev_points = self._last_led_points
-                auto_map = (self._camera_map_mode == "auto")
-                confirmed = bool(self._mapping_confirmed)
-                options = self._calib_options
-                active = self._calib
+        stage_ms = {"detect_ms": round(t_det * 1000.0, 2)}
+        if not locate:
+            self._store_result(rec, dets, raws, t_start,
+                               status="detecting", reason="",
+                               locate=False, calib=calib, stage_ms=stage_ms)
+            return
 
-            def run_match(calib_item):
-                return match_and_triangulate(
-                    det0, det1, calib_item, p0, previous_points=prev_points,
-                    predicted_center=pred_center)
-
-            # auto 模式先同时评估两种“实时相机 ↔ 标定相机”映射；错误的
-            # 映射会三角化到相机后方（负深度），正确映射会得到 34/79/79 mm 三角。
-            if auto_map and not confirmed:
-                results = {key: run_match(opt) for key, opt in options.items()}
-                chosen_key, match = _choose_mapping(results)
-                if chosen_key is not None:
-                    chosen_calib = options[chosen_key]
-                    strong = bool(match and match.get("ok")) or _mapping_strong(match)
-                    with self._lock:
-                        self._calib = chosen_calib
-                        calib = chosen_calib
-                        self._last_diag = {
-                            "active_map": chosen_calib.get("camera_map"),
-                            "auto": True,
-                            "confirmed": strong,
-                            "mappings": {k: r.get("diagnostics")
-                                         for k, r in results.items()},
-                        }
-                        if strong:
-                            self._mapping_confirmed = True
-                            self._roi_miss = {"0": 0, "1": 0}
-                else:
-                    # 两路都没有足够证据：保留上一次已确认的映射，不要在两个
-                    # 错误编号之间来回切换。
-                    active_key = (("%d,%d" % tuple(active.get("camera_map")))
-                                  if active else "0,1")
-                    match = results.get(active_key)
-                    if match is None and active:
-                        match = run_match(active)
-                    if match is None:
-                        match = {"ok": False, "status": "insufficient_matches",
-                                 "reason": "没有可用的相机映射"}
-                    with self._lock:
-                        self._last_diag = {
-                            "active_map": (active or {}).get("camera_map"),
-                            "auto": True,
-                            "confirmed": bool(self._mapping_confirmed),
-                            "mappings": {k: r.get("diagnostics")
-                                         for k, r in results.items()},
-                        }
-            else:
-                match = run_match(calib)
+        # 标定可能在运行期间被重新载入/修改；每秒检查一次签名。
+        with self._lock:
+            calib = self._calib
+            need_check = (calib is None
+                          or time.perf_counter() - self._last_calib_check > 1.0)
+        if need_check:
+            try:
+                self._load_calibration()
                 with self._lock:
-                    d = match.get("diagnostics") or {}
-                    self._last_diag = {
-                        "active_map": calib.get("camera_map") if calib else None,
-                        "auto": auto_map,
-                        "confirmed": bool(self._mapping_confirmed),
-                        "mappings": {("%d,%d" % tuple(
-                            calib.get("camera_map") or [0, 1])): d},
-                    }
-            if match.get("ok"):
-                stamp = rec.created_mono
-                upd = self._tracker.update(match["raw_center"], stamp)
-                self._tracker_state = upd["state"]
+                    calib = self._calib
+                    self._last_calib_check = time.perf_counter()
+                if calib is None:
+                    raise ValueError(self._calib_warning or "没有可用的标定参数")
+            except Exception as exc:
                 with self._lock:
-                    self._update_track_rois(det0, det1, match)
-                    self._last_led_points = [l["xyz"] for l in match["leds"]]
-                    self._trajectory.append(upd["position"])
+                    self._locate = False
+                    self._tracker.reset()
+                    self._tracker_state = "idle"
+                    self._trajectory = []
+                    self._clear_track_rois()
+                self._store_result(
+                    rec, dets, raws, t_start,
+                    status="calibration_invalid",
+                    reason=str(exc).strip().splitlines()[-1],
+                    locate=False, calib=None, stage_ms=stage_ms)
+                return
+
+        # 每台相机用自己的图像尺寸校验；不匹配的相机不参与定位，
+        # 绝不用别的相机的内参/外参顶替。
+        usable = []
+        size_problems = {}
+        for c in cams:
+            entry = (calib.get("per_camera") or {}).get(c)
+            if not entry:
+                size_problems[c] = "标定里没有相机 %d" % c
+                continue
+            want = [int(v) for v in entry["image_size"]]
+            got = [int(raws[c].shape[1]), int(raws[c].shape[0])]
+            if got != want:
+                size_problems[c] = ("相机 %d 当前分辨率 %s 与内参 %s 不一致"
+                                    % (c, got, want))
+                continue
+            usable.append(c)
+        if len(usable) < 2:
+            with self._lock:
+                self._locate = False
+                self._tracker.reset()
+                self._tracker_state = "idle"
+                self._trajectory = []
+                self._clear_track_rois()
+            self._store_result(
+                rec, dets, raws, t_start, status="calibration_invalid",
+                reason="；".join(size_problems.values())
+                or "可用于定位的相机不足 2 台",
+                locate=False, calib=calib, stage_ms=stage_ms)
+            return
+
+        with self._lock:
+            pred_center = None
+            if (self._tracker_state == "predicted"
+                    and self._state.get("filtered_center")):
+                pred_center = self._state["filtered_center"]
+            prev_points = self._last_led_points
+
+        t0 = time.perf_counter()
+        match = match_and_triangulate(
+            {c: dets[c] for c in usable}, calib, params[usable[0]],
+            previous_points=prev_points, predicted_center=pred_center)
+        stage_ms["match_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+        with self._lock:
+            self._last_diag = dict(match.get("diagnostics") or {},
+                                   cameras=usable)
+
+        if match.get("ok"):
+            stamp = rec.created_mono
+            t0 = time.perf_counter()
+            upd = self._tracker.update(match["raw_center"], stamp)
+            self._tracker_state = upd["state"]
+            stage_ms["track_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
+            with self._lock:
+                self._update_track_rois(dets, match)
+                self._last_led_points = [l["xyz"] for l in match["leds"]]
+                self._trajectory.append(upd["position"])
+                if len(self._trajectory) > MAX_TRAJECTORY:
+                    self._trajectory = self._trajectory[-MAX_TRAJECTORY:]
+            self._store_result(
+                rec, dets, raws, t_start,
+                status="tracking", reason="",
+                locate=True, calib=calib, match=match,
+                filtered_center=upd["position"], velocity=upd["velocity"],
+                tracker={"state": upd["state"], "missed": upd["missed"],
+                         "reacquired": upd.get("reacquired", False)},
+                stage_ms=stage_ms)
+        else:
+            with self._lock:
+                self._note_match_failure()
+            pred = self._tracker.predict(rec.created_mono)
+            self._tracker_state = pred["state"]
+            if pred["state"] == "predicted":
+                with self._lock:
+                    self._trajectory.append(pred["position"])
                     if len(self._trajectory) > MAX_TRAJECTORY:
                         self._trajectory = self._trajectory[-MAX_TRAJECTORY:]
                 self._store_result(
-                    rec, det0, det1, raw0, raw1, t0,
-                    status="tracking", reason="",
-                    locate=True, calib=calib,
-                    match=match,
-                    filtered_center=upd["position"], velocity=upd["velocity"],
-                    tracker={"state": upd["state"], "missed": upd["missed"],
-                             "reacquired": upd.get("reacquired", False)})
+                    rec, dets, raws, t_start,
+                    status="predicted",
+                    reason=match.get("reason") or "当前帧组没有有效三点测量",
+                    locate=True, calib=calib, match=match,
+                    filtered_center=pred["position"], velocity=pred["velocity"],
+                    tracker={"state": "predicted", "missed": pred["missed"],
+                             "age_s": pred.get("age_s")},
+                    stage_ms=stage_ms)
             else:
                 with self._lock:
-                    self._note_match_failure()
-                pred = self._tracker.predict(rec.created_mono)
-                self._tracker_state = pred["state"]
-                if pred["state"] == "predicted":
-                    with self._lock:
-                        self._trajectory.append(pred["position"])
-                        if len(self._trajectory) > MAX_TRAJECTORY:
-                            self._trajectory = self._trajectory[-MAX_TRAJECTORY:]
-                    self._store_result(
-                        rec, det0, det1, raw0, raw1, t0,
-                        status="predicted",
-                        reason=match.get("reason") or "当前帧没有有效三点测量",
-                        locate=True, calib=calib, match=match,
-                        filtered_center=pred["position"], velocity=pred["velocity"],
-                        tracker={"state": "predicted", "missed": pred["missed"],
-                                 "age_s": pred.get("age_s")})
-                else:
-                    with self._lock:
-                        self._trajectory = []
-                        self._last_led_points = None
-                        self._clear_track_rois()
-                        if self._camera_map_mode == "auto":
-                            self._mapping_confirmed = False
-                    self._store_result(
-                        rec, det0, det1, raw0, raw1, t0,
-                        status="lost",
-                        reason=match.get("reason") or "跟踪已丢失",
-                        locate=True, calib=calib, match=match,
-                        filtered_center=None, velocity=None,
-                        tracker={"state": "lost"})
-        else:
-            self._store_result(rec, det0, det1, raw0, raw1, t0,
-                               status="detecting", reason="",
-                               locate=False, calib=calib)
+                    self._trajectory = []
+                    self._last_led_points = None
+                    self._clear_track_rois()
+                self._store_result(
+                    rec, dets, raws, t_start,
+                    status="lost",
+                    reason=match.get("reason") or "跟踪已丢失",
+                    locate=True, calib=calib, match=match,
+                    filtered_center=None, velocity=None,
+                    tracker={"state": "lost"},
+                    stage_ms=stage_ms)
 
-    def _store_result(self, rec, det0, det1, raw0, raw1, t0, *,
+    def _store_result(self, rec, dets, raws, t0, *,
                       status: str, reason: str, locate: bool,
                       calib: dict | None, match: dict | None = None,
-                      filtered_center=None, velocity=None, tracker=None):
+                      filtered_center=None, velocity=None, tracker=None,
+                      stage_ms: dict | None = None):
         # 停止请求发出后，正在处理的旧结果不能再覆盖“已停止”状态
         if locate and not self._locate:
             return
@@ -996,14 +918,16 @@ class LedService:
         duration_ms = (time.perf_counter() - t0) * 1000.0
         with self._lock:
             if self._detect:
-                self._raw = {0: raw0, 1: raw1}
-                self._det_internal = {0: det0, 1: det1}
+                self._raw = {c: raws.get(c) for c in CAMS}
+                self._det_internal = {c: dets.get(c) for c in CAMS}
             self._processed_pairs += 1
             self._processing_ms = (duration_ms if self._processing_ms is None
                                    else 0.8 * self._processing_ms + 0.2 * duration_ms)
+            self._processing_stage_ms = dict(stage_ms or {})
             m = match or {}
             tracking = status == "tracking"
             shown = status in ("tracking", "predicted")
+            cams = [int(c) for c in rec.cameras]
             state = {
                 "ok": True,
                 "detect_enabled": bool(self._detect),
@@ -1012,19 +936,29 @@ class LedService:
                 "valid": status == "tracking",
                 "reason": reason,
                 "pair": {
-                    "pair_seq": int(rec.pair_seq),
-                    "dt_ms": round(float(rec.dt_ms), 3),
-                    "seq0": int(rec.frame_a.seq),
-                    "seq1": int(rec.frame_b.seq),
+                    # 兼容旧字段名：pair 现在表示一个 2..N 相机帧组
+                    "pair_seq": int(rec.group_seq),
+                    "group_seq": int(rec.group_seq),
+                    "dt_ms": round(float(rec.span_ms), 3),
+                    "span_ms": round(float(rec.span_ms), 3),
+                    "cameras": cams,
+                    "frames": {
+                        str(c): {
+                            "seq": int(rec.frames[c].seq),
+                            "host_ts": round(float(rec.frames[c].host_ts), 6),
+                            "mono_ts": round(float(rec.frames[c].mono_ts), 6),
+                            "mf_ts": int(rec.frames[c].mf_ts),
+                            "width": int(rec.frames[c].gray.shape[1]),
+                            "height": int(rec.frames[c].gray.shape[0]),
+                        } for c in cams},
                     "created_mono": round(float(rec.created_mono), 6),
-                    "host_ts0": round(float(rec.frame_a.host_ts), 6),
-                    "host_ts1": round(float(rec.frame_b.host_ts), 6),
                 },
-                "detections": {"0": _slim_detection(det0),
-                               "1": _slim_detection(det1)},
+                "detections": {str(c): _slim_detection(dets.get(c))
+                               for c in cams},
                 "roi": self._roi_state_locked(),
                 "matches": list(m.get("matches") or []),
                 "leds": list(m.get("leds") or []) if shown else [],
+                "cameras_used": list(m.get("cameras_used") or []),
                 "raw_center": m.get("raw_center") if tracking else None,
                 "filtered_center": filtered_center,
                 "velocity": velocity,
@@ -1043,25 +977,21 @@ class LedService:
                 "tracking": tracker or {"state": self._tracker_state},
                 "trajectory": [list(p) for p in self._trajectory],
                 "calibration": self._calib_summary_locked(calib),
-                "camera_map": (calib or {}).get("camera_map"),
-                "mapping": {
-                    "mode": (copy.deepcopy(self._camera_map_mode)
-                             if self._camera_map_mode != "auto" else "auto"),
-                    "effective": (calib or {}).get("camera_map"),
-                    "confirmed": bool(self._mapping_confirmed),
-                },
                 "diagnostics": _compact_diag(m.get("diagnostics")),
                 "params": self._params_state_locked(),
                 "processed_pairs": self._processed_pairs,
+                "groups_seen": self._groups_seen,
+                "groups_skipped": self._groups_skipped,
                 "processing_ms": round(self._processing_ms or 0.0, 2),
+                "stage_ms": dict(self._processing_stage_ms),
                 "timestamp": _now_iso(),
                 "last_error": self._last_error,
             }
             self._state = state
-        # 连续录制只登记这一帧已经完成的检测/定位结果，不重算任何东西；
+        # 连续录制只登记这一帧组已经完成的检测/定位结果，不重算任何东西；
         # note_result 内部不写盘，实际 PNG/JSONL 由录制写盘线程完成。
         try:
-            recorder().note_result(rec.pair_seq, state, m.get("diagnostics"))
+            recorder().note_result(rec.group_seq, state, m.get("diagnostics"))
         except Exception:
             pass
 
@@ -1077,7 +1007,8 @@ class LedService:
             "created": calib.get("created"),
             "orientation_confirmed": calib.get("orientation_confirmed"),
             "image_size": calib.get("image_size"),
-            "camera_map": calib.get("camera_map"),
+            "cameras": calib.get("cameras"),
+            "image_sizes": calib.get("image_sizes"),
             "R_10": calib.get("R_10"),
             "T_10": calib.get("T_10"),
             "convention": calib.get("convention"),
@@ -1117,13 +1048,12 @@ class LedService:
             "label_assignment": None,
             "tracking": {"state": "idle"},
             "trajectory": [],
-            "camera_map": None,
-            "mapping": {"mode": copy.deepcopy(self._camera_map_mode),
-                        "effective": None, "confirmed": False},
+            "cameras_used": [],
             "diagnostics": None,
             "calibration": self._calib_summary_locked(),
             "params": self._params_state_locked(),
             "processed_pairs": 0, "processing_ms": 0.0,
+            "groups_seen": 0, "groups_skipped": 0, "stage_ms": {},
             "timestamp": _now_iso(), "last_error": "",
         }
 
@@ -1145,46 +1075,29 @@ class LedService:
 
     @staticmethod
     def _diagnose_snapshot(snap: dict) -> dict:
-        """用同一快照的检测/参数/标定选项重新计算完整诊断。"""
-        state = snap.get("state") or {}
-        options = snap.get("calib_options") or {}
+        """用同一快照的检测/参数/标定重新计算完整诊断。"""
         calib = snap.get("calib")
-        det0 = (snap.get("det") or {}).get(0)
-        det1 = (snap.get("det") or {}).get(1)
-        params = (snap.get("params") or {}).get(0)
-        if not options and calib:
-            options = {"%d,%d" % tuple(calib.get("camera_map") or (0, 1)):
-                       calib}
-        mappings = {}
-        chosen_key = None
-        if det0 is not None and det1 is not None and params and options:
-            results = {}
-            for key, opt in options.items():
-                results[key] = match_and_triangulate(det0, det1, opt, params)
-            if snap.get("camera_map_mode") == "auto":
-                chosen_key, _ = _choose_mapping(results)
-            mappings = {k: r.get("diagnostics") for k, r in results.items()}
-        active = ((options.get(chosen_key) or {}).get("camera_map")
-                  if chosen_key else (calib or {}).get("camera_map"))
-        return {
-            "active_map": active,
-            "auto": snap.get("camera_map_mode") == "auto",
-            "confirmed": bool(snap.get("mapping_confirmed")),
-            "mappings": mappings,
-        }
+        dets = snap.get("det") or {}
+        params = snap.get("params") or {}
+        cams = [c for c in (calib or {}).get("cameras") or [] if dets.get(c)]
+        if calib and len(cams) >= 2:
+            m = match_and_triangulate(
+                {c: dets[c] for c in cams}, calib,
+                params.get(cams[0]) or default_params())
+            return {"cameras": cams, "diagnostics": m.get("diagnostics")}
+        return {"cameras": cams, "diagnostics": None}
 
     def diagnose(self) -> dict:
-        """返回当前帧的完整分阶段诊断（含两种相机映射）。"""
-        def payload(state, diag, mode, camera_map):
+        """返回当前帧组的完整分阶段诊断（所有相机对）。"""
+        def payload(state, diag):
             return {
                 "ok": True,
                 "pair": state.get("pair"),
                 "status": state.get("status"),
                 "reason": state.get("reason"),
-                "camera_map_mode": mode,
-                "camera_map": camera_map,
-                "mapping": state.get("mapping"),
-                "diagnostics": diag,
+                "cameras": (diag or {}).get("cameras")
+                if diag else state.get("pair", {}).get("cameras"),
+                "diagnostics": (diag or {}).get("diagnostics") if diag else None,
                 "params": state.get("params"),
                 "calibration": state.get("calibration"),
             }
@@ -1194,16 +1107,13 @@ class LedService:
         except Exception:
             with self._lock:
                 state = copy.deepcopy(self._state)
-                calib = self._calib
                 diag = copy.deepcopy(self._last_diag)
-                mode = copy.deepcopy(self._camera_map_mode)
-            return payload(state, diag, mode, (calib or {}).get("camera_map"))
+            return payload(state, {"cameras": (diag or {}).get("cameras"),
+                                   "diagnostics": diag})
         with self._lock:
             diag = self._diagnose_snapshot(snap)
             state = copy.deepcopy(snap.get("state") or {})
-            mode = copy.deepcopy(self._camera_map_mode)
-        return payload(state, diag, mode,
-                       state.get("camera_map") or diag.get("active_map"))
+        return payload(state, diag)
 
     # ------------------------------------------------------------------
     # 连续调试录制
@@ -1222,11 +1132,8 @@ class LedService:
                 },
                 "params": self._params_state_locked(),
                 "calibration": self._calib_summary_locked(),
-                "camera_map": {
-                    "mode": copy.deepcopy(self._camera_map_mode),
-                    "effective": ((self._calib or {}).get("camera_map")),
-                    "confirmed": bool(self._mapping_confirmed),
-                },
+                "cameras": self._active_cameras(),
+                "camera_count": len(self._active_cameras()),
             }
             try:
                 session["sync_max_dt_ms"] = sync_service().max_dt_ms
@@ -1251,27 +1158,26 @@ class LedService:
     # 实机调试保存
     # ------------------------------------------------------------------
     def save_debug(self) -> dict:
-        """保存当前同步帧的原始灰度、二值图、检测叠加图和检测 JSON。
-
-        这样可以用实机采集到的图离线复现检测/匹配，不必只依赖合成测试。
-        """
-        snap = self._overlay_snapshot(CAMS)
+        """保存当前同步帧组每台相机的原始灰度、二值图、叠加图和 JSON。"""
+        cams = self._active_cameras()
+        snap = self._overlay_snapshot(cams)
         raw = snap.get("raw") or {}
         dets_full = snap.get("det") or {}
         state = snap.get("state") or {}
-        if raw.get(0) is None or raw.get(1) is None:
-            raise RuntimeError("还没有处理过同步帧对，请等待新帧后再保存")
+        present = [c for c in cams if raw.get(c) is not None]
+        if len(present) < 2:
+            raise RuntimeError("还没有处理过同步帧组，请等待新帧后再保存")
         masks = {c: (None if (dets_full.get(c) or {}).get("mask") is None
-                     else (dets_full[c]["mask"]).copy()) for c in CAMS}
-        dets = {c: copy.deepcopy(_strip_mask(dets_full.get(c))) for c in CAMS}
+                     else (dets_full[c]["mask"]).copy()) for c in present}
+        dets = {c: copy.deepcopy(_strip_mask(dets_full.get(c)))
+                for c in present}
         rois = copy.deepcopy(self._rois)
         roi_tracking = bool(self._roi_tracking)
         diagnosis = self._diagnose_snapshot(snap)
         diagnosis.update({"pair": state.get("pair"),
                           "status": state.get("status"),
                           "reason": state.get("reason"),
-                          "camera_map": state.get("camera_map"),
-                          "mapping": state.get("mapping")})
+                          "cameras": present})
 
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         # 跟着当前参数文件走，测试/自定义 MOCAP_CALIB_DIR 时不会写回默认目录
@@ -1281,7 +1187,7 @@ class LedService:
         outdir = os.path.join(debug_root, stamp)
         os.makedirs(outdir, exist_ok=True)
         files = []
-        for c in CAMS:
+        for c in present:
             path = os.path.join(outdir, "cam%d_raw.png" % c)
             if not cv2.imwrite(path, raw[c]):
                 raise OSError("写入失败：%s" % path)
@@ -1292,7 +1198,7 @@ class LedService:
                     raise OSError("写入失败：%s" % path)
                 files.append(os.path.basename(path))
         # 叠加图在锁外生成，避免长时间持有状态锁
-        for c in CAMS:
+        for c in present:
             try:
                 data, _ = self.overlay(c, view="detect", scale=1.0,
                                        quality=92, snapshot=snap)
@@ -1305,14 +1211,12 @@ class LedService:
                 pass
         detections = {
             "timestamp": datetime.now().isoformat(timespec="seconds"),
-            "cameras": [int(c) for c in CAMS],
-            "detections": {str(c): dets[c] for c in CAMS},
+            "cameras": present,
+            "detections": {str(c): dets[c] for c in present},
             "params": state.get("params"),
             "rois": rois, "roi_tracking": roi_tracking,
             "pair": state.get("pair"),
             "calibration": state.get("calibration"),
-            "camera_map": state.get("camera_map"),
-            "mapping": state.get("mapping"),
             "status": state.get("status"),
             "reason": state.get("reason"),
         }
@@ -1342,20 +1246,17 @@ class LedService:
                 "det": det,
                 "params": params,
                 "calib": self._calib,
-                "calib_options": dict(self._calib_options),
-                "camera_map_mode": copy.deepcopy(self._camera_map_mode),
-                "mapping_confirmed": bool(self._mapping_confirmed),
                 "matches": list(self._state.get("matches") or []),
                 "state": copy.deepcopy(self._state),
             }
 
     def overlay(self, camera: int, *, view: str = "detect",
                 scale: float = OVERLAY_SCALE, quality: int = 75,
-                zoom: float = 1.0, snapshot: dict | None = None
-                ) -> tuple[bytes, dict]:
+                zoom: float = 1.0, snapshot: dict | None = None,
+                pair=None) -> tuple[bytes, dict]:
         cam = int(camera)
         if cam not in CAMS:
-            raise ValueError("camera 必须是 0 或 1")
+            raise ValueError("camera 必须是 0..3")
         if snapshot is None:
             snapshot = self._overlay_snapshot([cam])
         raw = (snapshot.get("raw") or {}).get(cam)
@@ -1366,8 +1267,9 @@ class LedService:
         params = (snapshot.get("params") or {}).get(cam)
         matched_map = {}
         for m in matches:
-            idx = m["cam0_index"] if cam == 0 else m["cam1_index"]
-            matched_map[int(idx)] = int(m["led"])
+            idx = (m.get("obs") or {}).get(str(cam))
+            if isinstance(idx, int):
+                matched_map[int(idx)] = int(m["led"])
         if raw is None or det is None:
             raise RuntimeError("还没有处理过同步帧对，请等待新帧")
         if params is None:
@@ -1376,7 +1278,7 @@ class LedService:
         q = int(np.clip(quality, 40, 95))
         zoom = float(np.clip(zoom, 1.0, 4.0))
         view = str(view or "detect")
-        if view not in ("detect", "binary", "raw", "epipolar"):
+        if view not in ("detect", "binary", "raw", "epipolar", "undistort"):
             view = "detect"
         if view == "epipolar" and not calib:
             # 二维检测本身不要求标定；但极线视图需要 K/D/R/t，按需从当前
@@ -1397,11 +1299,14 @@ class LedService:
                 _, mask = cv2.threshold(proc, int(params["threshold"]), 255,
                                         cv2.THRESH_BINARY)
             canvas = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
-        elif view == "epipolar":
+        elif view in ("epipolar", "undistort"):
             if not calib:
-                raise RuntimeError("极线视图需要先载入内参/外参")
-            K = calib["K0"] if cam == 0 else calib["K1"]
-            D = calib["D0"] if cam == 0 else calib["D1"]
+                raise RuntimeError("去畸变/极线视图需要先载入内参")
+            entry = (calib.get("per_camera") or {}).get(cam) or {}
+            K = np.asarray(entry.get("K"), np.float64)
+            D = np.asarray(entry.get("D"), np.float64).reshape(-1)
+            if K.shape != (3, 3):
+                raise RuntimeError("相机 %d 没有可用内参" % cam)
             canvas = cv2.undistort(raw, K, D)
             canvas = cv2.cvtColor(canvas, cv2.COLOR_GRAY2BGR)
         else:
@@ -1462,11 +1367,28 @@ class LedService:
         # 来源候选点。这样 matched=0 时也能直观看到为什么没配上。
         epi_draw = None
         if view == "epipolar" and calib:
-            F = calib["F"]
+            per = calib.get("per_camera") or {}
+            cams = [int(c) for c in calib.get("cameras") or []]
+            other_cam = None
+            if pair and int(pair[0]) == cam:
+                other_cam = int(pair[1])
+            elif pair and int(pair[1]) == cam:
+                other_cam = int(pair[0])
+            if other_cam is None or other_cam not in per:
+                other_cam = next((c for c in cams if c != cam), None)
+            if other_cam is None:
+                raise RuntimeError("极线视图需要至少两台已标定相机")
+            Rab, Tab = relative_pose(
+                np.asarray(per[other_cam]["R"], np.float64),
+                np.asarray(per[other_cam]["t"], np.float64).reshape(3),
+                np.asarray(per[cam]["R"], np.float64),
+                np.asarray(per[cam]["t"], np.float64).reshape(3))
+            F = fundamental_from_pose(
+                np.asarray(per[other_cam]["K"], np.float64),
+                np.asarray(per[cam]["K"], np.float64), Rab, Tab)
             tol = float(params["epipolar_tol_px"])
-            other_cam = 1 if cam == 0 else 0
-            K_other = calib["K1"] if cam == 0 else calib["K0"]
-            D_other = calib["D1"] if cam == 0 else calib["D0"]
+            K_other = np.asarray(per[other_cam]["K"], np.float64)
+            D_other = np.asarray(per[other_cam]["D"], np.float64)
 
             def ideal_of(items, k, d):
                 if not items:
@@ -1618,27 +1540,41 @@ class LedService:
             "roi_fallback": bool(det.get("roi_fallback")),
         }
 
-    def overlay_pair(self, *, view: str = "detect",
-                     scale: float = OVERLAY_SCALE, quality: int = 75,
-                     zoom: float = 1.0) -> dict:
-        """两台相机用**同一帧对快照**渲染叠加图，避免前端分别刷新时
-        出现 cam0 pair=9464、cam1 pair=9466 的显示错位。"""
-        snap = self._overlay_snapshot(CAMS)
-        images, infos = {}, {}
-        for c in CAMS:
-            data, info = self.overlay(c, view=view, scale=scale,
-                                      quality=quality, zoom=zoom,
-                                      snapshot=snap)
-            images[str(c)] = base64.b64encode(data).decode("ascii")
-            infos[str(c)] = info
+    def overlay_group(self, *, view: str = "detect",
+                      scale: float = OVERLAY_SCALE, quality: int = 75,
+                      zoom: float = 1.0, pair=None,
+                      cameras=None) -> dict:
+        """所有相机用**同一帧组快照**渲染叠加图，避免前端分别刷新时
+        出现不同帧组混在一起的显示错位。"""
+        with self._lock:
+            cams = [int(c) for c in (cameras or self._active_cameras())]
+        snap = self._overlay_snapshot(cams)
+        images, infos, errors = {}, {}, {}
+        for c in cams:
+            try:
+                data, info = self.overlay(c, view=view, scale=scale,
+                                          quality=quality, zoom=zoom,
+                                          snapshot=snap, pair=pair)
+                images[str(c)] = base64.b64encode(data).decode("ascii")
+                infos[str(c)] = info
+            except Exception as exc:
+                errors[str(c)] = str(exc).strip().splitlines()[-1]
         return {
             "ok": True,
             "pair": snap.get("state", {}).get("pair"),
             "status": snap.get("state", {}).get("status"),
-            "mapping": snap.get("state", {}).get("mapping"),
+            "cameras": cams,
             "images": images,
             "infos": infos,
+            "errors": errors,
         }
+
+    def overlay_pair(self, *, view: str = "detect",
+                     scale: float = OVERLAY_SCALE, quality: int = 75,
+                     zoom: float = 1.0) -> dict:
+        """兼容入口：只渲染 0/1 两台相机。"""
+        return self.overlay_group(view=view, scale=scale, quality=quality,
+                                  zoom=zoom, cameras=[0, 1])
 
 
 # 极线视图的颜色：同一条极线与其来源候选点共用一种颜色

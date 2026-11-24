@@ -238,18 +238,18 @@ def _peak_points(dt: np.ndarray, mask: np.ndarray, params: dict) -> np.ndarray:
                  & (dt >= max(1.0, params["peak_rel_threshold"] * max_dt))
                  & mask).astype(np.uint8)
     n, labels, _, _ = cv2.connectedComponentsWithStats(peak_mask, 8)
-    peaks = []
-    for label in range(1, n):
-        ys, xs = np.nonzero(labels == label)
-        if len(xs) == 0:
-            continue
-        w = dt[ys, xs]
-        s = float(w.sum())
-        if s <= 1e-9:
-            peaks.append([float(xs.mean()), float(ys.mean())])
-        else:
-            peaks.append([float((xs * w).sum() / s),
-                          float((ys * w).sum() / s)])
+    if n <= 1:
+        return np.empty((0, 2), np.float64)
+    # 一次 bincount 求每个峰标签的加权质心，避免对每个标签做整幅
+    # ``labels == k`` + nonzero 扫描（多峰时是主要开销）。
+    ys, xs = np.nonzero(peak_mask)
+    lab = labels[ys, xs]
+    w = dt[ys, xs].astype(np.float64)
+    total = np.bincount(lab, weights=w, minlength=n)
+    sx = np.bincount(lab, weights=w * xs, minlength=n)
+    sy = np.bincount(lab, weights=w * ys, minlength=n)
+    peaks = [[float(sx[k] / total[k]), float(sy[k] / total[k])]
+             for k in range(1, n) if total[k] > 1e-9]
     return _merge_close_peaks(np.asarray(peaks, np.float64),
                               float(params["min_peak_distance"]))
 
@@ -269,14 +269,16 @@ def _intensity_peaks(gray_roi: np.ndarray, mask: np.ndarray,
     peak_mask = (mask & (smooth >= local_max - 1e-3)
                  & (smooth >= lo)).astype(np.uint8)
     n, labels, _, _ = cv2.connectedComponentsWithStats(peak_mask, 8)
-    peaks = []
-    for label in range(1, n):
-        ys, xs = np.nonzero(labels == label)
-        if len(xs):
-            w = smooth[ys, xs].astype(np.float64)
-            s = float(w.sum())
-            peaks.append([float((xs * w).sum() / s) if s else float(xs.mean()),
-                          float((ys * w).sum() / s) if s else float(ys.mean())])
+    if n <= 1:
+        return np.empty((0, 2), np.float64)
+    ys, xs = np.nonzero(peak_mask)
+    lab = labels[ys, xs]
+    w = smooth[ys, xs].astype(np.float64)
+    total = np.bincount(lab, weights=w, minlength=n)
+    sx = np.bincount(lab, weights=w * xs, minlength=n)
+    sy = np.bincount(lab, weights=w * ys, minlength=n)
+    peaks = [[float(sx[k] / total[k]), float(sy[k] / total[k])]
+             for k in range(1, n) if total[k] > 1e-9]
     return _merge_close_peaks(np.asarray(peaks, np.float64),
                               float(params["min_peak_distance"]))
 
@@ -288,21 +290,34 @@ def _split_component(gray_roi: np.ndarray, mask: np.ndarray,
     每个 part 至少占父亮区 ``split_min_area_ratio``，避免单个 LED 的亮核/
     光晕被误拆成两个候选。
     """
+    # 外接框放不下两个相距 min_peak_distance 的峰 → 必然是单个 LED，直接返回。
+    # 单灯占绝大多数，跳过距离变换/峰值/Voronoi 是检测阶段最划算的优化。
+    h, w = mask.shape
+    if max(h, w) < 2.0 * float(params["min_peak_distance"]):
+        return [mask]
     dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 5)
     peaks = _peak_points(dt, mask, params)
     if len(peaks) < 2:
-        # 距离变换只有一个峰时，再尝试灰度局部极大值（薄桥粘连的情况）
-        alt = _intensity_peaks(gray_roi, mask,
-                               float(params["threshold"]), params)
-        if len(alt) >= 2:
-            peaks = alt
+        # 距离变换只有一个峰时，再尝试灰度局部极大值（薄桥粘连的情况）。
+        # 单个 LED 的外接框放不下两个相距 min_peak_distance 的峰，直接跳过
+        # 这个兜底；否则每个单灯都要多跑一次连通域分析（实测占检测耗时 25%）。
+        h, w = mask.shape
+        min_sep = float(params["min_peak_distance"])
+        if max(h, w) >= 2.0 * min_sep:
+            alt = _intensity_peaks(gray_roi, mask,
+                                   float(params["threshold"]), params)
+            if len(alt) >= 2:
+                peaks = alt
     if len(peaks) < 2:
         return [mask]
 
     ys, xs = np.nonzero(mask)
     # 最近峰值分配（Voronoi）。对圆形/近圆形 LED 光斑，效果与 watershed
     # 的分水岭边界基本一致，但实现更简单、没有 OpenCV 边界 -1 的问题。
-    d2 = np.stack([(xs - px) ** 2 + (ys - py) ** 2 for px, py in peaks])
+    # 广播成 (峰数, 像素数) 一次算完，避免逐峰建列表再 stack。
+    px = peaks[:, 0][:, None]
+    py = peaks[:, 1][:, None]
+    d2 = (xs[None, :] - px) ** 2 + (ys[None, :] - py) ** 2
     assign = np.argmin(d2, axis=0)
     parent_area = int(mask.sum())
     min_part = max(1, int(params["min_area"]),

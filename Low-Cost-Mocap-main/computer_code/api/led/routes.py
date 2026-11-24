@@ -111,8 +111,10 @@ def led_overlay():
         scale = float(request.args.get("scale", 0.6))
         quality = int(request.args.get("quality", 75))
         zoom = float(request.args.get("zoom", 1.0))
+        pair = request.args.get("pair")
+        pair = tuple(int(v) for v in pair.split(",")) if pair else None
         data, info = service().overlay(cam, view=view, scale=scale,
-                                       quality=quality, zoom=zoom)
+                                       quality=quality, zoom=zoom, pair=pair)
         resp = Response(data, mimetype="image/jpeg")
         resp.headers["Cache-Control"] = "no-store"
         resp.headers["X-LED-Count"] = str(info.get("count"))
@@ -130,14 +132,19 @@ def led_overlay():
 
 @bp.get("/api/led/overlay_pair")
 def led_overlay_pair():
-    """同一同步帧对的两台相机叠加图（JSON + base64 JPEG）。"""
+    """同一同步帧组的多相机叠加图（JSON + base64 JPEG）。"""
     try:
         view = request.args.get("view", "detect")
         scale = float(request.args.get("scale", 0.6))
         quality = int(request.args.get("quality", 75))
         zoom = float(request.args.get("zoom", 1.0))
-        data = service().overlay_pair(view=view, scale=scale,
-                                      quality=quality, zoom=zoom)
+        pair = request.args.get("pair")
+        pair = tuple(int(v) for v in pair.split(",")) if pair else None
+        cams = request.args.get("cameras")
+        cameras = ([int(v) for v in cams.split(",") if v] if cams else None)
+        data = service().overlay_group(view=view, scale=scale,
+                                       quality=quality, zoom=zoom,
+                                       pair=pair, cameras=cameras)
         resp = jsonify(data)
         resp.headers["Cache-Control"] = "no-store"
         if data.get("pair"):

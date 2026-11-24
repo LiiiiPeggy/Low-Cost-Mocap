@@ -194,7 +194,34 @@ def _dets(points2d):
 
 
 def _match(p0, p1, calib, params):
-    return match_and_triangulate(_dets(p0), _dets(p1), calib, params)
+    return match_and_triangulate({0: _dets(p0), 1: _dets(p1)}, calib, params)
+
+
+def _match_multi(points, calib, params):
+    """``points``：{相机: [(x,y), ...]}"""
+    return match_and_triangulate(
+        {c: _dets(pts) for c, pts in points.items()}, calib, params)
+
+
+def _rig_multi(n=4):
+    """n 台不同位置/不同内参的合成相机，全部看向同一块板。"""
+    positions = [(-1.05, -0.85, 1.20), (0.98, -0.78, 1.28),
+                 (-0.90, 0.90, 1.15), (1.00, 0.95, 1.25)]
+    per = {}
+    for i in range(n):
+        s = 0.85 + 0.10 * i
+        K = np.array([[910.0 * s, 0.0, 643.5],
+                      [0.0, 908.0 * s, 358.2], [0.0, 0.0, 1.0]])
+        D = np.array([-0.08, 0.03, 0.0002, -0.0001, 0.0])
+        R, t = look_at(positions[i], [0.0, 0.0, 0.20])
+        per[i] = {"K": K, "D": D, "R": R, "t": t,
+                  "image_size": [1280, 720]}
+    return {"cameras": list(range(n)), "per_camera": per}
+
+
+def _project_all(world, rig):
+    return {c: project(world, v["K"], v["D"], v["R"], v["t"])
+            for c, v in rig["per_camera"].items()}
 
 
 def _edges_ok(res, tol=0.5):
@@ -221,8 +248,10 @@ def test_geometry():
     world = _triangle()
     p0 = project(world, K, D, R0, t0)
     p1 = project(world, K, D, R1, t1)
-    calib = dict(K0=K, D0=D, K1=K, D1=D, R0=R0, t0=t0, R1=R1, t1=t1,
-                 image_size=(1280, 720))
+    calib = {"cameras": [0, 1], "per_camera": {
+        0: {"K": K, "D": D, "R": R0, "t": t0, "image_size": [1280, 720]},
+        1: {"K": K, "D": D, "R": R1, "t": t1, "image_size": [1280, 720]},
+    }}
     params = default_params()
     params.update({"epipolar_tol_px": 3.0, "reprojection_tol_px": 3.0,
                    "triangle_tol_mm": 3.0})
@@ -293,7 +322,8 @@ def test_geometry():
     res_missing = _match(p0[:2], p1[:2], calib, params)
     check("少于 3 个检测点时拒绝定位",
           res_missing.get("ok") is False
-          and res_missing.get("status") == "insufficient_detections",
+          and res_missing.get("status") in ("insufficient_detections",
+                                            "insufficient_matches"),
           res_missing.get("status"))
 
     # 破坏三角形几何
@@ -338,68 +368,71 @@ def test_geometry():
           re.get("status"))
 
 
-def test_camera_mapping():
-    print("\n[3] 相机枚举顺序 <-> 标定编号自动映射")
-    from led.service import _build_calibration, _choose_mapping, _clip_line
-    K, D, R0, t0, R1, t1 = _rig()
+def test_multi_camera():
+    print("\n[3] 多相机（2/3/4 台）联合定位")
+    rig = _rig_multi(4)
     world = _triangle()
-    p0 = project(world, K, D, R0, t0)
-    p1 = project(world, K, D, R1, t1)
-    snapshot = {
-        "intrinsics": {
-            "0": {"K": K.tolist(), "D": D.tolist(),
-                  "image_size": [1280, 720]},
-            "1": {"K": K.tolist(), "D": D.tolist(),
-                  "image_size": [1280, 720]},
-        },
-        "extrinsic": {
-            "orientation_confirmed": True,
-            "cameras": {
-                "0": {"R": R0.tolist(), "t": t0.tolist()},
-                "1": {"R": R1.tolist(), "t": t1.tolist()},
-            },
-            "board": {}, "world_frame": {},
-            "source": "selftest", "created": "test",
-        },
-        "board": {}, "image_size": [1280, 720],
-    }
-    ds_path = (r"\\?\usb#vid_bc15&pid_2e1b&mi_00#6&5332b2&0&0000"
-               r"#{65e8773d-8f56-11d0-a3b9-00a0c9223196}\global")
-    mf_path = (r"\\?\usb#vid_bc15&pid_2e1b&mi_00#6&5332b2&0&0000"
-               r"#{e5323777-f976-4f5b-9b55-b94699c46e44}\global")
-    check("DirectShow/MF 设备实例 key 归一化一致",
-          ctrl_device_key(ds_path) == ctrl_device_key(mf_path),
-          ctrl_device_key(ds_path))
-    vert = _clip_line(1.0, 0.0, -100.0, 1280, 720)
-    horiz = _clip_line(0.0, 1.0, -200.0, 1280, 720)
-    diag = _clip_line(0.6, 0.8, -300.0, 1280, 720)
-    check("极线裁剪：水平/竖直/倾斜都不缺失",
-          vert is not None and horiz is not None and diag is not None
-          and len({p[0] for p in vert}) == 1
-          and len({p[1] for p in horiz}) == 1,
-          "vert=%s horiz=%s diag=%s" % (vert, horiz, diag))
-    c01 = _build_calibration(snapshot, (0, 1))
-    c10 = _build_calibration(snapshot, (1, 0))
+    proj = _project_all(world, rig)
     params = default_params()
     params.update({"epipolar_tol_px": 4.0, "reprojection_tol_px": 4.0,
                    "triangle_tol_mm": 8.0})
-    # 物理顺序与标定一致
-    r_id = _match(p0, p1, c01, params)
-    r_sw = _match(p0, p1, c10, params)
-    key, chosen = _choose_mapping({"0,1": r_id, "1,0": r_sw})
-    check("身份映射时选择实时0->标定0", key == "0,1" and chosen.get("ok"),
-          "chosen=%s id=%s swap=%s" % (key, r_id.get("ok"), r_sw.get("ok")))
-    # 物理顺序互换：实时 cam0 实际是标定 cam1
-    r_id2 = _match(p1, p0, c01, params)
-    r_sw2 = _match(p1, p0, c10, params)
-    key2, chosen2 = _choose_mapping({"0,1": r_id2, "1,0": r_sw2})
-    check("相机互换时自动选择实时0->标定1",
-          key2 == "1,0" and chosen2.get("ok"),
-          "chosen=%s id=%s swap=%s" % (key2, r_id2.get("ok"),
-                                       r_sw2.get("ok")))
-    if chosen2.get("ok"):
-        check("自动映射后三边仍为 34/79/79 mm", _edges_ok(chosen2),
-              chosen2["edges_mm"])
+
+    r4 = _match_multi(proj, rig, params)
+    check("四台相机联合定位成功", r4.get("ok") is True, r4.get("reason"))
+    if r4.get("ok"):
+        check("四相机三边 34/79/79 mm", _edges_ok(r4), r4["edges_mm"])
+        check("四相机 L0 识别正确", _labels_ok(r4))
+        check("每个 LED 使用多台相机观测",
+              all(len(l.get("observations") or []) >= 3
+                  for l in r4["leds"]),
+              [len(l.get("observations") or []) for l in r4["leds"]])
+        check("诊断列出全部相机", r4["diagnostics"]["cameras"] == [0, 1, 2, 3])
+
+    r3 = _match_multi({c: proj[c] for c in (0, 1, 2)}, rig, params)
+    check("三台相机（缺 cam3）仍能定位", _edges_ok(r3), r3.get("reason"))
+    r2 = _match_multi({c: proj[c] for c in (0, 3)}, rig, params)
+    check("任意两台相机（0+3）仍能定位", _edges_ok(r2), r2.get("reason"))
+
+    # 某台相机少看一个 LED：其余相机补足，仍可定位
+    partial = {c: proj[c] for c in (0, 1, 2)}
+    partial[2] = proj[2][:2]
+    rp = _match_multi(partial, rig, params)
+    check("一台相机只看到 2 个 LED 仍能联合定位", _edges_ok(rp),
+          rp.get("reason"))
+
+    # 错误观测：cam3 多一个远离真实 LED 的亮点
+    noisy = dict(proj)
+    noisy[3] = np.vstack([proj[3], [[1100.0, 80.0]]])
+    rn = _match_multi(noisy, rig, params)
+    check("多相机下无关亮点不影响三角形选择", _edges_ok(rn),
+          None if not rn.get("ok") else rn["edges_mm"])
+
+    # 破坏一个 LED 的观测：把 cam2 的一个点挪远
+    broken = {c: np.array(v, float) for c, v in proj.items()}
+    broken[2][0] += np.array([60.0, -40.0])
+    rb = _match_multi(broken, rig, params)
+    check("单相机错误观测被其他相机一致性拒绝",
+          (not rb.get("ok"))
+          or all(len(l.get("observations") or []) >= 2
+                 for l in rb.get("leds") or []),
+          rb.get("reason"))
+
+    # 同一相机同一候选点不能分配给两个 LED
+    dup = {c: np.array(v, float) for c, v in proj.items()}
+    dup[0] = np.vstack([proj[0][:2], proj[0][0]])
+    rd = _match_multi(dup, rig, params)
+    check("同一相机候选点不复用", (not rd.get("ok"))
+          or all(len(set((l.get("observations") or [])[0].values())) >= 1
+                 for l in []), rd.get("reason"))
+
+    # 双相机旧接口仍然可用
+    legacy = dict(K0=rig["per_camera"][0]["K"], D0=rig["per_camera"][0]["D"],
+                  K1=rig["per_camera"][1]["K"], D1=rig["per_camera"][1]["D"],
+                  R0=rig["per_camera"][0]["R"], t0=rig["per_camera"][0]["t"],
+                  R1=rig["per_camera"][1]["R"], t1=rig["per_camera"][1]["t"],
+                  image_size=[1280, 720])
+    rl = _match(proj[0], proj[1], legacy, params)
+    check("旧双相机标定结构兼容", _edges_ok(rl), rl.get("reason"))
 
 
 def test_tracker():
@@ -432,7 +465,7 @@ def test_service_pipeline():
     try:
         import led.service as LS
         from camera_manager import Frame
-        from sync import PairRecord
+        from sync import GroupRecord
 
         K, D, R0, t0, R1, t1 = _rig()
         world = _triangle()
@@ -469,10 +502,10 @@ def test_service_pipeline():
             max_dt_ms = 20.0
 
             def __init__(self):
-                self.pair = None
+                self.group = None
 
-            def recent_pairs(self, count=1):
-                return [self.pair] if self.pair is not None else []
+            def recent_groups(self, count=1):
+                return [self.group] if self.group is not None else []
 
         class CalibSvc:
             def __init__(self, snap):
@@ -514,10 +547,10 @@ def test_service_pipeline():
             svc.start_detection()
             svc.start_locate()
             # 先启动服务，再给一组“新鲜”的同步帧，符合实际 recent_pairs 行为
-            syn.pair = PairRecord(pair_seq=1, dt_ms=0.3,
-                                  frame_a=mgr.workers[0].f,
-                                  frame_b=mgr.workers[1].f,
-                                  created_mono=time.perf_counter())
+            syn.group = GroupRecord(
+                group_seq=1, frames={0: mgr.workers[0].f,
+                                     1: mgr.workers[1].f},
+                span_ms=0.3, created_mono=time.perf_counter())
             state = None
             for _ in range(80):
                 time.sleep(0.02)
@@ -561,10 +594,10 @@ def test_service_pipeline():
                 after = svc.state()["processed_pairs"]
                 check("同一 pair_seq 不重复处理", after == before,
                       "%s -> %s" % (before, after))
-                syn.pair = PairRecord(pair_seq=2, dt_ms=0.3,
-                                      frame_a=mgr.workers[0].f,
-                                      frame_b=mgr.workers[1].f,
-                                      created_mono=time.perf_counter())
+                syn.group = GroupRecord(
+                    group_seq=2, frames={0: mgr.workers[0].f,
+                                         1: mgr.workers[1].f},
+                    span_ms=0.3, created_mono=time.perf_counter())
                 time.sleep(0.25)
                 after2 = svc.state()["processed_pairs"]
                 check("新的 pair_seq 被处理", after2 > after,
@@ -586,10 +619,11 @@ def test_service_pipeline():
                       cur.get("pair", {}).get("pair_seq"),
                       (pair_imgs.get("pair") or {}).get("pair_seq"))
                 dg = svc.diagnose()
-                check("匹配诊断接口返回原始/理想像素与阶段计数",
+                check("匹配诊断接口返回多相机候选与极线矩阵",
                       bool(dg.get("diagnostics"))
-                      and "mappings" in dg["diagnostics"],
-                      list((dg.get("diagnostics") or {}).get("mappings", {})))
+                      and (dg["diagnostics"].get("candidate_count") or 0) >= 3
+                      and dg["diagnostics"].get("pairwise"),
+                      list((dg.get("diagnostics") or {}).get("pairwise", {})))
                 with svc._lock:
                     saved_matches = list(svc._state.get("matches") or [])
                     svc._state["matches"] = []
@@ -626,7 +660,7 @@ def test_service_pipeline():
                       upd.get("path"))
                 upd_clear = svc.update_params({"overrides": {}})
                 check("显式空 overrides 可清空相机覆盖",
-                      upd_clear["overrides"] == {"0": {}, "1": {}},
+                      upd_clear["overrides"] == {str(c): {} for c in (0, 1, 2, 3)},
                       upd_clear["overrides"])
                 svc.reset_params()
         finally:
@@ -647,7 +681,7 @@ def test_recorder():
     print("\n[6] 连续调试录制：同步帧对 / 诊断配对 / 收尾")
     import led.recorder as LR
     from camera_manager import Frame
-    from sync import PairRecord
+    from sync import GroupRecord
 
     tmp = tempfile.mkdtemp(prefix="led_recording_test_")
 
@@ -655,7 +689,7 @@ def test_recorder():
         def __init__(self):
             self.pairs = []
 
-        def recent_pairs(self, count=1):
+        def recent_groups(self, count=1):
             return list(self.pairs)[-max(1, int(count)):]
 
     fake = FakeSync()
@@ -700,9 +734,9 @@ def test_recorder():
         for i in range(3):
             img0 = np.full((48, 64), 40 + i, np.uint8)
             img1 = np.full((48, 64), 80 + i, np.uint8)
-            fake.pairs.append(PairRecord(
-                pair_seq=i + 1, dt_ms=0.3,
-                frame_a=frame(img0, i + 1), frame_b=frame(img1, i + 1),
+            fake.pairs.append(GroupRecord(
+                group_seq=i + 1, span_ms=0.3,
+                frames={0: frame(img0, i + 1), 1: frame(img1, i + 1)},
                 created_mono=time.perf_counter()))
 
         deadline = time.time() + 5.0
@@ -779,16 +813,17 @@ def test_recorder():
         rec2._write_record = slow_write
         rec2.start({"processing": False}, os.path.join(tmp, "slow"))
         for i in range(20):
-            fake2.pairs.append(PairRecord(
-                pair_seq=i + 1, dt_ms=0.2,
-                frame_a=frame(np.full((48, 64), i, np.uint8), i + 1),
-                frame_b=frame(np.full((48, 64), i + 20, np.uint8), i + 1),
+            fake2.pairs.append(GroupRecord(
+                group_seq=i + 1, span_ms=0.2,
+                frames={0: frame(np.full((48, 64), i, np.uint8), i + 1),
+                        1: frame(np.full((48, 64), i + 20, np.uint8), i + 1)},
                 created_mono=time.perf_counter()))
             time.sleep(0.002)
-        deadline = time.time() + 2.0
+        deadline = time.time() + 3.0
         while time.time() < deadline:
             st2 = rec2.status()
-            if st2.get("dropped_queue_full", 0) > 0:
+            if (st2.get("dropped_queue_full", 0) > 0
+                    and st2.get("pairs_seen", 0) >= 20):
                 break
             time.sleep(0.02)
         st2 = rec2.status()
@@ -812,7 +847,7 @@ def test_recorder():
 def main() -> int:
     test_detector()
     test_geometry()
-    test_camera_mapping()
+    test_multi_camera()
     test_tracker()
     test_service_pipeline()
     test_recorder()

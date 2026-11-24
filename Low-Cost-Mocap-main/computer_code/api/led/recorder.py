@@ -2,7 +2,7 @@
 
 只做两件事，尽量不碰现有定位链路：
 
-* **采集线程**轮询 ``sync_service().recent_pairs()``，把新同步帧对放进有界队列；
+* **采集线程**轮询 ``sync_service().recent_groups()``，把新同步帧组放进有界队列；
 * **写盘线程**保存两台相机的原始灰度 PNG，并在诊断数据可用后写
   ``frames.jsonl``。
 
@@ -18,6 +18,7 @@ import json
 import os
 import queue
 import threading
+from concurrent.futures import ThreadPoolExecutor
 import time
 from collections import OrderedDict, deque
 from datetime import datetime
@@ -47,8 +48,9 @@ _FRAME_STATE_KEYS = (
     "edges_mm", "edge_errors_mm", "expected_edges_mm", "board_direction",
     "label_rule", "label_assignment", "mean_reprojection_px",
     "mean_epipolar_px", "triangle_score", "orientation_consistent",
-    "triangle_tol_mm", "tracking", "calibration", "camera_map", "mapping",
+    "triangle_tol_mm", "tracking", "calibration",
     "diagnostics", "processing_ms", "processed_pairs",
+    "cameras_used", "stage_ms", "groups_seen", "groups_skipped",
 )
 
 
@@ -85,6 +87,7 @@ class LedRecorder:
         self._stop = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._writer_thread: threading.Thread | None = None
+        self._png_pool: ThreadPoolExecutor | None = None
         self._queue: queue.Queue | None = None
 
         self._status = "idle"
@@ -164,7 +167,7 @@ class LedRecorder:
                 "abs_path": self._abs_path,
                 "frames": "frames.jsonl",
                 "recording": {
-                    "source": "sync_service.recent_pairs",
+                    "source": "sync_service.recent_groups",
                     "queue_size": self._queue_size,
                     "png_compression": PNG_COMPRESSION,
                 },
@@ -204,11 +207,16 @@ class LedRecorder:
             self._next_index = 1
 
             try:
-                recent = sync_service().recent_pairs(1)
-                self._last_seq = int(recent[-1].pair_seq) if recent else 0
+                recent = sync_service().recent_groups(1)
+                self._last_seq = int(recent[-1].group_seq) if recent else 0
             except Exception:
                 self._last_seq = 0
 
+            # PNG 编码是 CPU 密集且 cv2 会释放 GIL：多相机同组并行编码
+            # 实测 4 线程 ≈ 3x 单线程，避免写盘线程成为录制瓶颈。
+            self._png_pool = ThreadPoolExecutor(
+                max_workers=max(1, min(4, int(self._session.get("camera_count", 4)))),
+                thread_name_prefix="led-png")
             self._capture_thread = threading.Thread(
                 target=self._capture_loop, name="led-record-capture",
                 daemon=True)
@@ -291,7 +299,7 @@ class LedRecorder:
 
     def note_result(self, pair_seq: int, state: dict,
                     diagnostics: dict | None = None) -> bool:
-        """登记 LED 服务已经处理完的同一 pair_seq 的状态快照。"""
+        """登记 LED 服务已经处理完的同一帧组序号的状态快照。"""
         with self._lock:
             if self._status != "recording" or self._finalized:
                 return False
@@ -328,7 +336,7 @@ class LedRecorder:
     def _capture_loop(self) -> None:
         while not self._stop.is_set():
             try:
-                recs = sync_service().recent_pairs(16)
+                recs = sync_service().recent_groups(16)
             except Exception:
                 time.sleep(0.05)
                 continue
@@ -339,12 +347,12 @@ class LedRecorder:
                 # 相机/同步服务重启后 pair_seq 从 1 重新计数。只有“最新的
                 # 一对”仍旧于已观察值时才重置，避免同一批里先看到旧帧就
                 # 把指针清零、随后重复录制整批历史帧。
-                if int(recs[-1].pair_seq) < self._last_seq:
+                if int(recs[-1].group_seq) < self._last_seq:
                     self._last_seq = 0
             advanced = False
             for rec in recs:
                 with self._lock:
-                    seq = int(rec.pair_seq)
+                    seq = int(rec.group_seq)
                     if seq <= self._last_seq:
                         continue
                     gap = max(0, seq - self._last_seq - 1)
@@ -399,24 +407,26 @@ class LedRecorder:
         with self._lock:
             index = self._next_index
             frames_dir = os.path.join(self._abs_path, "frames")
-            fname0 = "%06d_cam0.png" % index
-            fname1 = "%06d_cam1.png" % index
-            path0 = os.path.join(frames_dir, fname0)
-            path1 = os.path.join(frames_dir, fname1)
         params = [int(cv2.IMWRITE_PNG_COMPRESSION), PNG_COMPRESSION]
-        ok0 = cv2.imwrite(path0, rec.frame_a.gray, params)
-        ok1 = cv2.imwrite(path1, rec.frame_b.gray, params)
-        if not ok0 or not ok1:
-            for path in (path0, path1):
-                try:
-                    os.remove(path)
-                except OSError:
-                    pass
-            raise OSError("PNG 写盘失败（磁盘空间或目录权限）：%s" % frames_dir)
+        names, futures = {}, {}
+        pool = self._png_pool
+        for cam in rec.cameras:
+            name = "%06d_cam%d.png" % (index, cam)
+            path = os.path.join(frames_dir, name)
+            names[cam] = name
+            if pool is not None:
+                futures[cam] = pool.submit(cv2.imwrite, path,
+                                           rec.frames[cam].gray, params)
+            elif not cv2.imwrite(path, rec.frames[cam].gray, params):
+                raise OSError("PNG 写盘失败（磁盘空间或目录权限）：%s" % path)
+        for cam, fut in futures.items():
+            if not fut.result():
+                raise OSError("PNG 写盘失败（磁盘空间或目录权限）：%s"
+                              % os.path.join(frames_dir, names[cam]))
 
         meta = rec.meta()
         try:
-            host_ts = max(float(rec.frame_a.host_ts), float(rec.frame_b.host_ts))
+            host_ts = max(float(f.host_ts) for f in rec.frames.values())
             captured = datetime.fromtimestamp(host_ts).isoformat(
                 timespec="milliseconds")
         except (TypeError, ValueError, OSError):
@@ -424,16 +434,17 @@ class LedRecorder:
         record = {
             "schema": FRAME_SCHEMA,
             "index": index,
-            "images": {
-                "0": "frames/" + fname0,
-                "1": "frames/" + fname1,
-            },
+            "cameras": rec.cameras,
+            "images": {str(c): "frames/" + names[c] for c in rec.cameras},
+            "image_sizes": {str(c): [int(rec.frames[c].gray.shape[1]),
+                                     int(rec.frames[c].gray.shape[0])]
+                            for c in rec.cameras},
             "pair": meta,
             "captured": captured,
             "recorded_at": _now_iso(),
             "led_processed": False,
             "led_status": "not_processed",
-            "led_reason": "该同步帧对未经过 LED 定位处理",
+            "led_reason": "该同步帧组未经过 LED 定位处理",
             "led": None,
         }
         with self._lock:
@@ -447,7 +458,8 @@ class LedRecorder:
         with self._lock:
             while self._records:
                 record = self._records[0]
-                seq = int((record.get("pair") or {}).get("pair_seq", 0))
+                seq = int((record.get("pair") or {}).get("group_seq")
+                          or (record.get("pair") or {}).get("pair_seq") or 0)
                 diag = self._diagnostics.get(seq)
                 if diag is not None:
                     record["led_processed"] = True
@@ -471,7 +483,7 @@ class LedRecorder:
                     record["led_processed"] = False
                     record["led_status"] = "not_processed"
                     record["led_reason"] = \
-                        "该同步帧对未经过 LED 定位处理"
+                        "该同步帧组未经过 LED 定位处理"
                     record["led"] = None
                     self._saved_not_processed += 1
                 self._records.popleft()
@@ -543,6 +555,10 @@ class LedRecorder:
                     fh.close()
                 except OSError:
                     pass
+        pool = self._png_pool
+        self._png_pool = None
+        if pool is not None:
+            pool.shutdown(wait=True)
         try:
             atomic_json_write(session_path, session)
         except BaseException as exc:
