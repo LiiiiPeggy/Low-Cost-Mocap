@@ -1411,6 +1411,15 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     check("相机模型与视锥体绘制缩小 50%",
           "const d = 0.14" in html and "0.0175" in html
           and "const d = 0.28" not in html)
+    check("外参采集按钮改为多相机措辞",
+          "采集相机图片" in html and "采集双相机图片" not in html)
+    check("内参与外参计数按相机动态生成",
+          'data-cap="${cam}"' in html and "c-nx-line" in html
+          and "外参帧数 " in html)
+    check("相机2/3 的 180° 复选框插在已确认之前",
+          "confirmedRow.parentNode.insertBefore(node, confirmedRow)" in html)
+    check("标定实时图为相机2/3 克隆相机1 的 figure",
+          "figs[1]" in html and "c-img1" in html)
 
 
 def _selftest_dir() -> str:

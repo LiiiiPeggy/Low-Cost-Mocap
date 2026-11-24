@@ -290,9 +290,9 @@
     <div class="row" style="border-top:1px dashed var(--line); margin-top:4px; padding-top:8px">
       <b>世界坐标系外参</b>
       <span class="hintline">固定板 · solvePnP</span>
-      <button id="c-ex-pair" class="primary">采集双相机图片</button>
+      <button id="c-ex-pair" class="primary">采集相机图片</button>
       <span id="c-exmsg" class="badge">—</span>
-      <span>外参帧数 相机0 <b id="c-nx0">0</b> / 相机1 <b id="c-nx1">0</b></span>
+      <span id="c-nx-line">外参帧数 —</span>
       <button id="c-solex" class="primary">解外参 solvePnP</button>
       <button id="c-ex-load" class="primary">载入世界坐标系外参</button>
       <span class="sep"></span>
@@ -311,7 +311,7 @@
       <label><input type="checkbox" id="c-flip0"> 相机0 反向 180°</label>
       <label><input type="checkbox" id="c-flip1"> 相机1 反向 180°</label>
       <label><input type="checkbox" id="c-confirmed"> 已确认世界坐标轴方向</label>
-      <span class="hintline">两台相机的 X 轴都须沿 12 格长边；只在两路检测顺序真的差 180° 时才单翻一台</span>
+      <span class="hintline">各台相机的 X 轴都须沿 12 格长边；只在某路检测顺序真的差 180° 时才单翻那台</span>
     </div>
     <div id="c-ex-out" class="result-grid"><div class="val-card">等待后端连接…</div></div>
     <div class="live">
@@ -524,7 +524,7 @@
                   <option value="9">9×9</option>
                 </select>
               </td>
-              <td colspan="2" class="param-note">两台相机共用</td>
+              <td class="param-note">各相机共用</td>
             </tr>
             <tr>
               <td>极线距离阈值 px</td>
@@ -596,15 +596,37 @@ function expandUiForCameras() {
       ctrlHost.appendChild(node);
     });
   }
-  // 世界轴方向：为相机2/3 克隆独立的“反向 180°”复选框
+  // 内参采集：为相机2/3 克隆“有效计数 + 采集按钮”
+  const cap1 = document.querySelector('#calib [data-cap="1"]');
+  if (cap1) {
+    const tplSpan = cap1.previousElementSibling;   // 始终克隆相机1 的计数
+    let anchor = cap1;
+    [2, 3].forEach(cam => {
+      if (document.querySelector(`#calib [data-cap="${cam}"]`)) return;
+      const span = tplSpan.cloneNode(true);
+      span.querySelectorAll('[id]').forEach(x => {
+        x.id = x.id.replace(/1$/, String(cam));
+        x.textContent = '0';
+      });
+      span.innerHTML = span.innerHTML.replace('相机1', '相机' + cam);
+      const btn = cap1.cloneNode(true);
+      btn.dataset.cap = String(cam);
+      btn.textContent = '采集相机 ' + cam;
+      anchor.parentNode.insertBefore(span, anchor.nextSibling);
+      anchor.parentNode.insertBefore(btn, span.nextSibling);
+      anchor = btn;
+    });
+  }
+  // 世界轴方向：相机2/3 的复选框放在相机0/1 之后、“已确认”之前
   const flipRow = el('c-flip1') ? el('c-flip1').closest('label') : null;
-  if (flipRow) {
+  const confirmedRow = el('c-confirmed') ? el('c-confirmed').closest('label') : null;
+  if (flipRow && confirmedRow) {
     [2, 3].forEach(cam => {
       if (el('c-flip' + cam)) return;
       const node = document.createElement('label');
       node.innerHTML = `<input type="checkbox" id="c-flip${cam}"> `
         + `相机${cam} 反向 180°`;
-      flipRow.parentNode.appendChild(node);
+      confirmedRow.parentNode.insertBefore(node, confirmedRow);
     });
   }
   // 标定实时图：必须克隆 **相机1** 的 figure（id 以 1 结尾），
@@ -1469,11 +1491,11 @@ el('c-intr-load').onclick = async () => {
   } finally { el('c-intr-load').disabled = false; }
 };
 
-// ---- 世界系外参（固定板 + solvePnP）：一次采两台相机的同一对同步帧 ----
+// ---- 世界系外参（固定板 + solvePnP）：一次采当前同步帧组里的全部相机 ----
 el('c-ex-pair').onclick = async () => {
   el('c-ex-pair').disabled = true;
   cBadge('c-exmsg', '正在采集同步帧…');
-  cLog('采集双相机图片：正在取同步帧对并检测两台相机的棋盘格…');
+  cLog('采集相机图片：正在取同步帧组并检测各组内相机的棋盘格…');
   try {
     const r = await api('/api/calib/capture/extrinsic-pair', {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}'
@@ -1491,10 +1513,10 @@ el('c-ex-pair').onclick = async () => {
       }
     });
     if (r.ok && warned) {
-      cBadge('c-exmsg', '两台均有效（覆盖率偏低，已告警）', 'warn',
+      cBadge('c-exmsg', '相机均有效（覆盖率偏低，已告警）', 'warn',
              Object.values(r.cameras || {}).map(c => c.warning).filter(Boolean).join('；'));
     } else if (r.ok) {
-      cBadge('c-exmsg', '两台相机均有效', 'ok');
+      cBadge('c-exmsg', '组内相机均有效', 'ok');
     } else {
       const why = Object.entries(r.cameras || {})
         .filter(([, c]) => !c.ok)
@@ -1510,8 +1532,8 @@ el('c-ex-pair').onclick = async () => {
     refreshCalib();
   } catch (e) {
     cBadge('c-exmsg', '采集失败：' + e.message, 'err');
-    cLog('采集双相机图片失败：' + e.message);
-    cLog('  提示：确认已打开会话、两台相机在 streaming，且顶部「配对率」不是 0');
+    cLog('采集相机图片失败：' + e.message);
+    cLog('  提示：确认已打开会话、相机在 streaming，且顶部「分组率」不是 0');
     console.error('extrinsic pair capture error', e);
   } finally { el('c-ex-pair').disabled = false; }
 };
@@ -2806,7 +2828,7 @@ function drawScene3D(st) {
     ctx.font = '12px "Microsoft YaHei", sans-serif';
     ctx.fillStyle = '#fbbf24';
     ctx.fillText(board.hasSession
-      ? '尚未求得外参：先「采集双相机图片」，再「解外参 solvePnP」'
+      ? '尚未求得外参：先「采集相机图片」，再「解外参 solvePnP」'
       : '尚未打开标定会话：当前显示默认 360×270 mm 棋盘格占位',
       12, 22);
   }
@@ -2879,10 +2901,10 @@ async function refreshCalib() {
     if (!s) {
       tag.textContent = '未打开会话';
       tag.className = 'badge';
-      el('c-n0').textContent = '0';
-      el('c-n1').textContent = '0';
-      el('c-nx0').textContent = '0';
-      el('c-nx1').textContent = '0';
+      CAMERAS.forEach(cam => {
+        if (el('c-n' + cam)) el('c-n' + cam).textContent = '0';
+      });
+      if (el('c-nx-line')) el('c-nx-line').textContent = '外参帧数 —';
       el('c-np').textContent = '0';
     } else {
       tag.textContent = `${s.board.cols}×${s.board.rows} @ ${s.board.square_mm}mm · `
@@ -2891,10 +2913,14 @@ async function refreshCalib() {
       // 各阶段独立计数：内参 / 外参 / 验证，互不混算
       const intr = byp.intrinsic || {};
       const extr = byp.extrinsic || {};
-      el('c-n0').textContent = (intr['0'] || 0);
-      el('c-n1').textContent = (intr['1'] || 0);
-      el('c-nx0').textContent = (extr['0'] || 0);
-      el('c-nx1').textContent = (extr['1'] || 0);
+      CAMERAS.forEach(cam => {
+        const box = el('c-n' + cam);
+        if (box) box.textContent = (intr[String(cam)] || 0);
+      });
+      if (el('c-nx-line')) {
+        el('c-nx-line').textContent = '外参帧数 '
+          + CAMERAS.map(cam => `相机${cam} ${extr[String(cam)] || 0}`).join(' / ');
+      }
       el('c-np').textContent = (byp.validation_pairs || 0);
     }
     const i0 = st.intrinsics && st.intrinsics['0'];
