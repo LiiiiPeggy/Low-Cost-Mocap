@@ -62,6 +62,37 @@ def triangulate(pts0, pts1, K0, D0, K1, D1, R, T) -> np.ndarray:
     return (X[:3] / w).T
 
 
+def triangulate_dlt(points: list, projections: list) -> np.ndarray:
+    """多视角 DLT 三角化（2..N 个视角）。
+
+    ``points``：每台相机一个**已去畸变**的归一化坐标 (2,)；
+    ``projections``：对应的 3×4 投影矩阵 ``[R|t]``（世界 → 相机）。
+    返回世界系 3D 点。
+    """
+    rows = []
+    for p, P in zip(points, projections):
+        P = np.asarray(P, np.float64)
+        x, y = float(p[0]), float(p[1])
+        rows.append(x * P[2] - P[0])
+        rows.append(y * P[2] - P[1])
+    A = np.asarray(rows, np.float64)
+    _, _, vt = np.linalg.svd(A)
+    X = vt[-1]
+    if abs(X[3]) < 1e-12:
+        return None
+    return X[:3] / X[3]
+
+
+def project_world(Xw, K, D, R, t) -> np.ndarray:
+    """世界点 → 像素（含畸变）。X_cam = R @ X_world + t。"""
+    rvec = cv2.Rodrigues(np.asarray(R, np.float64))[0]
+    proj, _ = cv2.projectPoints(
+        np.asarray(Xw, np.float64).reshape(-1, 1, 3), rvec,
+        np.asarray(t, np.float64).reshape(3, 1),
+        np.asarray(K, np.float64), np.asarray(D, np.float64).reshape(-1))
+    return proj.reshape(-1, 2)
+
+
 def epipolar_errors(pts0, pts1, F) -> np.ndarray:
     """点到极线的距离（像素），两个方向取平均。"""
     p0 = np.hstack([np.asarray(pts0, np.float64).reshape(-1, 2), np.ones((len(pts0), 1))])

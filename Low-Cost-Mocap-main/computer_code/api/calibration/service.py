@@ -105,6 +105,32 @@ INTRINSICS_SCHEMA = "lowcost-mocap/intrinsics"
 EXTRINSICS_SCHEMA = "lowcost-mocap/world-extrinsics"
 
 
+def _device_binding_ok(camera: int, entry: dict | None) -> tuple[bool, str]:
+    """标定条目与当前相机绑定是否一致（旧文件无设备信息时要求人工确认）。"""
+    try:
+        import camera_config
+        return camera_config.calibration_check(int(camera), entry or {})
+    except Exception:
+        return True, ""
+
+
+def _device_key(camera: int) -> str | None:
+    """该逻辑相机当前绑定的设备实例 key（优先运行中的 worker）。"""
+    try:
+        from camera_manager import manager
+        w = manager().worker(int(camera))
+        if w is not None and w.device_key:
+            return w.device_key
+    except Exception:
+        pass
+    try:
+        import camera_config
+        item = camera_config.entry(int(camera))
+        return item["device_key"] if item else None
+    except Exception:
+        return None
+
+
 def _now_iso() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
@@ -163,6 +189,7 @@ def _intrinsic_entry(camera: int, res: dict, *, device=None,
         "index": int(camera),
         "camera": int(camera),
         "device": device,
+        "device_key": res.get("device_key"),
         "K": res.get("K"),
         "D": res.get("D"),
         "rms_px": res.get("rms_px"),
@@ -325,7 +352,7 @@ class CalibrationService:
                          surface_height_m=surface_height_m)
         cams = [int(c) for c in (cameras or [0, 1])]
 
-        size = self._probe_image_size(cams)
+        size = self._probe_image_sizes(cams)
         sid = session_id or datetime.now().strftime("%Y%m%d_%H%M%S")
         path = resolve_path(root) if root else os.path.join(DEFAULT_SESSION_ROOT, sid)
 
@@ -441,18 +468,25 @@ class CalibrationService:
             self._reset_results()
         return {"session": None}
 
-    def _probe_image_size(self, cameras) -> tuple[int, int]:
-        """从未停流的相机上读一帧，确定图像尺寸；读不到就用请求参数兜底。"""
+    def _probe_image_sizes(self, cameras) -> dict[int, tuple[int, int]]:
+        """每台相机各自读一帧确定图像尺寸；读不到就用请求参数兜底。
+
+        不同相机可以有不同分辨率，不能再用一个共用尺寸。
+        """
+        out = {}
         for c in cameras:
+            c = int(c)
             w = manager().worker(c)
-            if w is None:
-                continue
-            f = w.latest()
-            if f is not None:
-                return int(f.gray.shape[1]), int(f.gray.shape[0])
-            if w.requested:
-                return int(w.requested["width"]), int(w.requested["height"])
-        return (1280, 720)
+            size = (1280, 720)
+            if w is not None:
+                f = w.latest()
+                if f is not None:
+                    size = (int(f.gray.shape[1]), int(f.gray.shape[0]))
+                elif w.requested:
+                    size = (int(w.requested["width"]),
+                            int(w.requested["height"]))
+            out[c] = size
+        return out
 
     # ------------------------------------------------------------------
     # 采集
@@ -506,12 +540,13 @@ class CalibrationService:
 
     @staticmethod
     def _last_pair_key(sess: Session, phase: str):
-        """最近一条同步帧对的 (seq_a, seq_b)，用于判断是否真的换了新帧对。"""
+        """最近一条同步帧组各相机的 seq 元组，用于判断是否真的换了新帧组。"""
         for s in reversed(sess.samples):
             if s.kind != "stereo" or s.phase != phase:
                 continue
             try:
-                return int(s.images["0"]["seq"]), int(s.images["1"]["seq"])
+                return tuple(int(s.images[k]["seq"])
+                             for k in sorted(s.images, key=int))
             except (KeyError, TypeError, ValueError):
                 return None
         return None
@@ -573,98 +608,116 @@ class CalibrationService:
                     last = int(v) if last is None else max(last, int(v))
         return last
 
-    def _acquire_sync_pair(self, sess: Session, *, last_key=None,
-                           last_pair_seq: int | None = None,
-                           force: bool = False, timeout: float = 1.5):
-        """从运行中的同步服务取一对**新**帧；重复帧对会被拒绝。"""
+    def _acquire_sync_group(self, sess: Session, *, last_key=None,
+                            last_pair_seq: int | None = None,
+                            force: bool = False, timeout: float = 1.5):
+        """从运行中的同步服务取一组**新**同步帧；重复帧组会被拒绝。"""
         svc = sync_service()
-        cams = sess.cameras
-        ca, cb = int(cams[0]), int(cams[1])
         deadline = time.perf_counter() + timeout
         while True:
-            recents = svc.recent_pairs(1)
+            recents = svc.recent_groups(1)
             if not recents:
-                raise RuntimeError("还没有配对成功的帧对：确认两台相机都在 streaming，"
-                                   "且 /api/sync/status 的 pairs_total 在增长")
+                raise RuntimeError("还没有同步帧组：确认相机都在 streaming，"
+                                   "且 /api/sync/status 的 groups_total 在增长")
             rec = recents[0]
-            same = ((last_key is not None
-                     and last_key == (rec.frame_a.seq, rec.frame_b.seq))
-                    or (last_pair_seq is not None and last_pair_seq == rec.pair_seq))
+            key = tuple(rec.frames[c].seq for c in rec.cameras)
+            same = ((last_key is not None and tuple(last_key) == key)
+                    or (last_pair_seq is not None
+                        and last_pair_seq == rec.group_seq))
             if force or not same:
                 break
             if time.perf_counter() > deadline:
                 raise RuntimeError(
-                    "最近一对同步帧（seq=%d/%d）已经采过，%.1f s 内没有新帧对，"
-                    "请稍后再按" % (rec.frame_a.seq, rec.frame_b.seq, timeout))
+                    "最近一组同步帧（seq=%s）已经采过，%.1f s 内没有新帧组，"
+                    "请稍后再按" % (key, timeout))
             time.sleep(0.05)
 
         age = time.perf_counter() - rec.created_mono
         if age > MAX_PAIR_AGE_S:
-            raise RuntimeError("最近一对同步帧已过期 %.0f ms，请重新触发（相机是否停流？）"
+            raise RuntimeError("最近一组同步帧已过期 %.0f ms，请重新触发（相机是否停流？）"
                                % (age * 1000))
-        if abs(rec.dt_ms) > svc.max_dt_ms + 1e-6:
-            raise RuntimeError("帧对时间差 |Δt|=%.1f ms 超过阈值 %.0f ms"
-                               % (abs(rec.dt_ms), svc.max_dt_ms))
+        if rec.span_ms > svc.max_dt_ms + 1e-6:
+            raise RuntimeError("帧组时间跨度 %.1f ms 超过阈值 %.0f ms"
+                               % (rec.span_ms, svc.max_dt_ms))
 
-        fa, fb = rec.frame_a, rec.frame_b
-        for cam, frame in ((ca, fa), (cb, fb)):
-            if (frame.gray.shape[1], frame.gray.shape[0]) != tuple(sess.image_size):
-                raise RuntimeError("相机 %d 当前分辨率与会话登记的不一致（%s vs %s）"
-                                   % (cam, frame.gray.shape[:2][::-1],
-                                      tuple(sess.image_size)))
+        for cam in rec.cameras:
+            frame = rec.frames[cam]
+            want = sess.image_size_for(cam)
+            if (frame.gray.shape[1], frame.gray.shape[0]) != want:
+                raise RuntimeError(
+                    "相机 %d 当前分辨率与会话登记的不一致（%s vs %s）"
+                    % (cam, frame.gray.shape[:2][::-1], want))
         return rec, age
 
-    def capture_stereo(self, *, force: bool = False, phase: str = "validation") -> dict:
-        """采一对同步帧。默认写入 validation 阶段；外参用 capture_extrinsic_pair。"""
+    # 兼容旧名
+    def _acquire_sync_pair(self, sess, **kw):
+        return self._acquire_sync_group(sess, **kw)
+
+    def capture_group(self, *, force: bool = False,
+                      phase: str = "validation") -> dict:
+        """采集一组多相机同步帧。默认写 validation；外参用 capture_extrinsic_group。
+
+        组里实际有几台相机就采几台；某台相机本组缺席时按“缺失”记录，不会
+        用其它相机的图像补位。
+        """
         sess = self._require_session()
         spec = sess.spec
-        cams = sess.cameras
+        cams = [int(c) for c in sess.cameras]
         if len(cams) < 2:
-            raise RuntimeError("会话只登记了 %d 台相机，无法做双相机采集" % len(cams))
-        ca, cb = int(cams[0]), int(cams[1])
+            raise RuntimeError("会话只登记了 %d 台相机，无法做多相机采集" % len(cams))
 
-        rec, age = self._acquire_sync_pair(
+        rec, age = self._acquire_sync_group(
             sess, last_key=self._last_pair_key(sess, phase), force=force)
-        fa, fb = rec.frame_a, rec.frame_b
+        present = [c for c in cams if c in rec.frames]
+        if len(present) < 2:
+            raise RuntimeError("本次同步帧组只有 %d 台相机（%s），至少需要 2 台"
+                               % (len(present), present))
 
-        deta, detb, info = board_mod.detect_pair(fa.gray, fb.gray, spec)
-        overlay = {str(ca): board_mod.draw_overlay(fa.gray, deta, spec, label_step=3),
-                   str(cb): board_mod.draw_overlay(fb.gray, detb, spec, label_step=3)}
+        dets, grays, overlay = {}, {}, {}
+        for cam in present:
+            frame = rec.frames[cam]
+            det = board_mod.detect(frame.gray, spec)
+            dets[cam] = det
+            grays[cam] = frame.gray
+            overlay[str(cam)] = board_mod.draw_overlay(
+                frame.gray, det, spec, label_step=3)
 
+        ok_cams = [c for c in present if dets[c].ok]
         status, reason, warning = "valid", "", ""
         signature = {}
-        if not (deta.ok and detb.ok):
+        if len(ok_cams) < 2:
             status = "invalid"
-            reason = "双相机未能同时检测到完整棋盘格：%s / %s" % (
-                deta.reason or "OK", detb.reason or "OK")
-        elif not info.get("ordering_consistent", True):
-            status, reason = "invalid", "两视角角点手性相反，拒绝入库（请检查是否拍到了板子背面）"
+            reason = "同步帧组里检测到完整棋盘格的相机不足 2 台：%s" % (
+                "，".join("相机%d %s" % (c, dets[c].reason or "OK")
+                         for c in present))
         else:
-            signature = board_mod.pose_signature(deta, spec)
-            dup = board_mod.is_duplicate(signature, sess.signatures(ca, kind="stereo"))
-            qa, qb = deta.quality, detb.quality
-            min_cov = min(qa["coverage"], qb["coverage"])
-            if min(qa["sharpness"], qb["sharpness"]) < MIN_SHARPNESS:
+            signature = board_mod.pose_signature(dets[ok_cams[0]], spec)
+            dup = board_mod.is_duplicate(signature,
+                                         sess.signatures(ok_cams[0], kind="stereo"))
+            min_cov = min(dets[c].quality["coverage"] for c in ok_cams)
+            min_sharp = min(dets[c].quality["sharpness"] for c in ok_cams)
+            if min_sharp < MIN_SHARPNESS:
                 status, reason = "invalid", "至少一路图像偏模糊"
             elif min_cov < MIN_COVERAGE_EXTRINSIC:
-                status, reason = "invalid", ("至少一路标定板太小（最低 %.1f%%，"
-                                             "外参/验证最低 %.1f%%）"
-                                             % (100 * min_cov,
-                                                100 * MIN_COVERAGE_EXTRINSIC))
+                status, reason = "invalid", (
+                    "至少一路标定板太小（最低 %.1f%%，外参/验证最低 %.1f%%）"
+                    % (100 * min_cov, 100 * MIN_COVERAGE_EXTRINSIC))
             elif dup and not force:
-                status, reason = "invalid", ("与已有帧对 %s 姿态几乎相同，换一个角度再采"
-                                             % dup["sample"])
+                status, reason = "invalid", (
+                    "与已有帧组 %s 姿态几乎相同，换一个角度再采" % dup["sample"])
             elif min_cov < MIN_COVERAGE:
                 warning = low_coverage_warning(min_cov)
 
-        pair_meta = {
-            str(ca): self._side_meta(fa, ca),
-            str(cb): self._side_meta(fb, cb),
-        }
-        sample = sess.add_stereo(
-            pair_meta, {ca: fa.gray, cb: fb.gray}, {ca: deta, cb: detb},
-            dt_ms=rec.dt_ms, overlay=overlay, status=status, reason=reason,
-            signature=signature, phase=phase, note=warning)
+        group_meta = {str(c): self._side_meta(rec.frames[c], c) for c in present}
+        for c in present:
+            group_meta[str(c)]["pair_seq"] = int(rec.group_seq)
+            group_meta[str(c)]["group_seq"] = int(rec.group_seq)
+            group_meta[str(c)]["dt_ms"] = round(float(rec.span_ms), 3)
+            group_meta[str(c)]["span_ms"] = round(float(rec.span_ms), 3)
+        sample = sess.add_group(
+            group_meta, grays, dets, dt_ms=rec.span_ms, overlay=overlay,
+            status=status, reason=reason, signature=signature, phase=phase,
+            note=warning)
         self._invalidate(phase)
 
         return {
@@ -673,16 +726,24 @@ class CalibrationService:
             "status": status,
             "reason": reason,
             "warning": warning,
-            "dt_ms": round(rec.dt_ms, 3),
-            "pair_seq": rec.pair_seq,
-            "detections": {str(ca): deta.to_dict(), str(cb): detb.to_dict()},
-            "ordering": info,
+            "dt_ms": round(rec.span_ms, 3),
+            "span_ms": round(rec.span_ms, 3),
+            "pair_seq": rec.group_seq,
+            "group_seq": rec.group_seq,
+            "cameras": present,
+            "detections": {str(c): dets[c].to_dict() for c in present},
             "frame_age_ms": round(age * 1000.0, 1),
             "stats": sess.stats(),
-            "message": ("已采集帧对 %s（Δt=%.1f ms）" % (sample.id, rec.dt_ms)
-                        if status == "valid" else "未计入有效帧对：%s" % reason),
-            "caveat": "帧对来自软件级时间戳配对，非硬件曝光同步；仅适用于静止标定板",
+            "message": ("已采集帧组 %s（%d 台相机，跨度 %.1f ms）"
+                        % (sample.id, len(present), rec.span_ms)
+                        if status == "valid" else "未计入有效帧组：%s" % reason),
+            "caveat": "帧组来自软件级时间戳分组，非硬件曝光同步；仅适用于静止标定板",
         }
+
+    # 兼容旧名
+    def capture_stereo(self, *, force: bool = False,
+                       phase: str = "validation") -> dict:
+        return self.capture_group(force=force, phase=phase)
 
     # ------------------------------------------------------------------
     # 世界系外参：固定棋盘格 + solvePnP
@@ -691,35 +752,36 @@ class CalibrationService:
         """外参阶段单相机采集（CLI/旧接口保留；网页已改为双相机同帧采集）。"""
         return self.capture_single(camera, force=True, phase="extrinsic")
 
-    def capture_extrinsic_pair(self, *, force: bool = False) -> dict:
-        """一次采集两台相机的**同一对同步帧**，分别存进各自的 extrinsic 阶段。
+    def capture_extrinsic_group(self, *, force: bool = False) -> dict:
+        """一次采集一组多相机同步帧，分别存进各相机的 extrinsic 阶段。
 
-        两台相机的检测质量、有效状态分别判断；一张有效图就足够 ``solvePnP``。
-        复用 ``SyncService``，不会重新打开相机；同一帧对被拒绝重复采集。
+        每台相机的检测质量、有效状态独立判断；一张有效图就足够 ``solvePnP``。
+        复用 ``SyncService``，不会重新打开相机；同一帧组被拒绝重复采集。
         """
         sess = self._require_session()
         spec = sess.spec
-        cams = sess.cameras
+        cams = [int(c) for c in sess.cameras]
         if len(cams) < 2:
-            raise RuntimeError("会话只登记了 %d 台相机，无法同时采集两台" % len(cams))
-        ca, cb = int(cams[0]), int(cams[1])
+            raise RuntimeError("会话只登记了 %d 台相机，无法同时采集" % len(cams))
 
-        rec, age = self._acquire_sync_pair(
+        rec, age = self._acquire_sync_group(
             sess, last_pair_seq=self._last_single_pair_seq(sess, "extrinsic"),
             force=force)
-        frames = {ca: rec.frame_a, cb: rec.frame_b}
+        present = [c for c in cams if c in rec.frames]
         results = {}
 
-        for cam in (ca, cb):
-            frame = frames[cam]
+        for cam in present:
+            frame = rec.frames[cam]
             det = board_mod.detect(frame.gray, spec)
             overlay = board_mod.draw_overlay(frame.gray, det, spec, label_step=3)
             status, reason, warning = self._classify_detection(
                 det, "extrinsic", coverage_label="外参")
 
             meta = self._side_meta(frame, cam)
-            meta["pair_seq"] = int(rec.pair_seq)
-            meta["dt_ms"] = round(float(rec.dt_ms), 3)
+            meta["pair_seq"] = int(rec.group_seq)
+            meta["group_seq"] = int(rec.group_seq)
+            meta["dt_ms"] = round(float(rec.span_ms), 3)
+            meta["span_ms"] = round(float(rec.span_ms), 3)
             sample = sess.add_single(
                 cam, frame.gray, det, meta, overlay=overlay,
                 status=status, reason=reason, note=warning,
@@ -742,52 +804,64 @@ class CalibrationService:
                            for k, v in results.items())
         return {
             "ok": ok,
-            "message": "已采集双相机图片（%s，Δt=%.1f ms）" % (summary, rec.dt_ms),
-            "pair_seq": rec.pair_seq,
-            "dt_ms": round(rec.dt_ms, 3),
+            "message": "已采集多相机图片（%s，跨度 %.1f ms）"
+                       % (summary, rec.span_ms),
+            "pair_seq": rec.group_seq,
+            "group_seq": rec.group_seq,
+            "dt_ms": round(rec.span_ms, 3),
+            "span_ms": round(rec.span_ms, 3),
             "frame_age_ms": round(age * 1000.0, 1),
             "cameras": results,
             "stats": sess.stats(),
-            "caveat": "帧对来自软件级时间戳配对，非硬件曝光同步；仅适用于静止标定板",
+            "caveat": "帧组来自软件级时间戳分组，非硬件曝光同步；仅适用于静止标定板",
         }
+
+    # 兼容旧名
+    def capture_extrinsic_pair(self, *, force: bool = False) -> dict:
+        return self.capture_extrinsic_group(force=force)
 
     def solve_extrinsic(self, *, flip180: bool = False, flip_cam=None,
                         orientation_confirmed: bool = False, exclude=()) -> dict:
         sess = self._require_session()
-        cams = sess.cameras
+        cams = [int(c) for c in sess.cameras]
         if len(cams) < 2:
             raise ValueError("会话只登记了 %d 台相机" % len(cams))
-        ca, cb = str(int(cams[0])), str(int(cams[1]))
-        missing = [c for c in (ca, cb) if c not in self._intrinsics]
+        missing = [str(c) for c in cams if str(c) not in self._intrinsics]
         if missing:
-            raise ValueError("相机 %s 还没有内参结果，请先执行内参标定" % ", ".join(missing))
+            raise ValueError("相机 %s 还没有内参结果，请先执行内参标定"
+                             % ", ".join(missing))
 
-        frames, ids, low_cov = {}, {}, []
-        for cam in (int(cams[0]), int(cams[1])):
+        frames, ids, low_cov, used = {}, {}, [], []
+        for cam in cams:
             samples = sess.single_samples(cam, phase="extrinsic", exclude=exclude)
             if len(samples) < ext_mod.MIN_FRAMES:
                 raise ValueError(
                     "相机 %d 的外参图像只有 %d 张，至少需要 %d 张（建议 %d 张）"
-                    % (cam, len(samples), ext_mod.MIN_FRAMES, ext_mod.RECOMMENDED_FRAMES))
+                    % (cam, len(samples), ext_mod.MIN_FRAMES,
+                       ext_mod.RECOMMENDED_FRAMES))
             frames[cam] = [s.corners(cam) for s in samples]
             ids[cam] = [s.id for s in samples]
+            used.append(cam)
             low_cov += [s.id for s in samples if s.note]
-        rig = ext_mod.solve_rig(frames, sess.spec,
-                                intr_mod.K_from(self._intrinsics[ca]),
-                                intr_mod.D_from(self._intrinsics[ca]),
-                                intr_mod.K_from(self._intrinsics[cb]),
-                                intr_mod.D_from(self._intrinsics[cb]),
-                                flip180=flip180, flip_cam=flip_cam,
-                                orientation_confirmed=orientation_confirmed)
+        rig = ext_mod.solve_rig_multi(
+            frames, sess.spec,
+            {c: (intr_mod.K_from(self._intrinsics[str(c)]),
+                 intr_mod.D_from(self._intrinsics[str(c)])) for c in used},
+            flip180=flip180, flip_cam=flip_cam,
+            orientation_confirmed=orientation_confirmed)
         rig["created"] = _now_iso()
         rig["computed_at"] = rig["created"]
-        rig["camera_pair"] = [int(cams[0]), int(cams[1])]
+        rig["camera_pair"] = [used[0], used[1]]
+        rig["cameras_used"] = used
         rig["frames"] = {str(k): v for k, v in ids.items()}
-        rig["intrinsic_rms_px"] = {ca: self._intrinsics[ca].get("rms_px"),
-                                   cb: self._intrinsics[cb].get("rms_px")}
+        rig["intrinsic_rms_px"] = {str(c): self._intrinsics[str(c)].get("rms_px")
+                                   for c in used}
         rig["world_frame"] = sess.spec.world_frame()
-        rig["intrinsics"] = _intrinsics_snapshot(self._intrinsics,
-                                                 [int(cams[0]), int(cams[1])])
+        rig["intrinsics"] = _intrinsics_snapshot(self._intrinsics, used)
+        rig["device_keys"] = {str(c): _device_key(c) for c in used}
+        for c in used:
+            if str(c) in rig.get("cameras", {}):
+                rig["cameras"][str(c)]["device_key"] = _device_key(c)
         rig["source"] = "computed"
         rig["source_session"] = project_relative(sess.root)
         if low_cov:
@@ -859,7 +933,7 @@ class CalibrationService:
     def _save_latest_extrinsics(self, rig: dict) -> str:
         """保存最新有效世界系外参（未确认方向也保存为待确认结果）。"""
         sess = self._require_session()
-        cams = [int(c) for c in sess.cameras[:2]]
+        cams = [int(c) for c in sess.cameras]
         payload = dict(rig)
         payload.update({
             "schema": EXTRINSICS_SCHEMA,
@@ -885,7 +959,7 @@ class CalibrationService:
         snap = rig.get("intrinsics")
         if not isinstance(snap, dict) or not snap:
             return False                  # 旧格式结果没有快照，无法可靠比较
-        cams = [int(c) for c in sess.cameras[:2]]
+        cams = [int(c) for c in sess.cameras]
         if not _intrinsics_mismatch(snap, self._intrinsics, cams):
             return False
         with self._lock:
@@ -922,8 +996,7 @@ class CalibrationService:
         if not isinstance(cameras, dict):
             raise ValueError("内参文件格式不兼容：缺少 cameras 对象")
 
-        cams = [int(c) for c in sess.cameras[:2]]
-        size = tuple(int(v) for v in sess.image_size)
+        cams = [int(c) for c in sess.cameras]
         loaded, problems = {}, {}
         for cam in cams:
             key = str(cam)
@@ -931,9 +1004,14 @@ class CalibrationService:
             if not isinstance(entry, dict):
                 problems[key] = "文件中没有相机 %s 的内参" % key
                 continue
+            size = sess.image_size_for(cam)
             why = _validate_intrinsic_entry(entry, cam, size)
             if why:
                 problems[key] = "；".join(why)
+                continue
+            ok_dev, why_dev = _device_binding_ok(cam, entry)
+            if not ok_dev:
+                problems[key] = why_dev
                 continue
             K = np.asarray(entry["K"], np.float64)
             loaded[key] = {
@@ -982,17 +1060,24 @@ class CalibrationService:
             path, DEFAULT_EXTRINSICS_PATH, EXTRINSICS_SCHEMA,
             "外参", "世界系外参文件")
 
-        cams = [int(c) for c in sess.cameras[:2]]
+        cams = [int(c) for c in sess.cameras]
         problems = _board_mismatch(data.get("board") or {}, sess.spec)
         problems += _world_frame_mismatch(data.get("world_frame") or {}, sess.spec)
         cameras = data.get("cameras")
         if not isinstance(cameras, dict):
             problems.append("文件缺少 cameras 对象")
             cameras = {}
+        # 只使用文件里确实存在的相机（旧的双相机结果可以在四相机会话里只载入 0/1）
+        available = [c for c in cams if isinstance(cameras.get(str(c)), dict)]
+        if len(available) < 2:
+            problems.append("文件里有效的相机不足 2 台")
         for cam in cams:
             entry = cameras.get(str(cam))
             if not isinstance(entry, dict):
-                problems.append("缺少相机 %d 的外参" % cam)
+                continue
+            ok_dev, why_dev = _device_binding_ok(cam, entry)
+            if not ok_dev:
+                problems.append(why_dev)
                 continue
             for key in ("R", "t", "camera_centre_world",
                         "height_above_floor_m", "reprojection",
@@ -1034,8 +1119,9 @@ class CalibrationService:
                 problems.append("外参文件缺少 %s" % key)
         if not isinstance(data.get("consistency"), dict):
             problems.append("缺少三角化自洽 consistency")
+        # 只校验文件里确实包含的相机：四相机会话可以只载入旧的双相机外参
         problems += _intrinsics_mismatch(data.get("intrinsics") or {},
-                                         self._intrinsics, cams)
+                                         self._intrinsics, available)
         if problems:
             raise ValueError("世界系外参文件不兼容，未载入：" + "；".join(problems))
 
@@ -1049,7 +1135,8 @@ class CalibrationService:
         rig["camera_pair"] = [int(c) for c in (rig.get("camera_pair") or cams)]
         rig["frames"] = rig.get("frames") or {}
         rig["intrinsic_rms_px"] = {
-            str(c): self._intrinsics[str(c)].get("rms_px") for c in cams}
+            str(c): self._intrinsics[str(c)].get("rms_px")
+            for c in available if str(c) in self._intrinsics}
         rig["orientation_confirmed"] = bool(rig.get("orientation_confirmed"))
         rig["orientation_ok"] = bool(rig.get("orientation_ok",
                                              rig["orientation_confirmed"]))
@@ -1127,16 +1214,15 @@ class CalibrationService:
         }
 
     def validate_rig(self, *, holdout: bool = False, expected_centres=None) -> dict:
-        """独立验证：用 validation 阶段的同步帧对（板挪到多个位置/高度）。"""
+        """独立验证：用 validation 阶段的同步帧组（板挪到多个位置/高度）。"""
         sess = self._require_session()
         rig = self._extrinsic
         if not rig:
             raise ValueError("还没有外参结果，请先执行 solvePnP 外参标定")
-        cams = sess.cameras
-        ca, cb = str(int(cams[0])), str(int(cams[1]))
+        cams = [int(c) for c in sess.cameras]
         pairs = sess.stereo_samples(phase="validation")
         if not pairs:
-            raise ValueError("没有验证帧对：请把板挪到其它位置/高度，用"
+            raise ValueError("没有验证帧组：请把板挪到其它位置/高度，用"
                              "「采集并验证三维精度」逐点采集，且不要把验证用的图混进外参标定")
 
         if holdout and len(pairs) >= 6:
@@ -1145,13 +1231,13 @@ class CalibrationService:
             pairs = val or pairs_sorted
 
         placements = [{"id": s.id,
-                       "corners0": s.corners(0),
-                       "corners1": s.corners(1),
+                       "corners": {c: s.corners(c) for c in cams},
                        "dt_ms": s.dt_ms} for s in pairs]
-        out = ext_mod.validate_rig(
+        out = ext_mod.validate_rig_multi(
             placements, sess.spec, rig,
-            intr_mod.K_from(self._intrinsics[ca]), intr_mod.D_from(self._intrinsics[ca]),
-            intr_mod.K_from(self._intrinsics[cb]), intr_mod.D_from(self._intrinsics[cb]),
+            {c: (intr_mod.K_from(self._intrinsics[str(c)]),
+                 intr_mod.D_from(self._intrinsics[str(c)]))
+             for c in cams if str(c) in self._intrinsics},
             expected_centres=expected_centres)
         out["created"] = _now_iso()
         out["sample_ids"] = [p["id"] for p in placements]
@@ -1174,15 +1260,15 @@ class CalibrationService:
         sess = self._require_session()
         cams = sess.cameras
         if len(cams) < 2:
-            raise ValueError("会话只登记了 %d 台相机，无法采集同步帧对" % len(cams))
-        missing = [str(c) for c in cams[:2] if str(int(c)) not in self._intrinsics]
+            raise ValueError("会话只登记了 %d 台相机，无法采集同步帧组" % len(cams))
+        missing = [str(c) for c in cams if str(int(c)) not in self._intrinsics]
         if missing:
             raise ValueError("相机 %s 还没有内参结果，请先完成内参标定"
                              % ", ".join(missing))
         if not self._extrinsic:
-            raise ValueError("还没有外参结果，请先采集双相机图片并执行 solvePnP 外参标定")
+            raise ValueError("还没有外参结果，请先采集多相机图片并执行 solvePnP 外参标定")
 
-        capture = self.capture_stereo(force=force, phase="validation")
+        capture = self.capture_group(force=force, phase="validation")
         out = {"ok": bool(capture.get("ok")), "capture": capture,
                "validation": None, "validation_error": None}
         if not capture.get("ok"):
@@ -1240,17 +1326,18 @@ class CalibrationService:
     def run_intrinsic(self, cameras=None, *, exclude=()) -> dict:
         sess = self._require_session()
         spec = sess.spec
-        size = tuple(sess.image_size)
         targets = [int(c) for c in (cameras if isinstance(cameras, (list, tuple)) else
                                     ([cameras] if cameras is not None else sess.cameras))]
 
         results, errors = {}, {}
         for cam in targets:
+            size = sess.image_size_for(cam)
             samples = sess.single_samples(cam, exclude=exclude, phase="intrinsic")
             try:
                 res = intr_mod.calibrate(samples, spec, size, camera=cam)
                 res["camera"] = cam
                 res["created"] = _now_iso()
+                res["device_key"] = _device_key(cam)
                 # 区域覆盖率：复用 board.coverage_map 的 6×6 网格统计，只统计
                 # 本相机 phase="intrinsic" 的有效样本（samples 已按该阶段筛选）。
                 cov = board_mod.coverage_map(_detections_for(samples, cam), size, spec)
@@ -1310,10 +1397,16 @@ class CalibrationService:
         if missing:
             raise ValueError("相机 %s 还没有内参结果，请先执行内参标定"
                              % ", ".join(missing))
+        size_a = sess.image_size_for(int(cams[0]))
+        size_b = sess.image_size_for(int(cams[1]))
+        if size_a != size_b:
+            raise ValueError(
+                "离线双目标定交叉校验要求两台相机分辨率相同（当前 %s vs %s）；"
+                "多相机外参请用 solvePnP 路线" % (size_a, size_b))
 
         samples = sess.stereo_samples(exclude=exclude)
         res = stereo_mod.calibrate(
-            samples, sess.spec, tuple(sess.image_size),
+            samples, sess.spec, size_a,
             self._intrinsics[ca], self._intrinsics[cb],
             auto_flip=auto_flip, flip_b=flip_b)
         res["created"] = _now_iso()
@@ -1334,20 +1427,24 @@ class CalibrationService:
             cams = [int(c) for c in (self._session.cameras
                                      if self._session else [0, 1])]
             board = self._session.spec.to_dict() if self._session else None
+            image_sizes = ({str(c): list(v) for c, v in
+                            self._session.image_sizes.items()}
+                           if self._session else None)
             image_size = list(self._session.image_size) if self._session else None
         return {"intrinsics": intr, "extrinsic": rig, "cameras": cams,
-                "board": board, "image_size": image_size}
+                "board": board, "image_size": image_size,
+                "image_sizes": image_sizes,
+                "device_keys": {str(c): _device_key(c) for c in cams}}
 
     # ------------------------------------------------------------------
     # 结果保存 / 加载
     # ------------------------------------------------------------------
     def build_result(self) -> dict:
         sess = self._require_session()
-        cams = sess.cameras
-        ca, cb = str(int(cams[0])), str(int(cams[1]))
-        if ca not in self._intrinsics or cb not in self._intrinsics:
-            raise ValueError("内参不完整：缺少相机 %s 的结果"
-                             % ", ".join([c for c in (ca, cb) if c not in self._intrinsics]))
+        cams = [int(c) for c in sess.cameras]
+        missing = [str(c) for c in cams if str(c) not in self._intrinsics]
+        if missing:
+            raise ValueError("内参不完整：缺少相机 %s 的结果" % ", ".join(missing))
         if not self._extrinsic and not self._stereo:
             raise ValueError("还没有外参结果，请先执行「解外参（solvePnP）」")
 
@@ -1357,7 +1454,7 @@ class CalibrationService:
         if self._extrinsic:
             rig = self._extrinsic
             cams_out = {}
-            for key in ("0", "1"):
+            for key in sorted(rig["cameras"], key=int):
                 p = rig["cameras"][key]
                 cw = p["cam_to_world"]
                 cams_out[key] = {
@@ -1422,17 +1519,17 @@ class CalibrationService:
                 str(c): {
                     "index": int(c),
                     "device": workers[c].device_name if workers[c] else None,
+                    "device_key": _device_key(c),
                     "format": workers[c].format_info if workers[c] else None,
-                    "width": int(sess.image_size[0]),
-                    "height": int(sess.image_size[1]),
+                    "width": int(sess.image_size_for(c)[0]),
+                    "height": int(sess.image_size_for(c)[1]),
                 } for c in cams},
             "board": spec.to_dict(),
             "world_frame": spec.world_frame(),
             "image_convention": sess.meta.get("image_convention"),
+            "image_sizes": {str(c): list(sess.image_size_for(c)) for c in cams},
             "intrinsics": {
-                ca: _slim_intrinsic(self._intrinsics[ca]),
-                cb: _slim_intrinsic(self._intrinsics[cb]),
-            },
+                str(c): _slim_intrinsic(self._intrinsics[str(c)]) for c in cams},
             "extrinsics": ext,
             "validation": self._validation,
             "data": sess.stats(),
@@ -1490,6 +1587,16 @@ class CalibrationService:
     # ------------------------------------------------------------------
     # 状态
     # ------------------------------------------------------------------
+    @staticmethod
+    def _camera_config_status() -> dict | None:
+        try:
+            import camera_config
+            cfg = camera_config.load(create=False)
+            return {"path": cfg.get("path"),
+                    "cameras": camera_config.resolve(cfg)}
+        except Exception as exc:
+            return {"error": str(exc).strip().splitlines()[-1]}
+
     def status(self) -> dict:
         sess = self._session
         sync_st = None
@@ -1531,12 +1638,15 @@ class CalibrationService:
             "result_exists": bool(result_path_abs
                                   and os.path.isfile(result_path_abs)),
             "sync": {k: sync_st.get(k) for k in
-                     ("pairs_total", "pair_rate", "max_dt_ms", "last_dt_ms")}
+                     ("groups_total", "group_rate", "max_dt_ms",
+                      "last_span_ms", "group_sizes")}
                     if sync_st else None,
-            "cameras": [{"index": c.index, "name": c.device_name, "state": c.state,
+            "cameras": [{"index": c.index, "name": c.device_name,
+                         "device_key": c.device_key, "state": c.state,
                          "format": c.format_info}
                         for c in (manager().worker(i) for i in (sess.cameras if sess else []))
                         if c is not None],
+            "camera_config": self._camera_config_status(),
         }
         if self._extrinsic:
             rig = self._extrinsic

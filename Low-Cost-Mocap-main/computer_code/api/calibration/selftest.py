@@ -709,6 +709,7 @@ class _FakeWorker:
 
     def __init__(self, frame, index=0):
         self.index = int(index)
+        self.device_key = "fake-cam-%d" % self.index
         self.frames = [frame]
 
     def push(self, frame):
@@ -744,11 +745,16 @@ class _FakeSync:
         self.pair_seq = int(pair_seq)
         self.calls = 0
 
-    def recent_pairs(self, count=1):
-        from sync import PairRecord
+    def recent_groups(self, count=1):
+        from sync import GroupRecord
         self.calls += 1
-        return [PairRecord(pair_seq=self.pair_seq, dt_ms=0.3, frame_a=self._fa,
-                           frame_b=self._fb, created_mono=time.perf_counter())]
+        return [GroupRecord(group_seq=self.pair_seq, span_ms=0.3,
+                            frames={0: self._fa, 1: self._fb},
+                            created_mono=time.perf_counter())]
+
+    # 兼容旧调用
+    def recent_pairs(self, count=1):
+        return self.recent_groups(count)
 
 
 def test_capture_http(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
@@ -1419,6 +1425,153 @@ def _selftest_dir() -> str:
     return tempfile.mkdtemp(prefix="calib_selftest_", dir=root)
 
 
+def _write_fake_camera_config(root: str) -> None:
+    """自检用的逻辑编号↔设备绑定（全部已确认），避免历史文件触发身份校验。"""
+    path = os.path.join(root, "camera_config.json")
+    payload = {
+        "schema": "lowcost-mocap/camera-config", "version": 1,
+        "cameras": [{"index": i, "device_key": "fake-cam-%d" % i,
+                     "device_name": "fake-cam", "confirmed": True,
+                     "width": 1280, "height": 720, "fps": 30.0,
+                     "format": "NV12"} for i in range(4)],
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+
+
+def test_camera_identity(tmp: str) -> None:
+    """逻辑编号 ↔ 设备实例绑定的确认/拒绝规则。"""
+    print("\n[14] 相机身份绑定与标定归属校验")
+    import camera_config as CC
+
+    path = os.path.join(tmp, "identity_config.json")
+    old_path = CC.CONFIG_PATH
+    CC.CONFIG_PATH = path
+    try:
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"schema": CC.SCHEMA, "version": 1, "cameras": [
+                {"index": 0, "device_key": "usb#port0", "confirmed": True,
+                 "width": 1280, "height": 720, "fps": 30, "format": "NV12"},
+                {"index": 1, "device_key": "usb#port1", "confirmed": False,
+                 "width": 1280, "height": 720, "fps": 30, "format": "NV12"},
+            ]}, fh)
+        cfg = CC.load()
+        check("读取固定绑定配置", [c["index"] for c in cfg["cameras"]] == [0, 1],
+              [c["device_key"] for c in cfg["cameras"]])
+        ok, why = CC.calibration_check(0, {"device_key": "usb#port0"})
+        check("设备标识一致时允许套用标定", ok, why)
+        ok, why = CC.calibration_check(0, {"device_key": "usb#other"})
+        check("设备标识不一致时拒绝套用标定", not ok and "属于设备" in why, why)
+        ok, why = CC.calibration_check(1, {})
+        check("旧标定无设备信息且未确认时拒绝", not ok and "人工确认" in why, why)
+        ok, why = CC.calibration_check(0, {})
+        check("旧标定无设备信息但已确认时允许", ok, why)
+        try:
+            CC.update(1, {"device_key": "usb#port0", "confirmed": True})
+            dup_ok = False
+        except ValueError:
+            dup_ok = True
+        check("同一物理设备不能绑定两个逻辑编号", dup_ok)
+        CC.update(1, {"device_key": "usb#port1", "confirmed": True})
+        ok, _why = CC.calibration_check(1, {})
+        check("人工确认后旧标定可用", ok)
+    finally:
+        CC.CONFIG_PATH = old_path
+
+
+def test_multi_camera_rig(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
+    """3/4 台不同分辨率相机的统一外参、结果结构与联合验证。"""
+    print("\n[15] 多相机（4 台、不同分辨率）统一外参与联合验证")
+    import calibration.service as SVC
+
+    cams = [0, 1, 2, 3]
+    sizes = {0: (1280, 720), 1: (1280, 720),
+             2: (960, 540), 3: (640, 360)}
+    root = os.path.join(tmp, "multi_rig")
+    shutil.rmtree(root, ignore_errors=True)
+    sess = Session.create(root, spec, cams, sizes, "NV12")
+    check("会话保存每台相机自己的图像尺寸",
+          sess.image_size_for(2) == (960, 540)
+          and sess.image_size_for(3) == (640, 360),
+          sess.image_sizes)
+
+    centres = [(-1.05, -0.85, 1.20), (0.98, -0.78, 1.28),
+               (-0.95, 0.85, 1.15), (1.00, 0.90, 1.25)]
+    poses, intr = {}, {}
+    for i, c in enumerate(cams):
+        w, h = sizes[c]
+        sx, sy = w / 1280.0, h / 720.0
+        K = np.array([[TRUE_K[0, 0] * sx, 0.0, TRUE_K[0, 2] * sx],
+                      [0.0, TRUE_K[1, 1] * sy, TRUE_K[1, 2] * sy],
+                      [0.0, 0.0, 1.0]])
+        D = np.asarray(TRUE_D, np.float64)
+        intr[str(c)] = {"K": K.tolist(), "D": D.tolist(),
+                        "image_size": [w, h], "rms_px": 0.1, "num_views": 1}
+        poses[c] = look_at(np.array(centres[i], np.float64),
+                           np.array([0.0, 0.0, 0.02]))
+
+    svc = SVC.CalibrationService()
+    svc._session = sess
+    svc._intrinsics = {k: dict(v) for k, v in intr.items()}
+
+    for c in cams:
+        R, t = poses[c]
+        K = np.asarray(intr[str(c)]["K"])
+        D = np.asarray(intr[str(c)]["D"])
+        img = render_rig(spec, R, t, (0, 0, 0), K, D, sizes[c], tex, off)
+        det = B.detect(img, spec)
+        sess.add_single(c, img, det,
+                        {"seq": 1, "mf_ts": 0, "host_ts": 0.0,
+                         "mono_ts": 0.0, "group_seq": 1},
+                        phase="extrinsic")
+    rig = svc.solve_extrinsic(orientation_confirmed=True)
+    check("四台相机各自 solvePnP 得到外参",
+          sorted(rig["cameras"], key=int) == ["0", "1", "2", "3"],
+          sorted(rig["cameras"]))
+    check("多视角联合三角化一致性 < 2 mm",
+          rig["multi_view"]["max_m"] is not None
+          and rig["multi_view"]["max_m"] < 0.002,
+          rig["multi_view"]["max_m"])
+    check("外参记录每台相机的独立分辨率",
+          all(rig["cameras"][str(c)]["reprojection"]["rms_px"] < 1.0
+              for c in cams))
+
+    result = svc.build_result()
+    check("结果包含全部 4 台相机与各自 image_size",
+          len(result["cameras"]) == 4
+          and result["cameras"]["2"]["width"] == 960
+          and result["cameras"]["3"]["height"] == 360
+          and len(result["intrinsics"]) == 4,
+          {k: (v["width"], v["height"]) for k, v in result["cameras"].items()})
+
+    # 联合验证：板挪到另一个位置，只有 3 台相机看到
+    placements = []
+    for k, offset in enumerate([(0.08, -0.05, 0.15), (-0.06, 0.10, 0.25)]):
+        corners = {}
+        for c in (0, 1, 2):
+            R, t = poses[c]
+            K = np.asarray(intr[str(c)]["K"])
+            D = np.asarray(intr[str(c)]["D"])
+            img = render_rig(spec, R, t, offset, K, D, sizes[c], tex, off)
+            det = B.detect(img, spec)
+            corners[c] = det.corners if det.ok else None
+        placements.append({"id": "v%d" % k, "corners": corners, "dt_ms": 0.3})
+    val = E.validate_rig_multi(placements, spec, rig,
+                               {c: (np.asarray(intr[str(c)]["K"]),
+                                    np.asarray(intr[str(c)]["D"]))
+                                for c in cams})
+    check("三相机联合验证给出有效位置",
+          val["aggregate"]["placements"] == 2
+          and val["aggregate"]["cameras"] == [0, 1, 2],
+          val["aggregate"].get("cameras"))
+    check("联合验证间距误差 < 1 mm",
+          val["aggregate"]["spacing_abs_error_mm"]["mean"] < 1.0,
+          val["aggregate"]["spacing_abs_error_mm"])
+    check("联合验证平面度 < 1 mm",
+          max(p["planarity_rms_mm"] for p in val["per_placement"]) < 1.0,
+          [p["planarity_rms_mm"] for p in val["per_placement"]])
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="标定模块合成数据自检")
     ap.add_argument("--quick", action="store_true", help="减少样本数，快速跑")
@@ -1433,6 +1586,7 @@ def main(argv=None) -> int:
     # 自检不能覆盖本机真实的最新内参/外参；在第一次 import service 前
     # 把跨会话结果目录重定向到临时目录。
     os.environ["MOCAP_CALIB_DIR"] = tmp
+    _write_fake_camera_config(tmp)
     keep_dir = tmp if args.keep else None
     print("自检临时目录：%s" % tmp)
     print("标定板 %dx%d 内角点（%d×%d 方格），方格 %gmm，图像 %dx%d"
@@ -1456,6 +1610,8 @@ def main(argv=None) -> int:
     test_intrinsic_coverage(spec, size, _tex, _off, tmp)
     test_extrinsic_pair_and_validation(spec, size, _tex, _off, tmp)
     test_latest_result_files(spec, size, _tex, _off, tmp)
+    test_camera_identity(tmp)
+    test_multi_camera_rig(spec, size, _tex, _off, tmp)
     test_preview_ui_and_paths(tmp)
     if st:
         test_persistence(spec, size, intr, st, tmp)

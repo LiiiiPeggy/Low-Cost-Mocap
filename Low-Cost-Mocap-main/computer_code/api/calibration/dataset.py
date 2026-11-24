@@ -34,6 +34,22 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _normalize_sizes(image_size, cameras: list[int]) -> dict[int, tuple[int, int]]:
+    """``image_size`` 可以是单台 (w,h)、``{cam: (w,h)}`` 或列表；统一成字典。"""
+    if isinstance(image_size, dict):
+        out = {}
+        for c in cameras:
+            v = image_size.get(c, image_size.get(str(c)))
+            if v is None:
+                raise ValueError("相机 %d 缺少图像尺寸" % c)
+            out[c] = (int(v[0]), int(v[1]))
+        return out
+    if (isinstance(image_size, (list, tuple)) and len(image_size) == 2
+            and all(isinstance(v, (int, float)) for v in image_size)):
+        return {c: (int(image_size[0]), int(image_size[1])) for c in cameras}
+    raise ValueError("image_size 必须是 (w,h) 或 {相机: (w,h)}")
+
+
 def _atomic_json(path: str, data) -> None:
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as fh:
@@ -116,21 +132,24 @@ class Session:
     # -- 创建 / 载入 ------------------------------------------------------
     @classmethod
     def create(cls, root: str, spec: BoardSpec, cameras: Iterable[int],
-               image_size: tuple[int, int], pixel_format: str = "",
+               image_size, pixel_format: str = "",
                note: str = "") -> "Session":
         s = cls(root)
         os.makedirs(s.img_dir, exist_ok=True)
         os.makedirs(s.overlay_dir, exist_ok=True)
         idxs = [int(c) for c in cameras]
+        sizes = _normalize_sizes(image_size, idxs)
         s.meta = {
             "schema": "lowcost-mocap/calibration-session",
-            "version": 1,
+            "version": 2,
             "session_id": os.path.basename(s.root),
             "created": _now(),
             "updated": _now(),
             "board": spec.to_dict(),
             "cameras": idxs,
-            "image_size": [int(image_size[0]), int(image_size[1])],
+            # 每台相机各自的原始图像尺寸；旧会话只有单个 image_size
+            "image_sizes": {str(c): list(sizes[c]) for c in idxs},
+            "image_size": list(sizes[idxs[0]]),
             "pixel_format": pixel_format,
             "image_convention": {
                 "source": "raw grayscale frame from camera_manager (NV12 Y plane or MJPG decode)",
@@ -185,7 +204,23 @@ class Session:
 
     @property
     def image_size(self) -> tuple[int, int]:
+        """兼容旧代码：第一台相机的尺寸。新代码请用 ``image_size_for``。"""
+        sizes = self.meta.get("image_sizes") or {}
+        cams = self.cameras
+        if cams and str(cams[0]) in sizes:
+            return tuple(int(v) for v in sizes[str(cams[0])])
         return tuple(self.meta.get("image_size", [0, 0]))
+
+    def image_size_for(self, camera: int) -> tuple[int, int]:
+        """该逻辑相机的原始图像尺寸；旧会话回退到统一的 ``image_size``。"""
+        sizes = self.meta.get("image_sizes") or {}
+        if str(int(camera)) in sizes:
+            return tuple(int(v) for v in sizes[str(int(camera))])
+        return tuple(int(v) for v in self.meta.get("image_size", [0, 0]))
+
+    @property
+    def image_sizes(self) -> dict[int, tuple[int, int]]:
+        return {c: self.image_size_for(c) for c in self.cameras}
 
     @property
     def cameras(self) -> list[int]:
@@ -242,16 +277,17 @@ class Session:
         self.save()
         return sample
 
-    def add_stereo(self, pair_meta: dict, grays: dict, dets: dict,
-                   *, dt_ms: float | None, flip_b: bool = False,
-                   overlay: dict | None = None, status: str = "valid",
-                   reason: str = "", signature: dict | None = None,
-                   phase: str = "validation", note: str = "") -> Sample:
+    def add_group(self, pair_meta: dict, grays: dict, dets: dict,
+                  *, dt_ms: float | None, flip_b: bool = False,
+                  overlay: dict | None = None, status: str = "valid",
+                  reason: str = "", signature: dict | None = None,
+                  phase: str = "validation", note: str = "") -> Sample:
+        """一条多相机同步帧组样本（2..N 台相机）。"""
         sid = self._next_id("p")
         images, detections = {}, {}
         for cam, gray in grays.items():
             key = str(int(cam))
-            fname = "%s_%s_cam%s.png" % (sid, "AB"[list(grays).index(cam)], key)
+            fname = "%s_cam%s.png" % (sid, key)
             self._write_image(os.path.join(self.img_dir, fname), gray)
             if overlay and key in overlay:
                 self._write_image(os.path.join(self.overlay_dir, fname), overlay[key])
@@ -269,6 +305,10 @@ class Session:
         self.samples.append(sample)
         self.save()
         return sample
+
+    # 兼容旧调用（两相机帧组）
+    def add_stereo(self, pair_meta: dict, grays: dict, dets: dict, **kw) -> Sample:
+        return self.add_group(pair_meta, grays, dets, **kw)
 
     def remove(self, sample_id: str) -> bool:
         keep, drop = [], None
@@ -375,6 +415,8 @@ class Session:
             "board": self.spec.to_dict(),
             "cameras": self.cameras,
             "image_size": list(self.image_size),
+            "image_sizes": {str(c): list(v)
+                            for c, v in self.image_sizes.items()},
             "pixel_format": self.meta.get("pixel_format"),
             "image_convention": self.meta.get("image_convention"),
             "note": self.meta.get("note", ""),

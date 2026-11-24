@@ -38,7 +38,7 @@ import cv2
 import numpy as np
 
 from calibration.board import BoardSpec, to_jsonable
-from calibration.intrinsic import D_from, K_from
+from calibration.intrinsic import D_from, K_from, undistort_points
 from calibration import stereo as st
 
 MIN_FRAMES = 1            # 固定板 + 固定相机：一张图就足以 solvePnP
@@ -366,107 +366,166 @@ def _flip_of(cam: int, flip180: bool, flip_cam) -> bool:
     return bool(flip180) if v is None else bool(v)
 
 
-def solve_rig(frames: dict, spec: BoardSpec, K0, D0, K1, D1, *,
-              flip180: bool = False, flip_cam=None,
-              orientation_confirmed: bool = False) -> dict:
-    """用两台相机各自的多张固定板图像求解世界系外参。
+def _multi_view_consistency(chosen: dict, frames: dict, spec: BoardSpec,
+                            intrinsics: dict) -> dict:
+    """各相机最优帧观测同一块固定板，联合三角化全部角点并比对已知世界坐标。"""
+    truth = spec.world_points().astype(np.float64)
+    cams = sorted(chosen)
+    obs = []
+    for c in cams:
+        idx, pose = chosen[c]
+        K, D = intrinsics[c]
+        corners = _apply_correspondence(frames[c][idx], spec,
+                                        pose["correspondence"])
+        norm = undistort_points(corners, K, D)
+        P = np.hstack([np.asarray(pose["R"], np.float64),
+                       np.asarray(pose["t"], np.float64).reshape(3, 1)])
+        obs.append((c, corners, norm, P))
 
-    ``frames``：``{0: [corners, ...], 1: [corners, ...]}``，每项是同一台相机对
-    **同一块固定棋盘格**的多次检测结果（同一物理姿态，多张图用于抖动评估）。
+    X = []
+    reproj = {c: [] for c in cams}
+    for k in range(spec.count):
+        pts = [norm[k] for _c, _raw, norm, _P in obs]
+        Ps = [P for _c, _raw, _norm, P in obs]
+        Xk = st.triangulate_dlt(pts, Ps)
+        if Xk is None:
+            Xk = np.full(3, np.nan)
+        X.append(Xk)
+        for c, raw, _norm, _P in obs:
+            K, D = intrinsics[c]
+            pose = chosen[c][1]
+            proj = st.project_world(Xk.reshape(1, 3), K, D,
+                                    pose["R"], pose["t"])
+            reproj[c].append(float(np.linalg.norm(
+                proj.reshape(2) - np.asarray(raw[k], np.float64).reshape(2))))
+    X = np.asarray(X, np.float64)
+    ok = np.isfinite(X).all(axis=1)
+    err = np.linalg.norm(X[ok] - truth[ok], axis=1) if ok.any() else np.array([])
+    worst = int(np.argmax(err)) if err.size else None
+    return {
+        "cameras": cams,
+        "rms_m": round(float(np.sqrt(np.mean(err ** 2))), 6) if err.size else None,
+        "mean_m": round(float(err.mean()), 6) if err.size else None,
+        "max_m": round(float(err.max()), 6) if err.size else None,
+        "worst_corner": ({"index": worst, "m": round(float(err[worst]), 6)}
+                         if worst is not None else None),
+        "reprojection_rms_px": {
+            str(c): (round(float(np.sqrt(np.mean(np.square(reproj[c])))), 4)
+                     if reproj[c] else None) for c in cams},
+        "definition": ("各相机最优帧联合 DLT 三角化棋盘格角点，与已知世界坐标的"
+                       "三维偏差（米）；2 台相机时与 pair_consistency 等价"),
+    }
 
-    ``flip180``：两台一起绕板法向转 180°（改变世界系 X/Y 朝向，不动相对几何）。
-    ``flip_cam``：``{0: bool, 1: bool}``，只翻某台相机。**仅在两台相机的检测
-    顺序相差 180° 时才需要**——这种情况下来自同一块物理板的两套角点编号不一致，
-    必须逐台纠正，否则基线会错（实测 2032mm → 1635mm）。
 
-    ``orientation_confirmed``：人工是否已用世界轴叠加确认过方向。**几何上无法
-    自动判定**（矩形板 D2 对称，两种对应误差逐位相同，一致性残差也都约 0.6mm），
-    所以这个标志只记录"人看过了"，不能被自动置真。
+def solve_rig_multi(frames: dict, spec: BoardSpec, intrinsics: dict, *,
+                    flip180: bool = False, flip_cam=None,
+                    orientation_confirmed: bool = False) -> dict:
+    """用 2..N 台相机各自的多张固定板图像求解世界系外参。
+
+    ``frames``：``{逻辑相机: [corners, ...]}``，每台相机对**同一块固定棋盘格**
+    的多次检测结果（同一物理姿态，多张图用于抖动评估）。
+    ``intrinsics``：``{逻辑相机: (K, D)}``。
+
+    ``flip180``：所有相机一起绕板法向转 180°；``flip_cam``：``{相机: bool}``
+    只翻某台。``orientation_confirmed`` 只能由人工确认置真。
     """
-    if 0 not in frames or 1 not in frames:
-        raise ValueError("需要同时提供相机 0 和相机 1 的图像")
-    n0, n1 = len(frames[0]), len(frames[1])
-    if n0 < MIN_FRAMES or n1 < MIN_FRAMES:
-        raise ValueError("每台相机至少需要 %d 张固定板图像（当前 %d / %d）"
-                         % (MIN_FRAMES, n0, n1))
+    cams = sorted(int(c) for c in frames)
+    if len(cams) < 2:
+        raise ValueError("至少需要两台相机的固定板图像")
+    for c in cams:
+        n = len(frames[c])
+        if n < MIN_FRAMES:
+            raise ValueError("相机 %d 至少需要 %d 张固定板图像（当前 %d）"
+                             % (c, MIN_FRAMES, n))
+        if c not in intrinsics:
+            raise ValueError("相机 %d 缺少内参" % c)
 
-    flips = (0, _flip_of(0, flip180, flip_cam)), (1, _flip_of(1, flip180, flip_cam))
-
-    # 每台相机：所有帧各解一次，**带着帧号**排序，避免位姿与角点错配
-    poses = []
-    for cam, flip, (K, D) in ((0, flips[0][1], (K0, D0)), (1, flips[1][1], (K1, D1))):
-        per_frame = [(i, solve_pose(c, spec, K, D, flip180=flip))
-                     for i, c in enumerate(frames[cam])]
+    flips = {c: _flip_of(c, flip180, flip_cam) for c in cams}
+    poses = {}
+    for c in cams:
+        K, D = intrinsics[c]
+        per_frame = [(i, solve_pose(corners, spec, K, D, flip180=flips[c]))
+                     for i, corners in enumerate(frames[c])]
         per_frame.sort(key=lambda t: t[1]["reprojection"]["rms_px"])
-        poses.append(per_frame)
+        poses[c] = per_frame
+    chosen = {c: poses[c][0] for c in cams}
 
-    i0, P0 = poses[0][0]
-    i1, P1 = poses[1][0]
-    # 一致性检查必须用**同一帧**的角点，否则等于拿 A 帧的位姿解释 B 帧的像素
-    cons = pair_consistency(P0, P1, spec, K0, D0, K1, D1,
-                            frames[0][i0], frames[1][i1],
-                            P0["correspondence"], P1["correspondence"])
+    ca, cb = cams[0], cams[1]
+    Ka, Da = intrinsics[ca]
+    Kb, Db = intrinsics[cb]
+    ia, Pa = chosen[ca]
+    ib, Pb = chosen[cb]
+    cons = pair_consistency(Pa, Pb, spec, Ka, Da, Kb, Db,
+                            frames[ca][ia], frames[cb][ib],
+                            Pa["correspondence"], Pb["correspondence"])
     rel = cons["relative"]
+    multi = _multi_view_consistency(chosen, frames, spec, intrinsics)
 
     warn = []
     if cons["blunder"]:
-        warn.append("两台相机的三角化残差 %.1f mm 偏大：检查角点是否都检测完整、"
-                    "标定板在两次采集之间是否被碰动" % (1000 * cons["max_m"]))
+        warn.append("相机 %d/%d 的三角化残差 %.1f mm 偏大：检查角点是否都检测"
+                    "完整、标定板在两次采集之间是否被碰动"
+                    % (ca, cb, 1000 * cons["max_m"]))
     if rel["baseline_m"] < 0.05:
-        warn.append("基线只有 %.1f mm，三角化精度会很差" % (1000 * rel["baseline_m"]))
+        warn.append("基线只有 %.1f mm，三角化精度会很差"
+                    % (1000 * rel["baseline_m"]))
     if not orientation_confirmed:
         warn.append("棋盘格朝向（180°）尚未人工确认：几何上无法自动判定，"
-                    "错 180° 会让基线与相机位置整体偏掉（实测 2032mm → 1635mm）。"
-                    "请用世界轴叠加确认两台相机的 X 轴都沿 12 格长边")
-    for cam, p in ((0, P0), (1, P1)):
+                    "错 180° 会让基线与相机位置整体偏掉。请用世界轴叠加确认"
+                    "每台相机的 X 轴都沿 12 格长边")
+    for c in cams:
+        p = chosen[c][1]
         if p["height_above_floor_m"] <= 0:
-            warn.append("相机 %d 的世界 Z 为负（%.3f m）：图案正面朝上时相机应在其上方，"
-                        "请检查该相机的角点方向" % (cam, p["height_above_floor_m"]))
+            warn.append("相机 %d 的世界 Z 为负（%.3f m）：图案正面朝上时相机应"
+                        "在其上方，请检查该相机的角点方向"
+                        % (c, p["height_above_floor_m"]))
         if p["points_in_front"] < 1.0:
-            warn.append("相机 %d 有角点落在后方，位姿不可信" % cam)
+            warn.append("相机 %d 有角点落在后方，位姿不可信" % c)
+    if len(set(flips.values())) > 1:
+        warn.append("各相机的 180° 设置不同（%s）：只有在各路检测顺序确实相差"
+                    " 180° 时才应这样设；请用世界轴叠加逐台核对"
+                    % ", ".join("cam%d=%s" % (c, flips[c]) for c in cams))
 
-    # 帧间抖动：同一个静止位姿，多张图的差异反映检测/内参的随机性。
-    # 只有 1 帧时不输出“标准差 0”这种误导性数字，明确标成 None。
     jitter = {}
-    for cam, plist in enumerate(poses):
+    for c in cams:
+        plist = poses[c]
         centres = np.array([p["camera_centre_world"] for _, p in plist])
         entry = {
             "frames": len(plist),
             "used_frame_index": plist[0][0],
-            "reproj_rms_px": [round(p["reprojection"]["rms_px"], 4) for _, p in plist],
+            "reproj_rms_px": [round(p["reprojection"]["rms_px"], 4)
+                              for _, p in plist],
         }
         if len(plist) >= 2:
-            entry["centre_std_m"] = round(float(np.linalg.norm(centres.std(axis=0))), 6)
+            entry["centre_std_m"] = round(
+                float(np.linalg.norm(centres.std(axis=0))), 6)
             entry["centre_range_m"] = round(float(np.max(np.linalg.norm(
                 centres - centres.mean(axis=0), axis=1))), 6)
         else:
             entry["centre_std_m"] = None
             entry["centre_range_m"] = None
             entry["note"] = "只有 1 帧，不计算帧间抖动；重复采集可观察稳定性"
-        jitter[str(cam)] = entry
+        jitter[str(c)] = entry
 
-    K0a = np.asarray(K0, np.float64)
-    K1a = np.asarray(K1, np.float64)
-    F = np.linalg.inv(K1a).T @ np.asarray(rel["E"]) @ np.linalg.inv(K0a)
+    F = np.linalg.inv(np.asarray(Kb, np.float64)).T @ np.asarray(rel["E"]) \
+        @ np.linalg.inv(np.asarray(Ka, np.float64))
     rel["F"] = F.tolist()
+    orientation_ok = (bool(orientation_confirmed)
+                      and len(set(flips.values())) == 1)
 
-    orientation_ok = bool(orientation_confirmed) and flips[0][1] == flips[1][1]
-    if flips[0][1] != flips[1][1]:
-        warn.append("两台相机的 180° 设置不同（cam0=%s, cam1=%s）：只有在两路检测"
-                    "顺序确实相差 180° 时才应这样设；请用世界轴叠加逐台核对"
-                    % (flips[0][1], flips[1][1]))
-
+    cam_entries = {str(c): dict(chosen[c][1], cam_to_world=cam_to_world(chosen[c][1]))
+                   for c in cams}
+    correspondence = {str(c): chosen[c][1]["correspondence"] for c in cams}
     return {
-        "method": "solvePnP (IPPE candidates + LM refine) per camera against one fixed board",
+        "method": ("solvePnP (IPPE candidates + LM refine) per camera against "
+                   "one fixed board"),
         "board": spec.to_dict(),
         "flip180": bool(flip180),
-        "flip_cam": {"0": flips[0][1], "1": flips[1][1]},
+        "flip_cam": {str(c): flips[c] for c in cams},
         "orientation_confirmed": bool(orientation_confirmed),
         "orientation_ok": orientation_ok,
-        "cameras": {
-            "0": dict(P0, cam_to_world=cam_to_world(P0)),
-            "1": dict(P1, cam_to_world=cam_to_world(P1)),
-        },
+        "camera_pair": [ca, cb],
+        "cameras": cam_entries,
         "relative": rel,
         "convention": rel["convention"],
         "T_unit": "m",
@@ -474,76 +533,112 @@ def solve_rig(frames: dict, spec: BoardSpec, K0, D0, K1, D1, *,
         "consistency": {"rms_m": cons["rms_m"], "mean_m": cons["mean_m"],
                         "max_m": cons["max_m"], "blunder": cons["blunder"],
                         "worst_corner": cons["worst_corner"],
-                        "definition": "三角化角点与已知世界坐标的三维偏差（棋盘格为基准）"},
+                        "definition": ("三角化角点与已知世界坐标的三维偏差"
+                                       "（棋盘格为基准）")},
+        "multi_view": multi,
         "stability": jitter,
         "warnings": warn,
         "corner_correspondence": {
-            "flip_cam": {"0": flips[0][1], "1": flips[1][1]},
-            "class_0": P0["correspondence"],
-            "class_1": P1["correspondence"],
+            "flip_cam": {str(c): flips[c] for c in cams},
+            "classes": correspondence,
+            "class_0": correspondence.get(str(ca)),
+            "class_1": correspondence.get(str(cb)),
             "confirmed": bool(orientation_confirmed),
             "meaning": ("class 是自动选定的格点对应（保证相机在图案正面一侧）；"
                         "flip_cam 是在其之上再绕板法向 180°"),
-            "how_to_verify": ("把世界系 X/Y 轴投影回图像（GET /api/calib/extrinsic/overlay"
-                              "?camera=0/1&flip180=0/1），确认两台相机的 X 轴都沿 12 格长边"),
-            "geometric_note": ("矩形角点阵列有 D2 四重对称：4 种对应重投影误差逐位相同，"
-                               "三角化一致性残差也都约 0.6mm，几何上不可区分；"
-                               "只能人工确认"),
+            "how_to_verify": ("把世界系 X/Y 轴投影回图像（GET /api/calib/"
+                              "extrinsic/overlay?camera=N&flip180=0/1），确认"
+                              "每台相机的 X 轴都沿 12 格长边"),
+            "geometric_note": ("矩形角点阵列有 D2 四重对称：4 种对应重投影误差"
+                               "逐位相同，三角化一致性残差也都约 0.6mm，几何上"
+                               "不可区分；只能人工确认"),
         },
         "caveat": ("三角化自洽性只能发现「板动了 / 检测错」，无法判断 180°；"
                    "三维精度请用 validate_rig 的独立数据（多个位置/高度）检验"),
     }
 
 
+def solve_rig(frames: dict, spec: BoardSpec, K0, D0, K1, D1, *,
+              flip180: bool = False, flip_cam=None,
+              orientation_confirmed: bool = False) -> dict:
+    """双相机兼容入口：内部走统一的 ``solve_rig_multi``。"""
+    return solve_rig_multi(frames, spec, {0: (K0, D0), 1: (K1, D1)},
+                           flip180=flip180, flip_cam=flip_cam,
+                           orientation_confirmed=orientation_confirmed)
+
+
 # ---------------------------------------------------------------------------
 # 独立验证：多个位置 / 高度
 # ---------------------------------------------------------------------------
-def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
-                 expected_centres=None) -> dict:
-    """用独立采集（板挪到不同位置/高度）检验三角化精度。
+def validate_rig_multi(placements: list, spec: BoardSpec, rig: dict,
+                       intrinsics: dict, expected_centres=None) -> dict:
+    """用独立采集（板挪到不同位置/高度）检验多相机三角化精度。
 
-    ``placements``：每项 ``{"id": str, "corners0": ..., "corners1": ...,
-    "dt_ms": float|None}``。**不复用**外参标定的那几张图。
+    ``placements``：每项 ``{"id", "corners": {相机: corners}, "dt_ms"}``。
+    ``intrinsics``：``{相机: (K, D)}``。每个位置用**当时有效的那几台相机**
+    联合 DLT 三角化；某台相机没检测到不影响其他相机。
     """
     if not placements:
         raise ValueError("没有验证数据")
-    K0 = np.asarray(K0, np.float64)
-    D0 = np.asarray(D0, np.float64).reshape(-1)
-    K1 = np.asarray(K1, np.float64)
-    D1 = np.asarray(D1, np.float64).reshape(-1)
-    rel = rig["relative"]
-    R10 = np.asarray(rel["R_10"], np.float64)
-    T10 = np.asarray(rel["T_10"], np.float64).reshape(3)
-    F = np.asarray(rel["F"], np.float64)
-    R0 = np.asarray(rig["cameras"]["0"]["R"], np.float64)
-    t0 = np.asarray(rig["cameras"]["0"]["t"], np.float64).reshape(3)
-    cls0 = rig["cameras"]["0"].get("correspondence", "none")
-    cls1 = rig["cameras"]["1"].get("correspondence", "none")
+    cams_all = sorted(int(c) for c in rig.get("cameras", {}))
+    if not cams_all:
+        raise ValueError("外参结果里没有相机")
+    KDs = {c: (np.asarray(intrinsics[c][0], np.float64),
+               np.asarray(intrinsics[c][1], np.float64).reshape(-1))
+           for c in cams_all if c in intrinsics}
+    classes = {c: rig["cameras"][str(c)].get("correspondence", "none")
+               for c in cams_all}
+    rel = rig.get("relative") or {}
+    F = np.asarray(rel.get("F"), np.float64) if rel.get("F") else None
+    first_pair = [c for c in cams_all if c in KDs][:2]
 
     spacing = spec.square_m
     truth = spec.world_points().astype(np.float64)
     per, all_sp, all_rep, all_epi, centres = [], [], [], [], []
 
     for pl in placements:
-        c0 = np.asarray(pl["corners0"], np.float32).reshape(-1, 2)
-        c1 = np.asarray(pl["corners1"], np.float32).reshape(-1, 2)
-        if len(c0) != spec.count or len(c1) != spec.count:
+        corners = {int(c): np.asarray(v, np.float32).reshape(-1, 2)
+                   for c, v in (pl.get("corners") or {}).items()
+                   if v is not None}
+        use = [c for c in cams_all if c in corners
+               and len(corners[c]) == spec.count and c in KDs]
+        if len(use) < 2:
             continue
-        i0 = _apply_correspondence(c0, spec, cls0)
-        i1 = _apply_correspondence(c1, spec, cls1)
+        raw, norm, proj = {}, {}, {}
+        for c in use:
+            K, D = KDs[c]
+            raw[c] = _apply_correspondence(corners[c], spec, classes[c])
+            norm[c] = undistort_points(raw[c], K, D)
+            pose = rig["cameras"][str(c)]
+            proj[c] = np.hstack([np.asarray(pose["R"], np.float64),
+                                 np.asarray(pose["t"], np.float64).reshape(3, 1)])
 
-        X0 = st.triangulate(i0, i1, K0, D0, K1, D1, R10, T10)
-        Xw = (X0 - t0) @ R0
+        Xw = []
+        reproj = {c: [] for c in use}
+        for k in range(spec.count):
+            Xk = st.triangulate_dlt([norm[c][k] for c in use],
+                                    [proj[c] for c in use])
+            if Xk is None:
+                Xk = np.full(3, np.nan)
+            Xw.append(Xk)
+            for c in use:
+                K, D = KDs[c]
+                pose = rig["cameras"][str(c)]
+                p = st.project_world(Xk.reshape(1, 3), K, D,
+                                     pose["R"], pose["t"])
+                reproj[c].append(float(np.linalg.norm(
+                    p.reshape(2) - raw[c][k].reshape(2))))
+        Xw = np.asarray(Xw, np.float64)
+        if not np.isfinite(Xw).all():
+            continue
+        rep = float(np.sqrt(np.mean(np.concatenate(
+            [np.square(reproj[c]) for c in use]))))
+        epi = None
+        if (F is not None and len(first_pair) == 2
+                and all(c in use for c in first_pair)):
+            epi = float(np.median(st.epipolar_errors(
+                raw[first_pair[0]], raw[first_pair[1]], F)))
 
-        # 重投影：把三角化点投回两台相机
-        e0 = st.reproject(X0, i0, K0, D0)
-        X1 = X0 @ R10.T + T10
-        e1 = st.reproject(X1, i1, K1, D1)
-        rep = float(np.sqrt(np.mean(np.concatenate([e0, e1]) ** 2)))
-
-        epi = float(np.median(st.epipolar_errors(i0, i1, F)))
-
-        # 已知间距：横向相邻（30mm）与纵向相邻（30mm），网格是正方形所以都该是 30mm
         pairs = []
         for r in range(spec.rows):
             for c in range(spec.cols):
@@ -554,30 +649,28 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
                     pairs.append((k, k + spec.cols))
         d = np.array([np.linalg.norm(Xw[i] - Xw[j]) for i, j in pairs])
         sp_err = d - spacing
-        # sp_err 的单位是米；汇总字段名是 *_mm，这里必须先换算，否则汇总值会
-        # 比逐位置结果小 1000 倍（历史 bug：mean/p95/max 都是米却标成毫米）。
         all_sp.extend((np.abs(sp_err) * 1000.0).tolist())
 
-        # 平面度：对 Z 做最小二乘（世界系里板面是 Z=0 平面，但验证时板被挪动了，
-        # 所以这里改为检查"重建点是否共面"——用 SVD 拟合平面）
         cen = Xw.mean(axis=0)
-        u, s, vt = np.linalg.svd(Xw - cen)
+        _u, _s, vt = np.linalg.svd(Xw - cen)
         normal = vt[2]
         planarity = float(np.sqrt(np.mean(((Xw - cen) @ normal) ** 2)))
 
         all_rep.append(rep)
-        all_epi.append(epi)
+        if epi is not None:
+            all_epi.append(epi)
         centres.append(cen)
-
-        # 棋盘格被挪动/转向后，原先的格点方向假设可能不再成立；间距和平面度一旦
-        # 明显跑偏，就是"对应关系不适用"的信号，直接标出来而不是让人自己猜
         suspect = (float(np.abs(sp_err).mean()) > 3 * spacing
                    or planarity > 3 * spacing)
         per.append({
             "id": pl.get("id"),
             "dt_ms": pl.get("dt_ms"),
+            "cameras": use,
             "reprojection_rms_px": round(rep, 4),
-            "epipolar_median_px": round(epi, 4),
+            "reprojection_by_camera_px": {
+                str(c): round(float(np.sqrt(np.mean(np.square(reproj[c])))), 4)
+                for c in use},
+            "epipolar_median_px": (round(epi, 4) if epi is not None else None),
             "spacing_mean_mm": round(float(d.mean() * 1000), 4),
             "spacing_mean_abs_error_mm": round(float(np.abs(sp_err).mean() * 1000), 4),
             "spacing_max_abs_error_mm": round(float(np.abs(sp_err).max() * 1000), 4),
@@ -595,18 +688,15 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
         })
 
     if not per:
-        raise ValueError("没有可用的验证帧对（角点数不符？）")
+        raise ValueError("没有可用的验证帧组（角点数不符或有效相机不足 2 台）")
 
     centres_arr = np.array(centres)
     agg = {
         "placements": len(per),
+        "cameras": sorted({c for p in per for c in p["cameras"]}),
         "reprojection_rms_px": {
             "mean": round(float(np.mean(all_rep)), 4),
             "max": round(float(np.max(all_rep)), 4),
-        },
-        "epipolar_median_px": {
-            "mean": round(float(np.mean(all_epi)), 4),
-            "max": round(float(np.max(all_epi)), 4),
         },
         "spacing_abs_error_mm": {
             "mean": round(float(np.mean(all_sp)), 4),
@@ -624,6 +714,11 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
             round(float(np.ptp(centres_arr[:, 1])), 4),
         ],
     }
+    if all_epi:
+        agg["epipolar_median_px"] = {
+            "mean": round(float(np.mean(all_epi)), 4),
+            "max": round(float(np.max(all_epi)), 4),
+        }
 
     cross = []
     if expected_centres:
@@ -660,6 +755,25 @@ def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
             "cross_checks": cross, "notes": notes}
 
 
+def validate_rig(placements: list, spec: BoardSpec, rig: dict, K0, D0, K1, D1,
+                 expected_centres=None) -> dict:
+    """双相机兼容入口：内部走统一的 ``validate_rig_multi``。"""
+    fixed = []
+    for pl in placements:
+        corners = {}
+        if pl.get("corners0") is not None:
+            corners[0] = pl["corners0"]
+        if pl.get("corners1") is not None:
+            corners[1] = pl["corners1"]
+        if "corners" in pl:
+            corners.update({int(c): v for c, v in pl["corners"].items()})
+        fixed.append({"id": pl.get("id"), "dt_ms": pl.get("dt_ms"),
+                      "corners": corners})
+    return validate_rig_multi(fixed, spec, rig,
+                              {0: (K0, D0), 1: (K1, D1)},
+                              expected_centres=expected_centres)
+
+
 __all__ = ["solve_pose", "cam_to_world", "relative_pose", "pair_consistency",
-           "solve_rig", "validate_rig", "to_jsonable", "MIN_FRAMES",
-           "RECOMMENDED_FRAMES"]
+           "solve_rig", "solve_rig_multi", "validate_rig", "validate_rig_multi",
+           "to_jsonable", "MIN_FRAMES", "RECOMMENDED_FRAMES"]

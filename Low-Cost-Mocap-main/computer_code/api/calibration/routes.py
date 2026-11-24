@@ -28,12 +28,21 @@ def _fail(exc: Exception, code: int = 400):
                     "type": type(exc).__name__}), code
 
 
+def _default_cameras() -> list[int]:
+    """当前配置里的全部逻辑相机；配置不可用时退回 0/1。"""
+    try:
+        import camera_config
+        return camera_config.logical_indices()
+    except Exception:
+        return [0, 1]
+
+
 def _session_options(body: dict) -> dict:
     return {
         "cols": int(body.get("cols", board_mod.DEFAULT_COLS)),
         "rows": int(body.get("rows", board_mod.DEFAULT_ROWS)),
         "square_mm": float(body.get("square_mm", board_mod.DEFAULT_SQUARE_MM)),
-        "cameras": body.get("cameras") or [0, 1],
+        "cameras": body.get("cameras") or _default_cameras(),
         "pixel_format": str(body.get("format", "")),
         "surface_height_m": float(body.get("surface_height_mm", 3.0)) / 1000.0,
     }
@@ -107,6 +116,7 @@ def calib_samples():
             "root": sess.root,
             "board": sess.spec.to_dict(),
             "image_size": list(sess.image_size),
+            "image_sizes": {str(c): list(v) for c, v in sess.image_sizes.items()},
             "stats": sess.stats(),
             "samples": [{
                 "id": s.id, "kind": s.kind, "status": s.status, "reason": s.reason,
@@ -350,7 +360,8 @@ def calib_coverage():
             dets.append(board_mod.Detection(
                 ok=True, corners=_corners(d.get("corners")),
                 method=d.get("method", ""), quality=d.get("quality") or {}))
-        return jsonify(board_mod.coverage_map(dets, tuple(sess.image_size), sess.spec))
+        return jsonify(board_mod.coverage_map(
+            dets, tuple(sess.image_size_for(cam)), sess.spec))
     except Exception as exc:
         return _fail(exc, 500)
 
