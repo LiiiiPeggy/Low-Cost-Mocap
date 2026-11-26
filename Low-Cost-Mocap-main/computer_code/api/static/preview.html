@@ -1079,17 +1079,21 @@ async function applyCameraControls(cam) {
   }
 }
 
-CAMERAS.forEach(cam => {
-  const btn = el('ctrl-apply-' + cam);
-  if (btn) btn.onclick = () => applyCameraControls(cam);
-  const auto = el('ctrl-auto-' + cam);
-  if (auto) auto.onchange = () => {
-    const exp = el('ctrl-exp-' + cam);
-    const info = camControlInfo[cam] || {};
-    const manual = ((info.exposure || {}).manual_supported !== false);
-    exp.disabled = auto.checked || !manual;
-  };
-});
+// 相机2/3 的控件块由 expandUiForCameras() 克隆生成，事件必须在克隆**之后**绑定，
+// 否则 ctrl-apply-2/3、ctrl-auto-2/3 不存在，页面点什么都没反应。
+function bindCameraControlHandlers() {
+  CAMERAS.forEach(cam => {
+    const btn = el('ctrl-apply-' + cam);
+    if (btn) btn.onclick = () => applyCameraControls(cam);
+    const auto = el('ctrl-auto-' + cam);
+    if (auto) auto.onchange = () => {
+      const exp = el('ctrl-exp-' + cam);
+      const info = camControlInfo[cam] || {};
+      const manual = ((info.exposure || {}).manual_supported !== false);
+      exp.disabled = auto.checked || !manual;
+    };
+  });
+}
 
 // ---------- 操作 ----------
 el('btn-start').onclick = async () => {
@@ -1162,6 +1166,7 @@ window.addEventListener('beforeunload', () => {
 });
 
 expandUiForCameras();
+bindCameraControlHandlers();
 buildPanels();
 refresh();
 ensureCalibSession();

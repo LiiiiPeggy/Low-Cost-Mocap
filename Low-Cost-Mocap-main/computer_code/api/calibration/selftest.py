@@ -1418,6 +1418,9 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
           and "外参帧数 " in html)
     check("相机2/3 的 180° 复选框插在已确认之前",
           "confirmedRow.parentNode.insertBefore(node, confirmedRow)" in html)
+    check("相机2/3 曝光/增益控件在克隆之后绑定事件",
+          "function bindCameraControlHandlers()" in html
+          and "bindCameraControlHandlers();" in html)
     check("标定实时图为相机2/3 克隆相机1 的 figure",
           "figs[1]" in html and "c-img1" in html)
 

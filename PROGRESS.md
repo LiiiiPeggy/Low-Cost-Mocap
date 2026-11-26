@@ -58,6 +58,16 @@ python -m led.selftest
 - 清理：删除旧版全局兼容结果 `api/calibration/calibration.json` 及对应读写代码；删除原作者 `index.py`/`helpers.py`/`KalmanFilter`/`LowPassFilter`/`Singleton`/`test.py`、React/Vite 网页、ESP32 固件和旧相机参数文件。
 - 运行产物 `captures/` 已被 `.gitignore` 忽略。
 
+## 2026-11-26 8 Hz 与图像撕裂排查（main）
+
+- 现象：四路 NV12 1280×720@30 中相机 0 为 30 fps，相机 1–3 为 8.0 fps，且 1–3 画面出现横向撕裂/矩形错位。
+- 复现：绕过 Flask/同步/LED，单相机直连 Media Foundation 逐帧抓取并保存原始灰度 PNG。相机 1–3 的曝光均为 **-3（2^-3 s = 125 ms）**，帧间隔实测 **125.0 ms = 8.00 fps**；125 ms 下 60 帧中 46 帧检测到横向断裂，撕裂出现在驱动交付的 NV12 数据里（解码前后一致）。
+- 解码核对：`MF_MT_DEFAULT_STRIDE` 返回 0，代码回退 stride=1280；buffer CurrentLength = 1,382,400 = 1280×720×1.5，Y 平面 921,600 字节，`reshape(720,1280)` 正确。不是 stride/格式/拷贝问题。
+- 对照：曝光 -8（3.9 ms）120 帧仅 3 帧底边固定亮线误报；曝光 -6（15.6 ms）与 -5（31.25 ms）四路均约 30 fps，保存的灰度 PNG 无撕裂。**8 fps 与撕裂均由 125 ms 长曝光引起，属相机/驱动在该低帧率下的行为，不是软件限频或带宽问题。**
+- 30 fps 需要曝光 ≤ 1/30 s：-5（31.25 ms）是仍能跑满 30 fps 的最亮档；本次将四路设为 -5、增益 63，画面比 -3 暗，需要更亮时只能补红外灯（增益已到 63）。
+- 同时修复 main 上的界面 bug：`ctrl-apply-2/3`、`ctrl-auto-2/3` 在 `expandUiForCameras()` 克隆之前绑定，导致相机 2/3 的“应用”按钮无事件。改为 `bindCameraControlHandlers()` 在克隆后调用，并加入自检。
+- 自检：`calibration.selftest` 162/162、`led.selftest` 76/76。
+
 ## 遗留问题与下一步
 
 1. **复核安装几何**：四台解出的中心相距 ≤0.17 m、相机 0/1 基线仅 80 mm，与“相机分布在不同位置”的预期不符；先在三维视图里核对相机位置/朝向是否与实际一致。
