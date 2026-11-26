@@ -392,30 +392,18 @@
         <span class="hintline">DirectShow UVC · 每台相机独立保存</span>
         <button id="ctrl-refresh">刷新设备状态</button>
         <button id="ctrl-restore">恢复上次保存</button>
-      </div>
-      <div class="row" id="ctrl-help">
-        <span class="hintline"><b>曝光</b>（-13…-1，单位 log2 秒）：
-          <b>要稳定跑满 30 fps，曝光取 -5 ~ -13</b>。其中 -5 = 31.25 ms，是这组里最亮的一档；
-          数值越小画面越暗，帧率仍为相机上限 30 fps。
-          <b>数值越大曝光越长、画面越亮，但帧率会被压低</b>：-4 ≈ 62.5 ms（约 16 fps）、
-          -3 ≈ 125 ms（8 fps）、-1 ≈ 0.5 s（约 2 fps）；长曝光下该相机还会出现画面撕裂。
-          参考：-5 = 31.25 ms，-6 = 15.6 ms，-8 = 3.9 ms，-10 = 0.98 ms，-13 = 0.12 ms。</span>
-        <span class="hintline"><b>增益</b>（0…63，仅手动）：
-          <b>数值越大</b> → 电子放大越强、画面越亮，但噪点更多、暗部可能出现虚假亮斑；
-          <b>数值越小</b> → 画面越暗、噪声越小。增益不改变曝光时间和拖影。
-          作用类似相机的 <b>ISO 感光度</b>（只放大信号），但这里的 0–63 是设备索引，
-          <b>不是 ISO 数值</b>。30 fps 下亮度不足时优先加红外补光；增益到 63 后无法再靠它提亮。</span>
+        <span class="hintline">曝光 -6~-13 跑满 30 fps（-6 最亮；越大越亮但帧率下降）；增益 0–63 越大越亮、噪点越多</span>
       </div>
       <div class="led-cam-controls" id="led-controls">
         <div class="cam-controls" data-cam="0">
           <b>相机 0</b>
           <label>曝光
-            <input id="ctrl-exp-0" type="number" step="1" title="曝光 log2(秒)：要跑满 30fps 取 -5~-13；数值越大越亮但帧率下降（-3=8fps 且会撕裂）">
+            <input id="ctrl-exp-0" type="number" step="1" title="DirectShow 对数曝光 log2(s)">
             <span class="range" id="ctrl-range-exp-0">范围 —</span>
           </label>
           <label><input type="checkbox" id="ctrl-auto-0"> 自动曝光</label>
           <label>增益
-            <input id="ctrl-gain-0" type="number" step="1" title="增益 0-63：作用类似 ISO，但这是设备索引不是 ISO 数值；越大越亮、噪点越多，不改变曝光时间">
+            <input id="ctrl-gain-0" type="number" step="1" title="DirectShow 增益索引">
             <span class="range" id="ctrl-range-gain-0">范围 —</span>
           </label>
           <label><button id="ctrl-apply-0">应用</button></label>
@@ -424,12 +412,12 @@
         <div class="cam-controls" data-cam="1">
           <b>相机 1</b>
           <label>曝光
-            <input id="ctrl-exp-1" type="number" step="1" title="曝光 log2(秒)：要跑满 30fps 取 -5~-13；数值越大越亮但帧率下降（-3=8fps 且会撕裂）">
+            <input id="ctrl-exp-1" type="number" step="1" title="DirectShow 对数曝光 log2(s)">
             <span class="range" id="ctrl-range-exp-1">范围 —</span>
           </label>
           <label><input type="checkbox" id="ctrl-auto-1"> 自动曝光</label>
           <label>增益
-            <input id="ctrl-gain-1" type="number" step="1" title="增益 0-63：作用类似 ISO，但这是设备索引不是 ISO 数值；越大越亮、噪点越多，不改变曝光时间">
+            <input id="ctrl-gain-1" type="number" step="1" title="DirectShow 增益索引">
             <span class="range" id="ctrl-range-gain-1">范围 —</span>
           </label>
           <label><button id="ctrl-apply-1">应用</button></label>
@@ -993,8 +981,7 @@ function populateCameraControls(controls) {
       const saved = item.saved ? ('上次保存：曝光 ' + item.saved.exposure
         + (item.saved.auto_exposure ? '（自动）' : '（手动）')
         + '，增益 ' + item.saved.gain) : '尚无该设备的保存记录';
-      setCtrlMsg(cam, '30 fps 需曝光 -5~-13（-5 最亮）；越大越亮但帧率下降，'
-        + '长曝光会撕裂。增益越大越亮、噪点越多。' + saved, '');
+      setCtrlMsg(cam, saved, '');
     }
   });
 }
