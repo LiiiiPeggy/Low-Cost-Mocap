@@ -1514,6 +1514,8 @@ setInterval(checkVersion, 2000);
 const cOut = el('c-out');
 let cLiveTimer = null;
 let cLiveBusy = false;
+let cLiveVisible = true;
+let cLiveObserved = false;
 const cLiveUrl = {};
 let cConfirmSuppressed = false; // 改 180°/重新采集后，禁止状态轮询把“已确认”自动勾回去
 let cBackendOnline = null;      // 用于区分“后端没开”和“还没有结果”
@@ -2609,7 +2611,7 @@ function updateFigCaptions() {
 }
 
 async function liveTick() {
-  if (cLiveBusy) return;
+  if (cLiveBusy || !cLiveVisible) return;
   cLiveBusy = true;
   const mode = el('c-vis-mode') ? el('c-vis-mode').value : 'none';
   try {
@@ -2681,8 +2683,17 @@ async function liveTick() {
   finally { cLiveBusy = false; }
 }
 
+// 标定实时图在屏幕外时不轮询：桌面端滚到顶部看相机时不再让角点预览
+// 持续占用 CPU（实测会压低 LED 处理约 20%+）。
 function startCalibLive() {
   updateFigCaptions();
+  const live = document.querySelector('#calib .live');
+  if (live && 'IntersectionObserver' in window && !cLiveObserved) {
+    cLiveObserved = true;
+    new IntersectionObserver((entries) => {
+      cLiveVisible = entries.some(e => e.isIntersecting);
+    }, { threshold: 0.01 }).observe(live);
+  }
   if (cLiveTimer) return;
   cLiveTimer = setInterval(liveTick, 900);
   liveTick();

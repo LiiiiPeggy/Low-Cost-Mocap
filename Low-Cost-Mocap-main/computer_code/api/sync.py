@@ -133,6 +133,9 @@ class SyncService:
         self._recent: deque[GroupRecord] = deque(maxlen=int(recent))
         self._recent_events: deque[str] = deque(maxlen=300)
         self._group_sizes: dict[str, int] = {}
+        # 实测分组/帧速率（最近 2 s），区分“组/秒”和“相机帧/秒”
+        self._group_times: deque[float] = deque(maxlen=self.window)
+        self._group_frames: deque[int] = deque(maxlen=self.window)
 
         # 基线：同步启动那一刻各相机已产出多少帧
         self._base: dict[int, int | None] = {i: None for i in self.indices}
@@ -174,6 +177,8 @@ class SyncService:
             self._recent_events.clear()
             self._base = {i: None for i in self.indices}
             self._group_sizes = {}
+            self._group_times.clear()
+            self._group_frames.clear()
 
     def set_max_dt(self, max_dt_ms: float) -> float:
         v = max(1.0, min(500.0, float(max_dt_ms)))
@@ -307,6 +312,8 @@ class SyncService:
             self._last_group_mono = time.perf_counter()
             key = ",".join(str(c) for c in sorted(group))
             self._group_sizes[key] = self._group_sizes.get(key, 0) + 1
+            self._group_times.append(time.perf_counter())
+            self._group_frames.append(len(group))
             self._recent.append(GroupRecord(
                 group_seq=self._groups_total, frames=dict(group),
                 span_ms=span_ms, created_mono=self._last_group_mono,
@@ -336,6 +343,8 @@ class SyncService:
             recent = list(self._recent)
             recent_events = list(self._recent_events)
             group_sizes = dict(self._group_sizes)
+            group_times = list(self._group_times)
+            group_frames = list(self._group_frames)
 
         stats = {
             "mean": float(span.mean()) if span.size else None,
@@ -344,10 +353,24 @@ class SyncService:
             "min": float(span.min()) if span.size else None,
             "signed_mean": float(signed.mean()) if signed.size else None,
         }
+        now = time.perf_counter()
+        cut = now - 2.0
+        n_recent = sum(1 for t in group_times if t >= cut)
+        frames_recent = sum(n for t, n in zip(group_times, group_frames)
+                            if t >= cut)
+        measured = {
+            "window_s": 2.0,
+            "groups_per_s": round(n_recent / 2.0, 2),
+            "frames_per_s": round(frames_recent / 2.0, 2),
+            "mean_group_size": (round(frames_recent / n_recent, 2)
+                                if n_recent else None),
+            "definition": ("groups_per_s = 每秒生成的同步帧组数；"
+                           "frames_per_s = 这些组包含的相机帧总数/秒，"
+                           "约等于各相机采集帧率之和"),
+        }
         consumed = {i: groups_total + dropped.get(i, 0) for i in self.indices}
         denom = max(consumed.values()) if consumed else 0
 
-        now = time.perf_counter()
         rp = recent_events.count("group")
         rd = {i: recent_events.count("drop_%d" % i) for i in self.indices}
         rden = max([rp + v for v in rd.values()] or [0])
@@ -391,6 +414,7 @@ class SyncService:
             "window_groups": self.window,
             "groups_total": groups_total,
             "groups_in_window": int(span.size),
+            "measured": measured,
             "group_sizes": group_sizes,
             "span_ms": {k: (round(v, 3) if v is not None else None)
                         for k, v in stats.items()},

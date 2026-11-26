@@ -1340,7 +1340,7 @@ class CalibrationService:
             t0 = time.perf_counter()
             # 实时叠加只做显示，用快速检测（SB 默认标志）；真正入库的采集走
             # EXHAUSTIVE|ACCURACY，两者不共用同一个质量等级是有意为之。
-            det = board_mod.detect(small, spec, fast=True)
+            det = board_mod.detect(small, spec, fast=True, preview=True)
             if factor != 1.0 and det.ok and det.corners is not None:
                 det.corners = (det.corners.reshape(-1, 2) / factor).reshape(
                     -1, 1, 2).astype(np.float32)

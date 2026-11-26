@@ -24,6 +24,8 @@
 - 2026-11-26 四相机标定：四台各 12 张内参图，RMS **0.559 / 0.282 / 0.137 / 0.123 px**；fx 约 **647 / 650 / 809 / 809**（相机 2/3 焦距明显不同，说明不是同一镜头配置）。外参由四台各自 solvePnP + 多视角联合检查，`orientation_confirmed=true`，`multi_view` max **2.28 mm**；相机 0/1 基线仅 **80.2 mm**，该对三角化残差 **53.2 mm**（已带警告）。
 - 2026-11-26 相机身份：四台全部 `confirmed=true`。逻辑 1 因换 USB 口/延长线在 `7&2cd17f8e` 与 `7&1a17cee9` 之间变动过，网页改绑后会自动重启该路采集。
 - 2026-11-26 手机端（`mobile_preview`）：新增 `--lan`（监听 0.0.0.0、打印本机 LAN 地址、拒绝与 `--debug` 同用）；手机窄屏自动进入精简布局：顶部三模式（原始/棋盘格/LED）、实测采集/画面/定位帧率、2×2 相机、点按放大、曝光增益、载入内参、完整外参流程（逐台翻转+人工确认）、二维 LED 检测；隐藏身份绑定/内参采集/三维场景/ROI/高级参数/同步诊断，且不启动对应轮询。原始画面改用 fetch 解析 MJPEG（兼容 iOS、可计帧、失败回退快照）；棋盘格预览在 640 宽检测并 100 ms 缓存，避免 10 Hz×4 拖垮 CPU。
+- 2026-11-26 合并 main：`origin/main` 仍为 `81bd62c`，没有新提交（JPEG 快照修复 `ff9b99b` 与手机端 `4ff3fe8` 都在 `mobile_preview` 上），`git merge main` 为 Already up to date，无冲突。已创建备份分支 `mobile_preview-backup-4ff3fe8`。
+- 2026-11-26 帧率口径与轻量优化：`/api/sync/status` 新增 `measured.groups_per_s / frames_per_s / mean_group_size`（最近 2 s）；组/秒可高于相机 30 Hz，因为 2 相机组占多数，`frames_per_s` ≈ 各相机采集帧率之和，同一帧只被消费一次；LED `fps.process` 是处理组数/秒，`fps.locate` 是 tracking 输出/秒（未定位时为 0）。棋盘格实时预览改为 `preview=True` 只尝试 SB 正常/反相（无板时更快）；桌面标定实时图在屏幕外暂停轮询，避免持续压低 LED 处理。
 - 2026-11-26 手机端性能实测（四相机、40 s/组）：无页面 LED 处理 41.5 组/s；仅手机原始 42.5；电脑+手机 39.5（-4.8%）；手机棋盘格 10 Hz ×4 39.5（-4.8%）；手机 LED 10 Hz ×4 40.5（-2.4%）；相机均约 30 fps。仅电脑打开桌面页（含原有 0.9 s 角点预览）时 LED 30.5（-26%），属桌面页既有开销，移动端不改其行为。
 - 本轮代码精简：合并 LED 参数/跟踪重置/诊断/叠加图重复逻辑，统一标定检测分类与 JSON 载入，收紧前端重复事件与无效状态，合并测试中的假相机和几何辅助代码。
 - 自检（2026-11-26 在本机复跑确认）：
@@ -59,6 +61,10 @@ python -m led.selftest
 - 文档：`README.md` 同步到当前实现；`memory.md` 重命名为 `MEMORY.md`，新增 `AGENTS.md`、`PROGRESS.md`、`PROCESS.md`、`CLAUDE.md`。
 - 清理：删除旧版全局兼容结果 `api/calibration/calibration.json` 及对应读写代码；删除原作者 `index.py`/`helpers.py`/`KalmanFilter`/`LowPassFilter`/`Singleton`/`test.py`、React/Vite 网页、ESP32 固件和旧相机参数文件。
 - 运行产物 `captures/` 已被 `.gitignore` 忽略。
+
+## 当前环境注意
+
+- 2026-11-26 复查时相机曝光被设为 **-1（约 0.5 s）/ 增益 63**，四路只有约 2 fps，帧周期 0.5 s 远大于 20 ms 同步门限，因此同步组与 LED 处理均为 0；性能对比需恢复短曝光（如 -8/-10）后重测。本次未改动用户的曝光/增益设置。
 
 ## 遗留问题与下一步
 

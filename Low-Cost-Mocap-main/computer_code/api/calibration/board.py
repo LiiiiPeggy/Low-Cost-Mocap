@@ -251,17 +251,27 @@ def _classic(gray: np.ndarray, spec: BoardSpec):
 
 
 def detect(gray: np.ndarray, spec: BoardSpec, *, fast: bool = False,
-           allow_inverted: bool = True) -> Detection:
-    """单张图检测。返回的角点坐标对应传入图像的原始像素坐标。"""
+           allow_inverted: bool = True, preview: bool = False) -> Detection:
+    """单张图检测。返回的角点坐标对应传入图像的原始像素坐标。
+
+    ``preview=True`` 只用于实时预览：只尝试 SB（正常/反相）两种，跳过较慢的
+    ``findChessboardCorners`` 兜底。正式采集/入库仍用默认的完整尝试顺序。
+    """
     try:
         g = _as_gray(gray)
     except ValueError as exc:
         return Detection(False, reason=str(exc))
 
     inv = np.ascontiguousarray(255 - g)
-    attempts = [("sb", g, "normal"), ("classic", g, "normal")]
-    if allow_inverted:
-        attempts += [("sb-inverted", inv, "inverted"), ("classic-inverted", inv, "inverted")]
+    if preview:
+        attempts = [("sb", g, "normal")]
+        if allow_inverted:
+            attempts.append(("sb-inverted", inv, "inverted"))
+    else:
+        attempts = [("sb", g, "normal"), ("classic", g, "normal")]
+        if allow_inverted:
+            attempts += [("sb-inverted", inv, "inverted"),
+                         ("classic-inverted", inv, "inverted")]
 
     reasons = []
     for name, img, polarity in attempts:
