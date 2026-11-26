@@ -162,8 +162,20 @@ def cameras_config_set():
         return jsonify({"error": "没有要修改的字段"}), 400
     try:
         cfg = camera_config.update(index, patch)
-        return jsonify({"ok": True, "path": cfg.get("path"),
-                        "cameras": camera_config.resolve(cfg)})
+        out = {"ok": True, "path": cfg.get("path"),
+               "cameras": camera_config.resolve(cfg),
+               "restarted": False}
+        # 这台相机正在运行：按新绑定/格式立即重启 worker，不必重启整个服务。
+        worker = manager().worker(index)
+        if worker is not None:
+            entry = camera_config.entry(index)
+            if entry:
+                try:
+                    manager().start([entry])
+                    out["restarted"] = True
+                except Exception as exc:
+                    out["restart_error"] = str(exc).strip().splitlines()[-1]
+        return jsonify(out)
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:
@@ -320,9 +332,12 @@ def cameras_start():
         return jsonify({"error": str(exc)}), 409
     except Exception as exc:
         return jsonify({"error": "%s: %s" % (type(exc).__name__, exc)}), 500
-    # 新会话：清空配对指针与统计（相机 seq 从 1 重新计数）
+    # 新会话：清空配对指针与统计（相机 seq 从 1 重新计数）。
+    # 部分启动（例如只重启相机1）时，同步必须继续覆盖所有在跑的相机，
+    # 不能只登记本次传入的子集，否则帧组会停摆。
     try:
-        sync_service().set_indices(indices)
+        running = [w.index for w in manager().workers()]
+        sync_service().set_indices(running or indices)
         sync_service().reset_pointers()
     except Exception:
         pass
