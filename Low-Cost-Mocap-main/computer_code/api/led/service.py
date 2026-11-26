@@ -46,10 +46,8 @@ DEFAULT_DEBUG_ROOT = os.path.join(os.path.dirname(DEFAULT_SESSION_ROOT),
 MAX_PAIR_AGE_S = 0.5
 MAX_TRAJECTORY = 300
 OVERLAY_SCALE = 0.6
-ROI_TRACK_PAD_PX = 80
-ROI_MAX_MISS = 12
 PARAMS_SCHEMA = "lowcost-mocap/led-params"
-CAMS = (0, 1, 2, 3)      # 参数/ROI 容器支持最多 4 台逻辑相机
+CAMS = (0, 1, 2, 3)      # 参数容器支持最多 4 台逻辑相机
 
 
 def _now_iso() -> str:
@@ -66,7 +64,6 @@ def _empty_detection() -> dict:
         "count": 0, "raw_count": 0, "status": "idle", "reason": "二维检测未启动",
         "leds": [], "rejected": [], "warnings": [],
         "overexposed": False, "unresolved_count": 0,
-        "roi": None, "roi_mode": "full", "roi_fallback": False,
     }
 
 
@@ -108,43 +105,7 @@ def _slim_detection(det: dict | None) -> dict:
         "warnings": list(det.get("warnings") or []),
         "overexposed": bool(det.get("overexposed")),
         "unresolved_count": int(det.get("unresolved_count", 0)),
-        "roi": det.get("roi"),
-        "roi_mode": det.get("roi_mode", "full"),
-        "roi_fallback": bool(det.get("roi_fallback")),
     }
-
-
-def _validate_rois(raw) -> dict:
-    """校验手动 ROI（归一化 0..1）。None/空表示整幅图。"""
-    if raw is None:
-        return {"0": None, "1": None}
-    if not isinstance(raw, dict):
-        raise ValueError("rois 必须是 JSON 对象，例如 {\"0\": [x0,y0,x1,y1]}")
-    out = {"0": None, "1": None}
-    for c in CAMS:
-        item = raw.get(str(c), raw.get(c))
-        if item in (None, "", [], {}):
-            continue
-        if isinstance(item, dict):
-            vals = [item.get(k) for k in ("x0", "y0", "x1", "y1")]
-        else:
-            try:
-                vals = list(item)
-            except TypeError:
-                raise ValueError("相机 %d ROI 必须是 [x0,y0,x1,y1]" % c)
-        if len(vals) != 4 or any(v is None for v in vals):
-            raise ValueError("相机 %d ROI 必须是 4 个数 [x0,y0,x1,y1]" % c)
-        try:
-            x0, y0, x1, y1 = [float(v) for v in vals]
-        except (TypeError, ValueError):
-            raise ValueError("相机 %d ROI 必须是数字" % c)
-        if not all(0.0 <= v <= 1.0 for v in (x0, y0, x1, y1)):
-            raise ValueError("相机 %d ROI 必须在 0..1 的归一化坐标内" % c)
-        if x1 - x0 < 0.02 or y1 - y0 < 0.02:
-            raise ValueError("相机 %d ROI 太小（至少占画面 2%%）" % c)
-        out[str(c)] = [round(x0, 6), round(y0, 6),
-                       round(x1, 6), round(y1, 6)]
-    return out
 
 
 def _compact_diag(diag: dict | None) -> dict | None:
@@ -168,19 +129,6 @@ def _compact_diag(diag: dict | None) -> dict | None:
             for d in row if d <= diag.get("epipolar_tol_px", 5.0))}
             for k, v in pairs.items()}
     return out
-
-
-def _roi_norm_to_px(norm, shape) -> list[int] | None:
-    if not norm:
-        return None
-    h, w = int(shape[0]), int(shape[1])
-    x0 = max(0, min(w - 1, int(round(float(norm[0]) * w))))
-    y0 = max(0, min(h - 1, int(round(float(norm[1]) * h))))
-    x1 = max(x0 + 1, min(w, int(round(float(norm[2]) * w))))
-    y1 = max(y0 + 1, min(h, int(round(float(norm[3]) * h))))
-    if x1 - x0 < 8 or y1 - y0 < 8:
-        return None
-    return [x0, y0, x1 - x0, y1 - y0]
 
 
 def _build_calibration(snapshot: dict, cameras=None) -> dict:
@@ -307,11 +255,6 @@ class LedService:
         self._params_path = DEFAULT_PARAMS_PATH
         self._global_params = default_params()
         self._overrides = {str(c): {} for c in CAMS}
-        self._rois = {str(c): None for c in CAMS}
-        self._roi_tracking = True
-        self._roi_track = {str(c): None for c in CAMS}
-        self._roi_miss = {str(c): 0 for c in CAMS}
-        self._roi_force_full = {str(c): False for c in CAMS}
         # 逻辑编号 ↔ 物理设备由 camera_config.json 固定；不再运行时猜测映射。
         self._last_diag = None
         self._params_updated = None
@@ -347,8 +290,6 @@ class LedService:
                 str(c): validate_params(overrides.get(str(c)) or {}, partial=True)
                 for c in CAMS if isinstance(overrides.get(str(c)) or {}, dict)
             }
-            self._rois = _validate_rois(data.get("rois"))
-            self._roi_tracking = bool(data.get("roi_tracking", True))
             self._params_updated = data.get("updated")
         except Exception as exc:
             self._params_warning = ("led_params.json 读取失败，使用默认参数：%s"
@@ -360,8 +301,6 @@ class LedService:
             "updated": _now_iso(),
             "params": self._global_params,
             "overrides": self._overrides,
-            "rois": self._rois,
-            "roi_tracking": self._roi_tracking,
         }
         atomic_json_write(self._params_path, payload)
         self._params_updated = payload["updated"]
@@ -372,7 +311,6 @@ class LedService:
 
     def _reset_runtime_after_params_locked(self, *, clear_warning: bool) -> None:
         self._last_diag = None
-        self._clear_track_rois()
         self._param_version += 1
         self._force_reprocess = True
         if clear_warning:
@@ -405,17 +343,9 @@ class LedService:
             # 空字符串/None 视为“未覆盖”
             clean = {k: v for k, v in item.items() if v not in (None, "")}
             overrides[str(c)] = validate_params(clean, partial=True) if clean else {}
-        rois = self._rois
-        if "rois" in payload:
-            rois = _validate_rois(payload.get("rois"))
-        roi_tracking = self._roi_tracking
-        if "roi_tracking" in payload:
-            roi_tracking = bool(payload.get("roi_tracking"))
         with self._lock:
             self._global_params = global_params
             self._overrides = overrides
-            self._rois = rois
-            self._roi_tracking = roi_tracking
             self._reset_runtime_after_params_locked(clear_warning=True)
         return self._persist_params()
 
@@ -423,8 +353,6 @@ class LedService:
         with self._lock:
             self._global_params = default_params()
             self._overrides = {str(c): {} for c in CAMS}
-            self._rois = {str(c): None for c in CAMS}
-            self._roi_tracking = True
             self._reset_runtime_after_params_locked(clear_warning=False)
         return self._persist_params()
 
@@ -434,8 +362,6 @@ class LedService:
             "params": copy.deepcopy(self._global_params),
             "overrides": copy.deepcopy(self._overrides),
             "effective": {str(c): self.effective_params(c) for c in CAMS},
-            "rois": copy.deepcopy(self._rois),
-            "roi_tracking": bool(self._roi_tracking),
             "cameras": (list(self._calib.get("cameras")) if self._calib else None),
             "path": project_relative(self._params_path),
             "exists": os.path.isfile(self._params_path),
@@ -476,56 +402,6 @@ class LedService:
                 self._last_diag = None
         return active, changed
 
-    # ------------------------------------------------------------------
-    # ROI：手动归一化 ROI + 匹配后的动态跟踪 ROI
-    # ------------------------------------------------------------------
-    def _roi_for(self, camera: int, shape) -> tuple[list[int] | None, str]:
-        key = str(int(camera))
-        h, w = int(shape[0]), int(shape[1])
-        if self._roi_force_full.get(key):
-            return None, "full_search"
-        if self._roi_tracking:
-            box = self._roi_track.get(key)
-            if box:
-                x, y, rw, rh = [int(v) for v in box]
-                pad = ROI_TRACK_PAD_PX
-                x0 = max(0, x - pad)
-                y0 = max(0, y - pad)
-                x1 = min(w, x + rw + pad)
-                y1 = min(h, y + rh + pad)
-                if x1 - x0 >= 8 and y1 - y0 >= 8:
-                    return [x0, y0, x1 - x0, y1 - y0], "track"
-        manual = _roi_norm_to_px(self._rois.get(key), shape)
-        if manual:
-            return manual, "manual"
-        return None, "full"
-
-    def _detect_camera(self, gray, params: dict, camera: int,
-                       need: int) -> dict:
-        """先按 ROI 检测；ROI 结果不足时回退全图搜索一次。"""
-        roi, mode = self._roi_for(camera, gray.shape)
-        det = detect_leds(gray, params, roi=roi)
-        det["roi_mode"] = mode
-        det["roi_fallback"] = False
-        if mode not in ("full", "full_search") and int(det.get("count") or 0) < int(need):
-            full = detect_leds(gray, params)
-            full["roi_mode"] = "full_fallback"
-            full["roi_fallback"] = True
-            if int(full.get("count") or 0) > int(det.get("count") or 0):
-                det = full
-            else:
-                # 全图也没有更多候选：保留 ROI 结果，但标记已经搜索过
-                det["roi_fallback"] = True
-        # 一次强制全图搜索只持续一帧
-        if self._roi_force_full.get(str(int(camera))):
-            self._roi_force_full[str(int(camera))] = False
-        return det
-
-    def _clear_track_rois(self) -> None:
-        self._roi_track = {str(c): None for c in CAMS}
-        self._roi_miss = {str(c): 0 for c in CAMS}
-        self._roi_force_full = {str(c): False for c in CAMS}
-
     def _reset_tracking_locked(self, *, new_tracker: bool = False) -> None:
         if new_tracker:
             self._tracker = LedKalmanTracker()
@@ -534,50 +410,6 @@ class LedService:
         self._tracker_state = "idle"
         self._last_led_points = None
         self._trajectory = []
-
-    def _update_track_rois(self, dets: dict, match: dict) -> None:
-        if not self._roi_tracking:
-            return
-        per_cam: dict[int, list] = {}
-        for m in match.get("matches") or []:
-            for cam_s, idx in (m.get("obs") or {}).items():
-                cam = int(cam_s)
-                leds = (dets.get(cam) or {}).get("leds") or []
-                if isinstance(idx, int) and 0 <= idx < len(leds):
-                    per_cam.setdefault(cam, []).append(
-                        (float(leds[idx]["x"]), float(leds[idx]["y"])))
-        for cam, pts in per_cam.items():
-            if len(pts) < 3:
-                continue
-            det = dets.get(cam) or {}
-            size = det.get("image_size") or [0, 0]
-            h, w = int(size[1]), int(size[0])
-            if w <= 0 or h <= 0:
-                continue
-            xs = [p[0] for p in pts]
-            ys = [p[1] for p in pts]
-            pad = ROI_TRACK_PAD_PX
-            x0 = max(0, int(round(min(xs))) - pad)
-            y0 = max(0, int(round(min(ys))) - pad)
-            x1 = min(w, int(round(max(xs))) + pad)
-            y1 = min(h, int(round(max(ys))) + pad)
-            if x1 - x0 >= 8 and y1 - y0 >= 8:
-                self._roi_track[str(cam)] = [x0, y0, x1 - x0, y1 - y0]
-                self._roi_miss[str(cam)] = 0
-                self._roi_force_full[str(cam)] = False
-
-    def _note_match_failure(self) -> None:
-        for c in self._active_cameras():
-            key = str(c)
-            self._roi_miss[key] = self._roi_miss.get(key, 0) + 1
-            if self._roi_miss[key] > ROI_MAX_MISS:
-                self._roi_track[key] = None
-            self._roi_force_full[key] = True
-
-    def _roi_state_locked(self) -> dict:
-        out = {"tracking": bool(self._roi_tracking),
-               "manual": copy.deepcopy(self._rois)}
-        return out
 
     def _active_cameras(self) -> list[int]:
         """当前配置里实际在采样的逻辑相机编号。"""
@@ -619,7 +451,6 @@ class LedService:
         with self._lock:
             self._detect = True
             self._force_reprocess = True
-            self._clear_track_rois()
             if not self._locate:
                 self._state = self._idle_state()
                 self._state.update({"detect_enabled": True, "status": "waiting_sync",
@@ -635,7 +466,6 @@ class LedService:
             self._locate = False
             self._stop.set()
             self._reset_tracking_locked()
-            self._clear_track_rois()
             self._raw = {c: None for c in CAMS}
             self._det_internal = {c: None for c in CAMS}
             self._state = self._idle_state()
@@ -655,7 +485,6 @@ class LedService:
         with self._lock:
             self._locate = True
             self._reset_tracking_locked(new_tracker=True)
-            self._clear_track_rois()
             self._last_diag = None
             self._last_error = ""
             self._last_calib_check = time.perf_counter()
@@ -678,7 +507,6 @@ class LedService:
         with self._lock:
             self._locate = False
             self._reset_tracking_locked()
-            self._clear_track_rois()
             self._state.update({
                 "locate_enabled": False, "valid": False,
                 "status": "detecting" if self._detect else "stopped",
@@ -761,14 +589,13 @@ class LedService:
             calib = self._calib
         cams = [int(c) for c in rec.cameras]
         params = {c: self.effective_params(c) for c in cams}
-        need = 3 if locate else 1
 
         dets, raws = {}, {}
         t_det = 0.0
         for c in cams:
             frame = rec.frames[c]
             t0 = time.perf_counter()
-            dets[c] = self._detect_camera(frame.gray, params[c], c, need)
+            dets[c] = detect_leds(frame.gray, params[c])
             t_det += time.perf_counter() - t0
             raws[c] = np.ascontiguousarray(frame.gray).copy()
 
@@ -798,7 +625,6 @@ class LedService:
                     self._tracker.reset()
                     self._tracker_state = "idle"
                     self._trajectory = []
-                    self._clear_track_rois()
                 self._store_result(
                     rec, dets, raws, t_start,
                     status="calibration_invalid",
@@ -828,7 +654,6 @@ class LedService:
                 self._tracker.reset()
                 self._tracker_state = "idle"
                 self._trajectory = []
-                self._clear_track_rois()
             self._store_result(
                 rec, dets, raws, t_start, status="calibration_invalid",
                 reason="；".join(size_problems.values())
@@ -859,7 +684,6 @@ class LedService:
             self._tracker_state = upd["state"]
             stage_ms["track_ms"] = round((time.perf_counter() - t0) * 1000.0, 2)
             with self._lock:
-                self._update_track_rois(dets, match)
                 self._last_led_points = [l["xyz"] for l in match["leds"]]
                 self._trajectory.append(upd["position"])
                 if len(self._trajectory) > MAX_TRAJECTORY:
@@ -873,8 +697,6 @@ class LedService:
                          "reacquired": upd.get("reacquired", False)},
                 stage_ms=stage_ms)
         else:
-            with self._lock:
-                self._note_match_failure()
             pred = self._tracker.predict(rec.created_mono)
             self._tracker_state = pred["state"]
             if pred["state"] == "predicted":
@@ -895,7 +717,6 @@ class LedService:
                 with self._lock:
                     self._trajectory = []
                     self._last_led_points = None
-                    self._clear_track_rois()
                 self._store_result(
                     rec, dets, raws, t_start,
                     status="lost",
@@ -955,7 +776,6 @@ class LedService:
                 },
                 "detections": {str(c): _slim_detection(dets.get(c))
                                for c in cams},
-                "roi": self._roi_state_locked(),
                 "matches": list(m.get("matches") or []),
                 "leds": list(m.get("leds") or []) if shown else [],
                 "cameras_used": list(m.get("cameras_used") or []),
@@ -1036,7 +856,6 @@ class LedService:
             "status": "idle", "valid": False, "reason": "未启动",
             "pair": None,
             "detections": {"0": _empty_detection(), "1": _empty_detection()},
-            "roi": self._roi_state_locked(),
             "matches": [], "leds": [], "raw_center": None,
             "filtered_center": None, "velocity": None,
             "edges_mm": None, "edge_errors_mm": None, "expected_edges_mm": None,
@@ -1171,8 +990,6 @@ class LedService:
                      else (dets_full[c]["mask"]).copy()) for c in present}
         dets = {c: copy.deepcopy(_strip_mask(dets_full.get(c)))
                 for c in present}
-        rois = copy.deepcopy(self._rois)
-        roi_tracking = bool(self._roi_tracking)
         diagnosis = self._diagnose_snapshot(snap)
         diagnosis.update({"pair": state.get("pair"),
                           "status": state.get("status"),
@@ -1214,7 +1031,6 @@ class LedService:
             "cameras": present,
             "detections": {str(c): dets[c] for c in present},
             "params": state.get("params"),
-            "rois": rois, "roi_tracking": roi_tracking,
             "pair": state.get("pair"),
             "calibration": state.get("calibration"),
             "status": state.get("status"),
@@ -1315,21 +1131,10 @@ class LedService:
         H, W = raw.shape[:2]
         accepted = det.get("leds") or []
         raw_comps = det.get("raw_components") or []
-        roi = det.get("roi")
-        roi_mode = det.get("roi_mode") or "full"
         epi_info = None
 
         def pt(p):
             return (int(round(float(p[0]))), int(round(float(p[1]))))
-
-        # ROI 框：手动 ROI 用青色，动态跟踪 ROI 用橙色
-        if roi and view != "epipolar":
-            x, y, w, h = [int(v) for v in roi]
-            color = (0, 180, 255) if roi_mode == "track" else (255, 255, 0)
-            cv2.rectangle(canvas, (x, y), (x + w, y + h), color, 1)
-            cv2.putText(canvas, "ROI " + ("track" if roi_mode == "track" else "manual"),
-                        (x + 3, max(11, y - 3)), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.36, color, 1, cv2.LINE_AA)
 
         if view == "detect":
             # 1) 原始连通域：很小的蓝色十字，不带文字，避免刷屏
@@ -1437,7 +1242,7 @@ class LedService:
             epi_draw = {"lines": lines, "points": points, "info": epi_info,
                         "cam": cam, "other": other_cam}
 
-        # 局部放大：以匹配点/ROI 为中心裁剪，再缩放到显示尺寸
+        # 局部放大：以匹配点为中心裁剪，再缩放到显示尺寸
         focus = None
         if view == "epipolar" and accepted:
             focus = (float(np.mean([d["x"] for d in accepted])),
@@ -1450,8 +1255,6 @@ class LedService:
                     ys.append(float(accepted[idx]["y"]))
             if xs:
                 focus = (sum(xs) / len(xs), sum(ys) / len(ys))
-        if focus is None and roi:
-            focus = (roi[0] + roi[2] / 2.0, roi[1] + roi[3] / 2.0)
         if focus is None:
             focus = (W / 2.0, H / 2.0)
 
@@ -1489,9 +1292,7 @@ class LedService:
             info_lines[0] += "  unresolved=%d" % det["unresolved_count"]
         if det.get("overexposed"):
             info_lines[0] += "  OVEREXPOSED"
-        line2 = "status=%s  roi=%s" % (det.get("status", "?"), roi_mode)
-        if det.get("roi_fallback"):
-            line2 += " (full search used)"
+        line2 = "status=%s" % det.get("status", "?")
         if zoom > 1.0:
             line2 += "  zoom=%.1fx" % zoom
         info_lines.append(line2)
@@ -1536,8 +1337,6 @@ class LedService:
             "count": len(accepted), "raw_count": len(raw_comps),
             "matched": len(matched_map),
             "status": det.get("status"),
-            "roi_mode": roi_mode,
-            "roi_fallback": bool(det.get("roi_fallback")),
         }
 
     def overlay_group(self, *, view: str = "detect",
@@ -1721,10 +1520,10 @@ def _draw_info_panel(out, lines, colors, *, font_scale: float = 0.4,
     x1 = min(width, right + 3)
     y1 = min(height, bottom + 3)
     if x1 > x0 and y1 > y0:
-        roi = out[y0:y1, x0:x1]
-        dark = roi.copy()
+        region = out[y0:y1, x0:x1]
+        dark = region.copy()
         cv2.rectangle(dark, (0, 0), (x1 - x0, y1 - y0), (0, 0, 0), -1)
-        cv2.addWeighted(dark, alpha, roi, 1.0 - alpha, 0, roi)
+        cv2.addWeighted(dark, alpha, region, 1.0 - alpha, 0, region)
     for k, (line, (w, h)) in enumerate(zip(lines, sizes)):
         y = top + line_h * k + h
         x = max(2, right - w)

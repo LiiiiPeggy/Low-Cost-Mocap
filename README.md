@@ -250,7 +250,7 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 | POST | `/api/calib/save` | 写当前会话 `calibration.json`；可选 `path` 额外导出 |
 | GET | `/api/calib/result` · `/api/calib/matrices` | 查看结果 / 取下游矩阵 |
 | GET | `/api/version` | Git SHA / 分支 / dirty / 启动时间 |
-| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` · `/record/start` 等 | LED 检测、参数、ROI、调试保存、连续录制与三维定位 |
+| GET/POST | `/api/led/state` · `/params` · `/detect/start` · `/locate/start` · `/record/start` 等 | LED 检测、参数、调试保存、连续录制与三维定位 |
 | GET/POST | `/api/cameras/controls` | UVC 曝光/自动曝光/增益范围、当前值、设置与读回验证；POST `/controls/restore` 恢复保存值 |
 | GET | `/api/led/overlay_pair` · `/api/led/diagnose` | 同一帧组的多相机叠加图（`view=detect|binary|raw|undistort|epipolar`，`pair=a,b` 选极线相机对）；多视角匹配诊断 |
 | POST | `/api/calib/session/ensure` | 页面初始化幂等会话：已有复用，没有才创建 |
@@ -260,15 +260,15 @@ python api\calib_cli.py save --session <会话> --validate --orientation-confirm
 ```bat
 conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code\api
-python -m calibration.selftest   :: 156/156
-python -m led.selftest           :: 76/76
+python -m calibration.selftest   :: 163/163
+python -m led.selftest           :: 72/72
 ```
 
 `calibration.selftest` 用已知 `K/D/R/T` 按真实畸变模型反向渲染虚拟棋盘格，再走正式代码求解；
 同时用合成数据/假相机覆盖 IPPE 物理筛选、HTTP/CLI 采集、自动保存/载入、结果失效、会话结果、
 LED UI 与版本接口等流程。`led.selftest` 覆盖光斑检测、粘连拆分、过曝拒绝、细长反光过滤、
-ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存、连续录制与接口。
-最近一次（2026-11-24）：**156/156 + 76/76 通过**。
+极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟踪、同帧对叠加图、matched=0 极线视图、调试帧保存、连续录制与接口。
+最近一次（2026-11-26）：**163/163 + 72/72 通过**。
 两者都只证明求解链路与流程，**不是实机精度**。
 
 ### 红外 LED 检测与三维定位（第二阶段）
@@ -278,10 +278,9 @@ ROI、极线/三角化、34/79/79 mm 三边、自动相机映射、卡尔曼跟�
 - **二维检测**：阈值 + 连通域/面积/solidity/填充率/长宽比过滤；距离变换局部峰值拆分粘连光斑，拆分块至少占父亮区 15%；完全饱和/不可分的亮区标记为 unresolved/overexposed，不伪造三点；原始灰度强度加权亚像素中心；分别输出原始连通域和筛选候选。
 - **多视角定位**：任意相机对先做极线距离筛选（向量化矩阵），双视角 DLT 三角化 + 正深度 + 重投影；把其它相机中重投影一致的观测加入同一 3D 假设，再联合 DLT 精化；按 3D 距离合并重复假设。**每个 LED 可以使用不同的有效相机组合**，不要求每台相机都看到三个 LED。最后检查三边 34/79/79 mm 与多相机绕向一致。L0 是两条 79 mm 边的公共顶点。
 - **相机身份**：逻辑编号与 USB 设备实例固定绑定，不再运行时猜测 `live0↔calib0` 排列；标定参数按逻辑编号直接对应。
-- **ROI**：每台相机可设归一化手动 ROI；匹配后动态跟踪 ROI（+80 px），连续失败 12 帧清除并全图重搜；ROI 不足 3 点自动全图回退。
 - **极线诊断视图**：不依赖最终 matches；选择任意相机对，绘制另一路每个候选的极线，同色标记来源，距离表显示最小极线距离与 OK/FAIL。匹配门槛不变。
 - **去畸变视图**：每台相机用自己的 K/D 做 `cv2.undistort`，保持原始宽高比；没有内参时明确提示。该视图只用于观察，LED/棋盘格检测仍用原始灰度图，三角化时像素只去畸变一次。
-- **信息布局**：相机编号、候选/匹配数量、状态、ROI、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
+- **信息布局**：相机编号、候选/匹配数量、状态、帧对、Δt 统一放在每台图像**右下角**，按显示尺寸和文字宽度动态右对齐，带半透明深色背景；左下角保留颜色图例，局部放大后仍自适应。
 - **三维方向**：有效跟踪时，从灯板几何中心沿“短边中点 → L0”画橙色箭头；预测/丢失状态不画。该方向不是机器人航向角。相机模型与视锥体绘制尺寸为原来的 50%，相机坐标和基线不变。
 - **连续调试录制**：在“保存调试帧”旁点 **开始录制/停止录制**。录制线程只轮询现有 `sync_service().recent_groups()`（不新开相机、不重复同步），写盘线程按帧组保存**每台相机**的原始灰度 PNG 和对应诊断 JSONL；某台相机缺失时按缺失记录，不用旧图填充；未经过 LED 处理的帧组仍保存图像并标记 `not_processed`。输出到 `captures/led_recordings/YYYYMMDD_HHMMSS/`（`session.json`、`frames.jsonl`、`frames/000001_cam0..3.png`）。PNG 编码用 4 线程并行（实测约 3× 单线程）；本机四相机实测 30.4 组/秒、100 s、0 丢帧。
 - **限制**：L1/L2 是短边端点，物理身份不唯一；L0 由两条 79 mm 边唯一确定。**不输出唯一航向或完整 6DoF**。

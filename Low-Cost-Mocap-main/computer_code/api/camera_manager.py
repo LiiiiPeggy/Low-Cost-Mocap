@@ -141,6 +141,9 @@ class CameraWorker:
         self._fps_count = 0
         self._fps_t0 = time.perf_counter()
         self._frames_total = 0
+        self._corrupt_frames = 0
+        self._last_corrupt_log = 0.0
+        self._prev_rows: np.ndarray | None = None
         self._last_frame_mono: float | None = None
         self._intervals_ms: deque[float] = deque(maxlen=120)
 
@@ -246,12 +249,20 @@ class CameraWorker:
                         "ok": False,
                         "error": "%s: %s" % (type(exc).__name__, exc)}
                 backoff = 0.5
+                self._prev_rows = None
 
                 while not self._stop_evt.is_set():
-                    gray, mf_ts = cam.grab()
+                    try:
+                        gray, mf_ts = cam.grab()
+                    except irc.IncompleteFrame:
+                        self._note_corrupt("解码失败/截断")
+                        continue
                     if gray is None:
                         # 刚开流时可能还没有帧，稍等避免空转
                         time.sleep(0.002)
+                        continue
+                    if not self._complete(gray):
+                        self._note_corrupt("缺失行/半帧")
                         continue
                     self._publish(gray, mf_ts)
 
@@ -321,6 +332,47 @@ class CameraWorker:
         except BaseException:
             pass
         return None
+
+    def _complete(self, gray: np.ndarray) -> bool:
+        """判断驱动交付的帧是否完整。
+
+        USB 等时传输丢包时，部分驱动会把缺失的行直接填 0（常见于画面下半部），
+        Media Foundation 仍报告完整长度。判据必须同时满足：
+        **这些行在上一张有效帧里还有内容，这一帧突然整段变成全黑**。
+        单纯的大面积黑（暗场、只有 LED 亮）是合法画面，不能据此丢帧；
+        合成自检图正是这种情况。
+        """
+        h = int(gray.shape[0])
+        if h < 32:
+            return True
+        rows = gray.mean(axis=1)
+        black = rows < 0.5
+        complete = True
+        if black.any() and not black.all():
+            prev = self._prev_rows
+            if prev is not None and len(prev) == h:
+                newly_black = black & (prev > 1.0)
+                run = best = 0
+                for is_black in newly_black:
+                    if is_black:
+                        run += 1
+                        if run > best:
+                            best = run
+                    else:
+                        run = 0
+                if best >= max(24, h // 10):
+                    complete = False
+        if complete:
+            self._prev_rows = rows       # 只保留最近一张有效帧的行亮度
+        return complete
+
+    def _note_corrupt(self, reason: str) -> None:
+        self._corrupt_frames += 1
+        now = time.time()
+        if now - self._last_corrupt_log > 30.0:
+            self._last_corrupt_log = now
+            print("[cam %d] 丢弃不完整帧（%s），累计 %d 帧"
+                  % (self.index, reason, self._corrupt_frames), file=sys.stderr)
 
     def _publish(self, gray: np.ndarray, mf_ts: int) -> None:
         now_wall = time.time()
@@ -438,6 +490,7 @@ class CameraWorker:
             "fps": round(self._fps, 1),
             "frame_interval_ms": interval,
             "frames_total": self._frames_total,
+            "corrupt_frames": self._corrupt_frames,
             "buffered": self.buffered,
             "frame": frame.meta() if frame else None,
             "opened_at": self._opened_at,

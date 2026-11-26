@@ -93,6 +93,13 @@ except OSError as exc:  # pragma: no cover - 非 Windows 环境
     raise SystemExit("本脚本仅支持 Windows（需要 Media Foundation）") from exc
 
 
+class IncompleteFrame(OSError):
+    """设备交付的帧数据不完整（USB 丢包/截断）。
+
+    这类帧应当丢弃并继续取下一帧，而不是走“流错误/重连”路径。
+    """
+
+
 class GUID(ctypes.Structure):
     _fields_ = [
         ("Data1", ctypes.c_uint32),
@@ -476,7 +483,7 @@ class IRCamera:
         if fmt.fourcc == "MJPG":
             img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
             if img is None:
-                raise OSError("MJPG 解码失败")
+                raise IncompleteFrame("MJPG 解码失败（帧数据不完整）")
             return img
 
         if fmt.fourcc in ("NV12", "YUY2"):

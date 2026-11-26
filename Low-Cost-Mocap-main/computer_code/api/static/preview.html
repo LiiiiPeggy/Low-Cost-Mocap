@@ -214,13 +214,13 @@
   .cam-controls .msg.ok { color: var(--ok); }
   .cam-controls .msg.err { color: var(--err); }
   .cam-controls button { padding: 3px 8px; font-size: 12px; border-radius: 5px; }
-  /* ---- LED ROI ---- */
-  #led-section .roi-grid {
+  /* ---- LED 网格布局 ---- */
+  #led-section .led-grid {
     display: grid; grid-template-columns: auto repeat(4, 1fr); gap: 5px 8px;
     align-items: center; margin-top: 6px; font-size: 12px; color: var(--dim);
   }
-  #led-section .roi-grid input[type="number"] { width: 100%; min-width: 58px; }
-  #led-section .roi-grid .head { font-weight: 600; color: var(--fg); }
+  #led-section .led-grid input[type="number"] { width: 100%; min-width: 58px; }
+  #led-section .led-grid .head { font-weight: 600; color: var(--fg); }
 </style>
 </head>
 <body>
@@ -375,7 +375,7 @@
             <option value="4">4×</option>
           </select>
         </label>
-        <span class="hintline">放大以匹配点/ROI 为中心；候选点不再逐个写文字</span>
+        <span class="hintline">放大以匹配点为中心；候选点不再逐个写文字</span>
         <span class="spacer"></span>
         <span class="hintline">曝光/增益在上方每台相机卡片内控制（DirectShow UVC）</span>
       </div>
@@ -385,24 +385,37 @@
         <button id="l-diagnose">匹配诊断</button>
         <span class="hintline">逻辑编号 ↔ USB 设备实例固定绑定；枚举顺序变化不影响编号。未确认的相机不会套用历史标定。</span>
       </div>
-      <div id="cam-identity" class="roi-grid" style="grid-template-columns:auto 1fr auto auto"></div>
+      <div id="cam-identity" class="led-grid" style="grid-template-columns:auto 1fr auto auto"></div>
       <div id="l-diag" class="result-grid"></div>
       <div class="row">
         <b>相机曝光 / 增益</b>
-        <span class="hintline">DirectShow UVC · 曝光为 log2(s)，数值越小曝光越短；每台相机独立保存</span>
+        <span class="hintline">DirectShow UVC · 每台相机独立保存</span>
         <button id="ctrl-refresh">刷新设备状态</button>
         <button id="ctrl-restore">恢复上次保存</button>
+      </div>
+      <div class="row" id="ctrl-help">
+        <span class="hintline"><b>曝光</b>（-13…-1，单位 log2 秒）：
+          <b>要稳定跑满 30 fps，曝光取 -5 ~ -13</b>。其中 -5 = 31.25 ms，是这组里最亮的一档；
+          数值越小画面越暗，帧率仍为相机上限 30 fps。
+          <b>数值越大曝光越长、画面越亮，但帧率会被压低</b>：-4 ≈ 62.5 ms（约 16 fps）、
+          -3 ≈ 125 ms（8 fps）、-1 ≈ 0.5 s（约 2 fps）；长曝光下该相机还会出现画面撕裂。
+          参考：-5 = 31.25 ms，-6 = 15.6 ms，-8 = 3.9 ms，-10 = 0.98 ms，-13 = 0.12 ms。</span>
+        <span class="hintline"><b>增益</b>（0…63，仅手动）：
+          <b>数值越大</b> → 电子放大越强、画面越亮，但噪点更多、暗部可能出现虚假亮斑；
+          <b>数值越小</b> → 画面越暗、噪声越小。增益不改变曝光时间和拖影。
+          作用类似相机的 <b>ISO 感光度</b>（只放大信号），但这里的 0–63 是设备索引，
+          <b>不是 ISO 数值</b>。30 fps 下亮度不足时优先加红外补光；增益到 63 后无法再靠它提亮。</span>
       </div>
       <div class="led-cam-controls" id="led-controls">
         <div class="cam-controls" data-cam="0">
           <b>相机 0</b>
           <label>曝光
-            <input id="ctrl-exp-0" type="number" step="1" title="DirectShow 对数曝光 log2(s)">
+            <input id="ctrl-exp-0" type="number" step="1" title="曝光 log2(秒)：要跑满 30fps 取 -5~-13；数值越大越亮但帧率下降（-3=8fps 且会撕裂）">
             <span class="range" id="ctrl-range-exp-0">范围 —</span>
           </label>
           <label><input type="checkbox" id="ctrl-auto-0"> 自动曝光</label>
           <label>增益
-            <input id="ctrl-gain-0" type="number" step="1" title="DirectShow 增益索引">
+            <input id="ctrl-gain-0" type="number" step="1" title="增益 0-63：作用类似 ISO，但这是设备索引不是 ISO 数值；越大越亮、噪点越多，不改变曝光时间">
             <span class="range" id="ctrl-range-gain-0">范围 —</span>
           </label>
           <label><button id="ctrl-apply-0">应用</button></label>
@@ -411,38 +424,17 @@
         <div class="cam-controls" data-cam="1">
           <b>相机 1</b>
           <label>曝光
-            <input id="ctrl-exp-1" type="number" step="1" title="DirectShow 对数曝光 log2(s)">
+            <input id="ctrl-exp-1" type="number" step="1" title="曝光 log2(秒)：要跑满 30fps 取 -5~-13；数值越大越亮但帧率下降（-3=8fps 且会撕裂）">
             <span class="range" id="ctrl-range-exp-1">范围 —</span>
           </label>
           <label><input type="checkbox" id="ctrl-auto-1"> 自动曝光</label>
           <label>增益
-            <input id="ctrl-gain-1" type="number" step="1" title="DirectShow 增益索引">
+            <input id="ctrl-gain-1" type="number" step="1" title="增益 0-63：作用类似 ISO，但这是设备索引不是 ISO 数值；越大越亮、噪点越多，不改变曝光时间">
             <span class="range" id="ctrl-range-gain-1">范围 —</span>
           </label>
           <label><button id="ctrl-apply-1">应用</button></label>
           <span class="msg" id="ctrl-msg-1">读取中…</span>
         </div>
-      </div>
-      <div class="row">
-        <b>手动 ROI</b>
-        <span class="hintline">归一化坐标 0–1（x0 = 像素 x / 1280，y0 = 像素 y / 720）；留空 = 全图。目标运动时匹配成功会更新动态 ROI，丢失后自动全图重搜。</span>
-        <label><input type="checkbox" id="l-roi-track" checked> 动态跟踪 ROI</label>
-        <button id="l-roi-apply">应用 ROI</button>
-        <button id="l-roi-clear">清除 ROI</button>
-        <span id="l-roi-msg" class="badge">—</span>
-      </div>
-      <div class="roi-grid">
-        <span class="head">相机</span><span class="head">x0</span><span class="head">y0</span><span class="head">x1</span><span class="head">y1</span>
-        <span>相机0</span>
-        <input id="l-roi0-x0" type="number" min="0" max="1" step="0.01" placeholder="0">
-        <input id="l-roi0-y0" type="number" min="0" max="1" step="0.01" placeholder="0">
-        <input id="l-roi0-x1" type="number" min="0" max="1" step="0.01" placeholder="1">
-        <input id="l-roi0-y1" type="number" min="0" max="1" step="0.01" placeholder="1">
-        <span>相机1</span>
-        <input id="l-roi1-x0" type="number" min="0" max="1" step="0.01" placeholder="0">
-        <input id="l-roi1-y0" type="number" min="0" max="1" step="0.01" placeholder="0">
-        <input id="l-roi1-x1" type="number" min="0" max="1" step="0.01" placeholder="1">
-        <input id="l-roi1-y1" type="number" min="0" max="1" step="0.01" placeholder="1">
       </div>
       <div class="led-params">
         <table>
@@ -673,25 +665,6 @@ function expandUiForCameras() {
           if (x.tagName === 'SELECT') x.value = '';
         });
         tr.appendChild(td);
-      });
-    });
-  }
-  // 手动 ROI：增加相机2/3行
-  const grid = document.querySelector('#led-section .roi-grid');
-  if (grid) {
-    [2, 3].forEach(cam => {
-      if (el('l-roi' + cam + '-x0')) return;
-      const label = document.createElement('span');
-      label.textContent = '相机' + cam;
-      grid.appendChild(label);
-      ['x0', 'y0', 'x1', 'y1'].forEach(k => {
-        const input = document.createElement('input');
-        input.type = 'number';
-        input.id = 'l-roi' + cam + '-' + k;
-        input.min = '0'; input.max = '1'; input.step = '0.01';
-        input.placeholder = k.startsWith('x') ? (k === 'x0' ? '0' : '1')
-                                             : (k === 'y0' ? '0' : '1');
-        grid.appendChild(input);
       });
     });
   }
@@ -1020,7 +993,8 @@ function populateCameraControls(controls) {
       const saved = item.saved ? ('上次保存：曝光 ' + item.saved.exposure
         + (item.saved.auto_exposure ? '（自动）' : '（手动）')
         + '，增益 ' + item.saved.gain) : '尚无该设备的保存记录';
-      setCtrlMsg(cam, '曝光为 log2(s)，数值越小曝光越短；' + saved, '');
+      setCtrlMsg(cam, '30 fps 需曝光 -5~-13（-5 最亮）；越大越亮但帧率下降，'
+        + '长曝光会撕裂。增益越大越亮、噪点越多。' + saved, '');
     }
   });
 }
@@ -1716,26 +1690,11 @@ function populateLedParams(p) {
     el('l-split-' + cam).value = v === undefined ? ''
       : (v ? '1' : '0');
   });
-  const rois = p.rois || {};
-  CAMERAS.forEach(cam => {
-    const r = rois[String(cam)];
-    ['x0', 'y0', 'x1', 'y1'].forEach((key, idx) => {
-      setInput('l-roi' + cam + '-' + key,
-               (r && r.length === 4) ? r[idx] : '');
-    });
-  });
-  el('l-roi-track').checked = p.roi_tracking !== false;
   const mapMsg = el('l-map-msg');
   if (mapMsg) {
     const cams = p.cameras || [];
     mapMsg.textContent = cams.length ? ('定位相机 ' + cams.join(',')) : '未载入标定';
     mapMsg.className = 'badge ' + (cams.length ? 'ok' : '');
-  }
-  const roiMsg = el('l-roi-msg');
-  if (roiMsg) {
-    const manual = CAMERAS.filter(cam => rois[String(cam)]).length;
-    roiMsg.textContent = manual ? ('手动 ROI：' + manual + ' 台') : '手动 ROI：全图';
-    roiMsg.className = 'badge ' + (manual ? 'ok' : '');
   }
   const msg = el('l-params-msg');
   if (msg) {
@@ -1790,19 +1749,7 @@ function collectLedParams() {
     else if (split === '0') o.split_blobs = false;
     if (Object.keys(o).length) overrides[String(cam)] = o;
   });
-  const rois = {};
-  CAMERAS.forEach(cam => {
-    const vals = ['x0', 'y0', 'x1', 'y1'].map(k =>
-      numOrNull('l-roi' + cam + '-' + k));
-    const filled = vals.filter(v => v !== null).length;
-    if (filled === 0) { rois[String(cam)] = null; return; }
-    if (filled !== 4) {
-      throw new Error('相机 ' + cam + ' ROI 必须同时填写 x0/y0/x1/y1，或全部留空');
-    }
-    rois[String(cam)] = vals;
-  });
-  return { params: common, overrides, rois,
-           roi_tracking: el('l-roi-track').checked };
+  return { params: common, overrides };
 }
 
 el('l-params-apply').onclick = async () => {
@@ -1988,12 +1935,9 @@ function renderLedState(s) {
   const cams = pair.cameras || Object.keys(dets).map(Number);
   const camText = (c) => {
     const d = dets[String(c)] || {};
-    const roiMode = d.roi_mode === 'track' ? '动态ROI'
-      : (d.roi_mode === 'manual' ? '手动ROI'
-      : (d.roi_mode === 'full_fallback' ? '全图回退' : '全图'));
     const warns = (d.warnings || []).length ? ' · 警告 ' + d.warnings.length : '';
     return `相机${c}：原始 ${d.raw_count || 0} · 候选 ${d.count || 0} · `
-      + `${LED_STATUS_NAMES[d.status] || d.status || '—'} · ${roiMode}${warns}`
+      + `${LED_STATUS_NAMES[d.status] || d.status || '—'}${warns}`
       + ((d.reason) ? ('\n  ' + d.reason) : '')
       + ((d.warnings || []).length ? ('\n  警告：' + d.warnings[0]) : '');
   };
@@ -2099,15 +2043,6 @@ el('l-locate-start').onclick = () => startLedAction(
 el('l-locate-stop').onclick = () => ledPost('/api/led/locate/stop', '停止三维定位');
 el('l-view').onchange = ledTickIfActive;
 el('l-zoom').onchange = ledTickIfActive;
-el('l-roi-apply').onclick = () => {
-  el('l-params-apply').click();
-};
-el('l-roi-clear').onclick = () => {
-  [0, 1].forEach(cam => ['x0', 'y0', 'x1', 'y1'].forEach(k => {
-    el('l-roi' + cam + '-' + k).value = '';
-  }));
-  el('l-params-apply').click();
-};
 async function showLedDiagnostics() {
   try {
     const d = await api('/api/led/diagnose');

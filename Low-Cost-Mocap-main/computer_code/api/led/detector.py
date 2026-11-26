@@ -9,8 +9,7 @@
 3. 粘连亮区用**距离变换局部峰值 + 最近峰值分配**（watershed 的简化等价）
    拆分；距离变换分不开时再用灰度局部极大值兜底。饱和平台没有可区分峰值时
    明确报告 ``unresolved``，绝不凭面积估算三个虚假中心。
-4. 中心用原始灰度的强度加权亚像素中心；坐标始终是**整幅原始图像**坐标，
-   即使检测只在一个 ROI 内进行，也会加回 ROI 偏移。
+4. 中心用原始灰度的强度加权亚像素中心；坐标始终是**整幅原始图像**坐标。
 
 不引入深度学习、不引入新的第三方依赖，只使用 OpenCV/NumPy 的经典操作。
 """
@@ -140,37 +139,11 @@ def _as_gray(gray: np.ndarray) -> np.ndarray:
     return np.ascontiguousarray(arr)
 
 
-def _normalize_roi(roi, height: int, width: int):
-    """把 ROI 规范成 (x, y, w, h)；返回 None 表示整幅图。"""
-    if not roi:
-        return None
-    if isinstance(roi, dict):
-        vals = [roi.get(k) for k in ("x", "y", "w", "h")]
-    else:
-        try:
-            vals = list(roi)
-        except TypeError:
-            return None
-    if len(vals) != 4 or any(v is None for v in vals):
-        return None
-    try:
-        x, y, w, h = [int(round(float(v))) for v in vals]
-    except (TypeError, ValueError):
-        return None
-    x = max(0, min(width - 1, x))
-    y = max(0, min(height - 1, y))
-    w = max(0, min(width - x, w))
-    h = max(0, min(height - y, h))
-    if w < 4 or h < 4:
-        return None
-    return x, y, w, h
-
-
-def _weighted_center(gray_roi: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
+def _weighted_center(gray_part: np.ndarray, mask: np.ndarray) -> tuple[float, float]:
     ys, xs = np.nonzero(mask)
     if len(xs) == 0:
         return 0.0, 0.0
-    w = gray_roi[ys, xs].astype(np.float64)
+    w = gray_part[ys, xs].astype(np.float64)
     s = float(w.sum())
     if s <= 1e-9:
         return float(xs.mean()), float(ys.mean())
@@ -185,10 +158,10 @@ def _contour_of(mask: np.ndarray) -> np.ndarray | None:
     return max(contours, key=cv2.contourArea)
 
 
-def _shape_metrics(roi_mask: np.ndarray, width: int, height: int,
+def _shape_metrics(part_mask: np.ndarray, width: int, height: int,
                    area: int) -> dict:
     """solidity / 长宽比 / 外接矩形填充率。"""
-    contour = _contour_of(roi_mask)
+    contour = _contour_of(part_mask)
     solidity = 1.0
     aspect = 1.0
     if contour is not None:
@@ -254,13 +227,13 @@ def _peak_points(dt: np.ndarray, mask: np.ndarray, params: dict) -> np.ndarray:
                               float(params["min_peak_distance"]))
 
 
-def _intensity_peaks(gray_roi: np.ndarray, mask: np.ndarray,
+def _intensity_peaks(gray_part: np.ndarray, mask: np.ndarray,
                      threshold: float, params: dict) -> np.ndarray:
     """距离变换分不开时的兜底：灰度局部极大值。"""
     k = max(3, int(round(float(params["min_peak_distance"]))))
     if k % 2 == 0:
         k += 1
-    smooth = cv2.GaussianBlur(gray_roi, (k, k), 0)
+    smooth = cv2.GaussianBlur(gray_part, (k, k), 0)
     local_max = cv2.dilate(smooth, np.ones((k, k), np.uint8))
     vals = smooth[mask]
     if vals.size == 0:
@@ -283,9 +256,9 @@ def _intensity_peaks(gray_roi: np.ndarray, mask: np.ndarray,
                               float(params["min_peak_distance"]))
 
 
-def _split_component(gray_roi: np.ndarray, mask: np.ndarray,
+def _split_component(gray_part: np.ndarray, mask: np.ndarray,
                      params: dict) -> list[np.ndarray]:
-    """按峰值把一个连通亮区拆成 1~N 个部分（ROI 坐标）。
+    """按峰值把一个连通亮区拆成 1~N 个部分（局部坐标）。
 
     每个 part 至少占父亮区 ``split_min_area_ratio``，避免单个 LED 的亮核/
     光晕被误拆成两个候选。
@@ -304,7 +277,7 @@ def _split_component(gray_roi: np.ndarray, mask: np.ndarray,
         h, w = mask.shape
         min_sep = float(params["min_peak_distance"])
         if max(h, w) >= 2.0 * min_sep:
-            alt = _intensity_peaks(gray_roi, mask,
+            alt = _intensity_peaks(gray_part, mask,
                                    float(params["threshold"]), params)
             if len(alt) >= 2:
                 peaks = alt
@@ -334,12 +307,12 @@ def _split_component(gray_roi: np.ndarray, mask: np.ndarray,
     return parts if len(parts) >= 2 else [mask]
 
 
-def _part_record(gray_roi: np.ndarray, part: np.ndarray, params: dict):
+def _part_record(gray_part: np.ndarray, part: np.ndarray, params: dict):
     """把拆分后的 part 转成候选记录；不满足形状/面积时返回 None。"""
     pa = int(part.sum())
     if pa < int(params["min_area"]):
         return None
-    cx, cy = _weighted_center(gray_roi, part)
+    cx, cy = _weighted_center(gray_part, part)
     pc = _contour_of(part)
     ys, xs = np.nonzero(part)
     if len(xs) == 0:
@@ -347,7 +320,7 @@ def _part_record(gray_roi: np.ndarray, part: np.ndarray, params: dict):
     x0, x1 = int(xs.min()), int(xs.max())
     y0, y1 = int(ys.min()), int(ys.max())
     w, h = x1 - x0 + 1, y1 - y0 + 1
-    vals = gray_roi[part]
+    vals = gray_part[part]
     metrics = _shape_metrics(part, w, h, pa)
     if metrics["solidity"] < float(params["min_solidity"]):
         return None
@@ -380,25 +353,16 @@ def _rank_score(rec: dict, params: dict) -> float:
             - 0.10 * max(0.0, aspect - 1.0))
 
 
-def detect_leds(gray: np.ndarray, params: dict | None = None, *,
-                roi=None) -> dict:
+def detect_leds(gray: np.ndarray, params: dict | None = None) -> dict:
     """检测单张原始灰度图中的红外 LED 亮点。
 
-    ``roi`` 可以是 (x, y, w, h) 像素或 {"x","y","w","h"}；只在该区域内检测，
-    但返回的坐标、bbox、contour 都已加回 ROI 偏移，仍是整图坐标。
     ``leds`` 是通过面积/形状/分离筛选的 LED 候选；``raw_components`` 是全部
     原始连通域（含被拒绝的），供网页区分绘制。
     """
     p = validate_params(params or default_params())
     g = _as_gray(gray)
     height, width = g.shape[:2]
-    roi_box = _normalize_roi(roi, height, width)
-    if roi_box is None:
-        x_off, y_off = 0, 0
-        work = g
-    else:
-        x_off, y_off, rw, rh = roi_box
-        work = g[y_off:y_off + rh, x_off:x_off + rw]
+    work = g
 
     k = int(p["blur_kernel"])
     processed = cv2.GaussianBlur(work, (k, k), 0) if k > 0 else work
@@ -424,22 +388,22 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
                       int(stats[label, cv2.CC_STAT_TOP]),
                       int(stats[label, cv2.CC_STAT_WIDTH]),
                       int(stats[label, cv2.CC_STAT_HEIGHT]))
-        roi_mask = labels[y:y + h, x:x + w] == label
-        roi_gray = work[y:y + h, x:x + w]
-        vals = roi_gray[roi_mask]
+        part_mask = labels[y:y + h, x:x + w] == label
+        part_gray = work[y:y + h, x:x + w]
+        vals = part_gray[part_mask]
         mean_v = float(vals.mean()) if vals.size else 0.0
         max_v = int(vals.max()) if vals.size else 0
         sat_ratio = (float((vals >= int(p["saturation_value"])).mean())
                      if vals.size else 0.0)
-        cx, cy = _weighted_center(roi_gray, roi_mask)
-        metrics = _shape_metrics(roi_mask, w, h, area)
+        cx, cy = _weighted_center(part_gray, part_mask)
+        metrics = _shape_metrics(part_mask, w, h, area)
         comp_id = len(raw_components)
-        # 连通域中心是 ROI 内的局部坐标：先加 bbox 偏移，再加 ROI 偏移。
-        gx, gy = cx + x + x_off, cy + y + y_off
+        # 连通域中心先加 bbox 偏移，得到整图坐标。
+        gx, gy = cx + x, cy + y
         common = {
             "id": comp_id,
             "x": round(float(gx), 3), "y": round(float(gy), 3),
-            "bbox": [x + x_off, y + y_off, w, h],
+            "bbox": [x, y, w, h],
             "area": area,
             "mean_intensity": round(mean_v, 1),
             "max_intensity": max_v,
@@ -472,31 +436,31 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
             continue
 
         # ---- 粘连分离 ----
-        parts = (_split_component(roi_gray, roi_mask, p)
-                 if p["split_blobs"] else [roi_mask])
+        parts = (_split_component(part_gray, part_mask, p)
+                 if p["split_blobs"] else [part_mask])
         split_leds = []
         if len(parts) >= 2:
             for part in parts:
-                rec = _part_record(roi_gray, part, p)
+                rec = _part_record(part_gray, part, p)
                 if rec is None:
                     continue
                 px, py, pw, ph = rec["bbox_local"]
-                vals_p = roi_gray[part]
+                vals_p = part_gray[part]
                 split_leds.append({
                     "component_id": comp_id,
                     "part_index": len(split_leds),
-                    "x": round(float(rec["cx"] + x + x_off), 3),
-                    "y": round(float(rec["cy"] + y + y_off), 3),
+                    "x": round(float(rec["cx"] + x), 3),
+                    "y": round(float(rec["cy"] + y), 3),
                     "area": rec["area"],
                     "mean_intensity": round(rec["mean_intensity"], 1),
                     "max_intensity": rec["max_intensity"],
-                    "bbox": [px + x + x_off, py + y + y_off, pw, ph],
+                    "bbox": [px + x, py + y, pw, ph],
                     "contour": (None if rec["contour"] is None
                                 else (rec["contour"].reshape(-1, 2)
-                                      + [x + x_off, y + y_off]).tolist()),
+                                      + [x, y]).tolist()),
                     "split": True,
                     "parent_area": area,
-                    "parent_bbox": [x + x_off, y + y_off, w, h],
+                    "parent_bbox": [x, y, w, h],
                     "saturated_ratio": round(rec["saturated_ratio"], 3),
                     "solidity": rec["solidity"],
                     "aspect": rec["aspect"],
@@ -536,13 +500,13 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
             "area": area,
             "mean_intensity": round(mean_v, 1),
             "max_intensity": max_v,
-            "bbox": [x + x_off, y + y_off, w, h],
+            "bbox": [x, y, w, h],
             "contour": (None if metrics["contour"] is None
                         else (metrics["contour"].reshape(-1, 2)
-                              + [x + x_off, y + y_off]).tolist()),
+                              + [x, y]).tolist()),
             "split": False,
             "parent_area": area,
-            "parent_bbox": [x + x_off, y + y_off, w, h],
+            "parent_bbox": [x, y, w, h],
             "saturated_ratio": round(sat_ratio, 3),
             "solidity": metrics["solidity"],
             "aspect": metrics["aspect"],
@@ -589,15 +553,6 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
     raw_components = raw_components[:MAX_RAW_COMPONENTS]
     raw_components.sort(key=lambda d: int(d["id"]))
 
-    if roi_box is None:
-        mask = mask_work
-        roi_out = None
-    else:
-        mask = np.zeros((height, width), np.uint8)
-        mask[roi_box[1]:roi_box[1] + roi_box[3],
-             roi_box[0]:roi_box[0] + roi_box[2]] = mask_work
-        roi_out = [int(v) for v in roi_box]
-
     return {
         "status": status,
         "reason": reason,
@@ -609,15 +564,13 @@ def detect_leds(gray: np.ndarray, params: dict | None = None, *,
         "warnings": warnings,
         "unresolved_count": unresolved,
         "overexposed": bool(overexposed),
-        "mask": mask,
+        "mask": mask_work,
         "params": p,
         "image_size": [int(width), int(height)],
-        "roi": roi_out,
-        "roi_fallback": False,
     }
 
 
 __all__ = ["DEFAULT_PARAMS", "PARAM_LIMITS", "TRIANGLE_SHORT_M",
            "TRIANGLE_LONG_M", "TRIANGLE_SIDES_M",
            "default_params", "validate_params", "merge_params",
-           "detect_leds", "_as_gray", "_normalize_roi"]
+           "detect_leds", "_as_gray"]

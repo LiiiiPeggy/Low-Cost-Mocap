@@ -125,18 +125,6 @@ def test_detector():
           and any("细长" in r.get("reason", "") for r in d6["rejected"]),
           "count=%d raw=%d" % (d6["count"], d6["raw_count"]))
 
-    # ROI：只检测 ROI 内的光斑，但坐标仍是整图坐标
-    two = spots([(300.0, 250.0), (340.0, 250.0)])
-    d7 = detect_leds(two, p, roi=(250, 200, 140, 120))
-    check("ROI 内检测坐标加回整图偏移",
-          d7["count"] == 2
-          and all(280 <= d["x"] <= 360 and 230 <= d["y"] <= 280
-                  for d in d7["leds"])
-          and d7.get("roi") == [250, 200, 140, 120],
-          [(round(d["x"], 1), round(d["y"], 1)) for d in d7["leds"]])
-    d8 = detect_leds(two, p, roi=(500, 400, 120, 100))
-    check("ROI 外光斑不参与检测", d8["count"] == 0, d8["count"])
-
     # partial=True 只覆盖 min_area 时，不应该拿缺省的 max_area 去比较
     try:
         validate_params({"min_area": 50}, partial=True)
@@ -573,22 +561,10 @@ def test_service_pipeline():
                 check("LED 标签遵循 L0/底边端点规则",
                       state.get("label_rule", "").startswith("L0=")
                       and state.get("labels_are_temporary") is True)
-                check("服务状态包含 ROI / 动态跟踪信息",
-                      isinstance(state.get("roi"), dict)
-                      and "tracking" in state["roi"]
-                      and state.get("detections", {}).get("0", {}).get("raw_count") is not None,
-                      state.get("roi"))
-                svc._roi_tracking = True
-                svc._roi_track["0"] = [600, 500, 40, 30]
-                roi_track, mode_track = svc._roi_for(0, (720, 1280))
-                check("动态 ROI 向外扩 80px 且裁剪到图像内",
-                      mode_track == "track" and roi_track == [520, 420, 200, 190],
-                      "%s %s" % (mode_track, roi_track))
-                svc._roi_force_full["0"] = True
-                _, mode_full = svc._roi_for(0, (720, 1280))
-                check("匹配失败后允许下一帧全图重搜", mode_full == "full_search",
-                      mode_full)
-                svc._clear_track_rois()
+                check("服务状态包含每台相机的检测统计",
+                      state.get("detections", {}).get("0", {}).get("raw_count") is not None
+                      and state.get("detections", {}).get("0", {}).get("count") is not None,
+                      state.get("detections", {}).get("0"))
                 before = state["processed_pairs"]
                 time.sleep(0.3)
                 after = svc.state()["processed_pairs"]
@@ -648,15 +624,11 @@ def test_service_pipeline():
                     "params": {"threshold": 190},
                     "overrides": {"0": {"split_blobs": False},
                                   "1": {"min_area": 6}},
-                    "rois": {"0": [0.1, 0.1, 0.6, 0.7], "1": None},
-                    "roi_tracking": False,
                 })
-                check("参数/ROI/单相机分离覆盖可保存",
+                check("参数/单相机分离覆盖可保存",
                       upd["params"]["threshold"] == 190
                       and upd["overrides"]["0"].get("split_blobs") is False
-                      and upd["overrides"]["1"].get("min_area") == 6
-                      and upd["rois"]["0"] == [0.1, 0.1, 0.6, 0.7]
-                      and upd["roi_tracking"] is False,
+                      and upd["overrides"]["1"].get("min_area") == 6,
                       upd.get("path"))
                 upd_clear = svc.update_params({"overrides": {}})
                 check("显式空 overrides 可清空相机覆盖",

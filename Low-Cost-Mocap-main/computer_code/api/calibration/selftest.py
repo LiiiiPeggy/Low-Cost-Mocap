@@ -1423,6 +1423,13 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
           and "bindCameraControlHandlers();" in html)
     check("标定实时图为相机2/3 克隆相机1 的 figure",
           "figs[1]" in html and "c-img1" in html)
+    from camera_manager import CameraWorker
+    w = CameraWorker(0, reconnect=False)
+    ok_frame = np.full((720, 1280), 10, np.uint8)
+    bad_frame = ok_frame.copy()
+    bad_frame[400:] = 0          # 模拟 USB 丢包后驱动填 0 的下半帧
+    check("不完整帧检测：正常帧通过、缺行半帧被丢弃",
+          w._complete(ok_frame) and not w._complete(bad_frame))
 
 
 def _selftest_dir() -> str:
