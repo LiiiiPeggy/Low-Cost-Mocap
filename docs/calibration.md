@@ -52,7 +52,15 @@ conda activate lowcost_mocap
 cd Low-Cost-Mocap-main\computer_code
 python api\preview_server.py            :: 默认启动 camera_config 里的全部相机
 :: 浏览器打开 http://127.0.0.1:3002/preview（标定面板默认展开）
+
+:: 手机同一 WiFi 操作：加 --lan，按启动日志里的局域网地址打开
+python api\preview_server.py --lan
 ```
+
+手机打开 `/preview` 时页面自动切到精简布局：顶部“手机”栏切换原始/棋盘格/LED 三种预览
+（棋盘格与 LED 为 10 Hz 上限），显示实测采集/画面/定位帧率；可调曝光增益、载入内参、
+完成完整外参流程（含逐台 180° 与人工方向确认）和二维 LED 检测。相机身份绑定、内参采集/
+计算、三维场景、ROI、高级参数与同步诊断在手机端隐藏且不启动轮询。服务无认证，只用于可信网络。
 
 面板默认展开，页面初始化会自动检查会话：已有有效会话直接复用，没有才按
 内角点 `11 × 8`、方格 `30` mm、板面高 `3` mm 创建；多标签页/刷新不会重复创建，

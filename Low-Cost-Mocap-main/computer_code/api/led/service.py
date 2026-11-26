@@ -22,6 +22,7 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime
 
 import cv2
@@ -301,6 +302,8 @@ class LedService:
         self._processing_ms = None
         self._processing_stage_ms: dict = {}
         self._processed_pairs = 0
+        self._group_times = deque(maxlen=300)
+        self._track_times = deque(maxlen=300)
         self._groups_seen = 0
         self._groups_skipped = 0
         self._last_error = ""
@@ -905,6 +908,17 @@ class LedService:
                     tracker={"state": "lost"},
                     stage_ms=stage_ms)
 
+    @staticmethod
+    def _rate(times, window: float = 2.0) -> float:
+        """最近 ``window`` 秒内的实测频率（与预设帧率无关）。"""
+        now = time.perf_counter()
+        n = sum(1 for t in times if now - t <= window)
+        return round(n / window, 2)
+
+    def _fps_locked(self) -> dict:
+        return {"process": self._rate(self._group_times),
+                "locate": self._rate(self._track_times)}
+
     def _store_result(self, rec, dets, raws, t0, *,
                       status: str, reason: str, locate: bool,
                       calib: dict | None, match: dict | None = None,
@@ -918,8 +932,12 @@ class LedService:
         duration_ms = (time.perf_counter() - t0) * 1000.0
         with self._lock:
             if self._detect:
-                self._raw = {c: raws.get(c) for c in CAMS}
-                self._det_internal = {c: dets.get(c) for c in CAMS}
+                # 按相机合并，而不是整表替换：某台相机不在最新帧组时，
+                # 它的单路叠加图仍应显示上一帧，而不是变成“没有帧”。
+                for c, img in raws.items():
+                    self._raw[c] = img
+                for c, det in dets.items():
+                    self._det_internal[c] = det
             self._processed_pairs += 1
             self._processing_ms = (duration_ms if self._processing_ms is None
                                    else 0.8 * self._processing_ms + 0.2 * duration_ms)
@@ -984,9 +1002,14 @@ class LedService:
                 "groups_skipped": self._groups_skipped,
                 "processing_ms": round(self._processing_ms or 0.0, 2),
                 "stage_ms": dict(self._processing_stage_ms),
+                "fps": {"process": 0.0, "locate": 0.0},
                 "timestamp": _now_iso(),
                 "last_error": self._last_error,
             }
+            self._group_times.append(time.perf_counter())
+            if status == "tracking":
+                self._track_times.append(time.perf_counter())
+            state["fps"] = self._fps_locked()
             self._state = state
         # 连续录制只登记这一帧组已经完成的检测/定位结果，不重算任何东西；
         # note_result 内部不写盘，实际 PNG/JSONL 由录制写盘线程完成。
@@ -1054,6 +1077,7 @@ class LedService:
             "params": self._params_state_locked(),
             "processed_pairs": 0, "processing_ms": 0.0,
             "groups_seen": 0, "groups_skipped": 0, "stage_ms": {},
+            "fps": {"process": 0.0, "locate": 0.0},
             "timestamp": _now_iso(), "last_error": "",
         }
 

@@ -317,6 +317,10 @@ class CalibrationService:
         self._extrinsic: dict | None = None
         self._validation: dict | None = None
         self._result_path: str | None = None
+        # 实时“棋盘格提取”预览：手机 10 Hz 轮询时避免重复检测与并发风暴
+        self._preview_lock = threading.Lock()
+        self._preview_cache: dict = {}
+        self._preview_busy: set = set()
 
     # ------------------------------------------------------------------
     # 会话
@@ -1296,29 +1300,75 @@ class CalibrationService:
     # ------------------------------------------------------------------
     # 实况检测（只画图，不入库）
     # ------------------------------------------------------------------
+    PREVIEW_MAX_W = 640          # 预览检测的降采样宽度（不影响入库采集）
+    PREVIEW_MIN_S = 0.10         # 同一相机两次检测的最小间隔（10 Hz 上限）
+
     def detect_live(self, camera: int, *, scale: float = 0.6,
                     quality: int = 70) -> tuple[bytes, dict]:
-        frame, age = self._fresh_frame(camera)
-        sess = self._session
-        spec = sess.spec if sess else BoardSpec()
-        t0 = time.perf_counter()
-        # 实时叠加只做显示，用快速检测（SB 默认标志）；真正入库的采集走
-        # EXHAUSTIVE|ACCURACY，两者不共用同一个质量等级是有意为之。
-        det = board_mod.detect(frame.gray, spec, fast=True)
-        dt_ms = (time.perf_counter() - t0) * 1000.0
-        img = board_mod.draw_overlay(frame.gray, det, spec, scale=scale, label_step=3)
-        ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
-        if not ok:
-            raise RuntimeError("JPEG 编码失败")
-        return buf.tobytes(), {
-            "ok": det.ok,
-            "method": det.method,
-            "quality": det.quality,
-            "reason": det.reason,
-            "detect_ms": round(dt_ms, 1),
-            "frame_age_ms": round(age * 1000.0, 1),
-            "seq": int(frame.seq),
-        }
+        """实时棋盘格叠加预览（只画图，不入库）。
+
+        手机端会以 10 Hz 轮询四台相机。完整分辨率的 ``findChessboardCornersSB``
+        在无板场景约 225 ms/次，四路 10 Hz 会直接吃满 CPU，因此这里：
+        * 检测在 ≤640 宽的小图上做，角点再按比例映射回原图（仅预览，
+          入库采集仍用原始分辨率）；
+        * 同一相机 100 ms 内复用上一次 JPEG，避免多客户端重复检测。
+        """
+        cam = int(camera)
+        key = (cam, float(scale), int(quality))
+        now = time.perf_counter()
+        with self._preview_lock:
+            cached = self._preview_cache.get(key)
+            if cached and now - cached[0] < self.PREVIEW_MIN_S:
+                return cached[1], dict(cached[2], cached=True)
+            if key in self._preview_busy and cached:
+                return cached[1], dict(cached[2], cached=True)
+            self._preview_busy.add(key)
+        try:
+            frame, age = self._fresh_frame(cam)
+            sess = self._session
+            spec = sess.spec if sess else BoardSpec()
+            gray = frame.gray
+            h, w = gray.shape[:2]
+            factor = 1.0
+            if w > self.PREVIEW_MAX_W:
+                factor = self.PREVIEW_MAX_W / float(w)
+                small = cv2.resize(
+                    gray, (self.PREVIEW_MAX_W, max(1, int(round(h * factor)))),
+                    interpolation=cv2.INTER_AREA)
+            else:
+                small = gray
+            t0 = time.perf_counter()
+            # 实时叠加只做显示，用快速检测（SB 默认标志）；真正入库的采集走
+            # EXHAUSTIVE|ACCURACY，两者不共用同一个质量等级是有意为之。
+            det = board_mod.detect(small, spec, fast=True)
+            if factor != 1.0 and det.ok and det.corners is not None:
+                det.corners = (det.corners.reshape(-1, 2) / factor).reshape(
+                    -1, 1, 2).astype(np.float32)
+            dt_ms = (time.perf_counter() - t0) * 1000.0
+            img = board_mod.draw_overlay(gray, det, spec, scale=scale,
+                                         label_step=3)
+            ok, buf = cv2.imencode(".jpg", img,
+                                   [int(cv2.IMWRITE_JPEG_QUALITY), int(quality)])
+            if not ok:
+                raise RuntimeError("JPEG 编码失败")
+            data = buf.tobytes()
+            info = {
+                "ok": det.ok,
+                "method": det.method,
+                "quality": det.quality,
+                "reason": det.reason,
+                "detect_ms": round(dt_ms, 1),
+                "detect_width": int(small.shape[1]),
+                "frame_age_ms": round(age * 1000.0, 1),
+                "seq": int(frame.seq),
+                "cached": False,
+            }
+            with self._preview_lock:
+                self._preview_cache[key] = (time.perf_counter(), data, dict(info))
+            return data, info
+        finally:
+            with self._preview_lock:
+                self._preview_busy.discard(key)
 
     # ------------------------------------------------------------------
     # 求解

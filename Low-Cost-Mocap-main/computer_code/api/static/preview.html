@@ -221,6 +221,87 @@
   }
   #led-section .roi-grid input[type="number"] { width: 100%; min-width: 58px; }
   #led-section .roi-grid .head { font-weight: 600; color: var(--fg); }
+  /* ---- 相机身份绑定（窄屏两列） ---- */
+  #led-section #cam-identity {
+    grid-template-columns: auto minmax(0, 1fr) auto auto;
+  }
+  #cam-identity select { width: 100%; min-width: 0; }
+  /* ---- 手机 / 窄屏可用性 ---- */
+  @media (max-width: 900px) {
+    #c-scene { height: clamp(300px, 52vh, 430px); }
+    #led-section .roi-grid {
+      grid-template-columns: auto repeat(4, minmax(0, 1fr));
+      gap: 4px 5px;
+      overflow-x: auto;
+    }
+    #led-section .roi-grid input[type="number"] { min-width: 0; }
+    /* iOS 聚焦输入框时不自动放大页面（需要计算字号 >= 16px） */
+    #syncbar input[type="number"], #calib input[type="number"],
+    #calib select, #led-section input[type="number"],
+    #led-section select, .cam-controls input[type="number"],
+    #cam-identity select { font-size: 16px; }
+    header button, #syncbar button, #calib button, #led-section button {
+      padding: 7px 12px; font-size: 13px;
+    }
+    /* 4 相机参数表横向滑动时固定“参数名”列 */
+    #led-section .led-params { -webkit-overflow-scrolling: touch; }
+    #led-section th:first-child, #led-section td:first-child {
+      position: sticky; left: 0; z-index: 1; background: #fff;
+    }
+    #led-section th:first-child { background: #fafbfc; }
+  }
+  @media (max-width: 600px) {
+    .stats { grid-template-columns: repeat(2, 1fr); }
+    #led-section #cam-identity {
+      grid-template-columns: auto minmax(0, 1fr);
+    }
+    #cam-identity button { justify-self: start; }
+  }
+  /* ---- 手机端精简布局（JS 检测到窄屏时给 body 加 .mobile） ---- */
+  #mobile-bar { display: none; }
+  body.mobile #mobile-bar {
+    display: flex; flex-wrap: wrap; gap: 8px; align-items: center;
+    padding: 8px 12px; background: #0b1526; color: #cbd5e1;
+    border-bottom: 1px solid #1e293b; position: sticky; top: 0; z-index: 20;
+    font-size: 13px;
+  }
+  body.mobile #mobile-bar button {
+    padding: 6px 10px; border-radius: 6px; font-size: 13px;
+    background: #1e293b; color: #cbd5e1; border: 1px solid #334155;
+  }
+  body.mobile #mobile-bar button.active {
+    background: #2563eb; color: #fff; border-color: #2563eb;
+  }
+  body.mobile #mobile-bar b { color: #fff; font-variant-numeric: tabular-nums; }
+  body.mobile #syncbar,
+  body.mobile .mobile-hide,
+  body.mobile #c-scene,
+  body.mobile .view3d-tools,
+  body.mobile #c-intr,
+  body.mobile #c-intr-out,
+  body.mobile #c-val-out,
+  body.mobile #cam-identity,
+  body.mobile #led-section .roi-grid,
+  body.mobile #l-diag,
+  body.mobile #btn-save { display: none !important; }
+  body.mobile header #build { display: none; }
+  body.mobile header #summary { word-break: break-all; }
+  body.mobile main {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 10px; padding: 10px 12px 20px;
+  }
+  body.mobile .panel { min-width: 0; }
+  body.mobile .panel .head {
+    padding: 6px 8px; flex-wrap: wrap; gap: 6px;
+  }
+  body.mobile .panel .head b { font-size: 13px; }
+  body.mobile .panel .head .meta { font-size: 11px; word-break: break-all; }
+  body.mobile .stats { padding: 6px 8px; gap: 4px; min-width: 0; }
+  body.mobile .stats div { min-width: 0; }
+  body.mobile .stats div b { word-break: break-all; }
+  body.mobile #log { margin: 0 12px 16px; max-height: 110px; }
+  body.mobile .panel.zoomed { grid-column: 1 / -1; }
+  body.mobile .panel.zoomed .view { aspect-ratio: auto; height: 58vh; }
 </style>
 </head>
 <body>
@@ -233,6 +314,15 @@
   <button id="btn-stop" class="danger">停止采集</button>
   <button id="btn-save">保存原始灰度</button>
 </header>
+<section id="mobile-bar">
+  <b>手机</b>
+  <button data-mmode="raw" class="active">原始</button>
+  <button data-mmode="corners">棋盘格</button>
+  <button data-mmode="led">LED</button>
+  <span>采集 <b id="m-fps-cap">—</b></span>
+  <span>画面 <b id="m-fps-view">—</b></span>
+  <span>定位 <b id="m-fps-loc">未运行</b></span>
+</section>
 <div id="version-banner">
   <span>服务已更新，请刷新页面</span>
   <button id="btn-reload">刷新页面</button>
@@ -271,7 +361,7 @@
     <span id="c-conn" class="badge">连接中…</span>
   </div>
   <div class="body">
-    <div class="row">
+    <div class="row mobile-hide">
       <span>内参 相机0 有效 <b id="c-n0">0</b></span>
       <button data-cap="0">采集相机 0</button>
       <span class="sep"></span>
@@ -322,9 +412,9 @@
     <div class="view3d-tools">
       <button id="c-reset-view">重置视角</button>
       <button id="c-top-view">俯视图</button>
-      <span class="hintline">左键拖动旋转 · 滚轮缩放 · 右键拖动平移 · Z 轴向上</span>
+      <span class="hintline">拖动旋转（手机单指/鼠标左键） · 滚轮缩放（桌面） · 右键拖动平移（桌面） · Z 轴向上</span>
     </div>
-    <div class="row" style="border-top:1px dashed var(--line); margin-top:10px; padding-top:8px">
+    <div class="row mobile-hide" style="border-top:1px dashed var(--line); margin-top:10px; padding-top:8px">
       <b>三维定位精度验证</b>
       <span class="hintline">同步帧对三角化 · 几何一致性检查（无外部真值，不称绝对定位精度）</span>
       <button id="c-val-capture" class="primary">采集并验证三维精度</button>
@@ -345,7 +435,7 @@
         <button id="l-debug-save">保存调试帧</button>
         <span id="l-state" class="badge">未启动</span>
       </div>
-      <div class="row">
+      <div class="row mobile-hide">
         <b>连续调试录制</b>
         <button id="l-record-start" class="primary">开始录制</button>
         <button id="l-record-stop" disabled>停止录制</button>
@@ -353,7 +443,7 @@
         <span id="l-record-info" class="hintline">—</span>
         <span class="hintline">保存同步帧对原始灰度 PNG + 定位诊断；目录 captures/led_recordings/</span>
       </div>
-      <div class="row">
+      <div class="row mobile-hide">
         <label>显示
           <select id="l-view">
             <option value="detect">最终检测叠加</option>
@@ -379,13 +469,13 @@
         <span class="spacer"></span>
         <span class="hintline">曝光/增益在上方每台相机卡片内控制（DirectShow UVC）</span>
       </div>
-      <div class="row">
+      <div class="row mobile-hide">
         <b>相机身份绑定</b>
         <span id="l-map-msg" class="badge">—</span>
         <button id="l-diagnose">匹配诊断</button>
         <span class="hintline">逻辑编号 ↔ USB 设备实例固定绑定；枚举顺序变化不影响编号。未确认的相机不会套用历史标定。</span>
       </div>
-      <div id="cam-identity" class="roi-grid" style="grid-template-columns:auto 1fr auto auto"></div>
+      <div id="cam-identity" class="roi-grid"></div>
       <div id="l-diag" class="result-grid"></div>
       <div class="row">
         <b>相机曝光 / 增益</b>
@@ -423,7 +513,7 @@
           <span class="msg" id="ctrl-msg-1">读取中…</span>
         </div>
       </div>
-      <div class="row">
+      <div class="row mobile-hide">
         <b>手动 ROI</b>
         <span class="hintline">归一化坐标 0–1（x0 = 像素 x / 1280，y0 = 像素 y / 720）；留空 = 全图。目标运动时匹配成功会更新动态 ROI，丢失后自动全图重搜。</span>
         <label><input type="checkbox" id="l-roi-track" checked> 动态跟踪 ROI</label>
@@ -444,7 +534,7 @@
         <input id="l-roi1-x1" type="number" min="0" max="1" step="0.01" placeholder="1">
         <input id="l-roi1-y1" type="number" min="0" max="1" step="0.01" placeholder="1">
       </div>
-      <div class="led-params">
+      <div class="led-params mobile-hide">
         <table>
           <thead>
             <tr><th>参数</th><th>共用</th><th>相机0覆盖</th><th>相机1覆盖</th></tr>
@@ -544,7 +634,7 @@
           </tbody>
         </table>
       </div>
-      <div class="row">
+      <div class="row mobile-hide">
         <button id="l-params-apply" class="primary">应用参数</button>
         <button id="l-params-reset">恢复默认</button>
         <span id="l-params-msg" class="badge">参数 —</span>
@@ -564,6 +654,9 @@ let CONFIG_READY = false;
 let running = false;
 
 const el = (id) => document.getElementById(id);
+const MOBILE = !!(window.matchMedia
+  && window.matchMedia('(max-width: 900px)').matches);
+if (MOBILE) document.body.classList.add('mobile');
 const panelsEl = el('panels');
 const logEl = el('log');
 const summaryEl = el('summary');
@@ -796,6 +889,7 @@ function startPoll(i) {
     img.removeAttribute('src');
   }
   mode[i] = 'poll';
+  img.onload = () => { seen[i] = true; noteViewFrame(); };
   const tag = el(`mode-${i}`);
   if (tag) tag.textContent = '快照轮询';
 
@@ -834,7 +928,7 @@ function startMjpeg(i) {
   if (tag) tag.textContent = 'MJPEG';
   img.style.display = 'block';
   if (hint) hint.style.display = 'none';
-  img.onload = () => { seen[i] = true; };          // multipart 首帧到达
+  img.onload = () => { seen[i] = true; noteViewFrame(); };
   img.onerror = () => {
     if (mode[i] === 'mjpeg') {
       log(`相机 ${i}：MJPEG 流不可用，改用快照轮询`);
@@ -888,6 +982,176 @@ async function refreshSync() {
 }
 
 // ---------- 状态轮询：由它决定每路挂不挂流 ----------
+// ---------- 手机端：三种全局预览模式（原始 / 棋盘格 / LED） ----------
+let MOBILE_MODE = 'raw';
+let mCapFps = null;
+const mFrameTimes = [];
+const mPollTimer = {};
+const mPollUrl = {};
+
+function noteViewFrame() {
+  mFrameTimes.push(performance.now());
+  if (mFrameTimes.length > 3000) mFrameTimes.splice(0, 1500);
+}
+
+function mobileEndpoint(i, mode) {
+  const t = Date.now();
+  // 棋盘格模式用快速角点检测（640 宽，服务端 100 ms 缓存）；
+  // 世界坐标轴/方向确认用标定面板里的 c-vis-mode 图像，避免 10 Hz 下
+  // 每帧跑完整 solve_pose。
+  return mode === 'corners'
+    ? `/api/calib/live?camera=${i}&scale=0.55&t=${t}`
+    : `/api/led/overlay?camera=${i}&view=detect&scale=0.55&t=${t}`;
+}
+
+function stopMobilePoll(i) {
+  if (mPollTimer[i]) { clearInterval(mPollTimer[i]); delete mPollTimer[i]; }
+  if (mPollUrl[i]) { URL.revokeObjectURL(mPollUrl[i]); delete mPollUrl[i]; }
+}
+
+// ---------- 手机端原始画面：直接解析 MJPEG 流 ----------
+// <img src=stream> 在部分浏览器（尤其 iOS）不可用，且无法统计帧率。
+// 用 fetch + ReadableStream 解析 multipart，既能计数，也能在失败时回退快照。
+const mStreamCtrl = {};
+const mStreamUrl = {};
+
+function stopMobileRaw(i) {
+  if (mStreamCtrl[i]) { mStreamCtrl[i].abort(); delete mStreamCtrl[i]; }
+  if (mStreamUrl[i]) { URL.revokeObjectURL(mStreamUrl[i]); delete mStreamUrl[i]; }
+}
+
+function _headerEnd(buf) {
+  for (let k = 0; k + 3 < buf.length; k++) {
+    if (buf[k] === 13 && buf[k + 1] === 10 && buf[k + 2] === 13 && buf[k + 3] === 10) {
+      return k;
+    }
+  }
+  return -1;
+}
+
+async function startMobileRaw(i) {
+  stopMobileRaw(i);
+  const ctrl = new AbortController();
+  mStreamCtrl[i] = ctrl;
+  mode[i] = 'stream';
+  const tag = el('mode-' + i);
+  if (tag) tag.textContent = 'MJPEG';
+  const img = el('img-' + i);
+  const hint = el('hint-' + i);
+  try {
+    const r = await fetch(`/api/camera/${i}/stream`,
+                          { signal: ctrl.signal, cache: 'no-store' });
+    if (!r.ok || !r.body) throw new Error('stream ' + r.status);
+    const reader = r.body.getReader();
+    let buf = new Uint8Array(0);
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value || !value.length) continue;
+      const merged = new Uint8Array(buf.length + value.length);
+      merged.set(buf); merged.set(value, buf.length); buf = merged;
+      for (;;) {
+        const idx = _headerEnd(buf);
+        if (idx < 0) break;
+        const header = new TextDecoder().decode(buf.subarray(0, idx));
+        buf = buf.subarray(idx + 4);
+        const m = /content-length:\s*(\d+)/i.exec(header);
+        if (!m) { buf = new Uint8Array(0); break; }
+        const len = parseInt(m[1], 10);
+        if (buf.length < len) break;
+        const jpg = buf.slice(0, len);
+        buf = buf.subarray(len);
+        const url = URL.createObjectURL(new Blob([jpg], { type: 'image/jpeg' }));
+        const old = mStreamUrl[i];
+        img.src = url;
+        mStreamUrl[i] = url;
+        img.style.display = 'block';
+        if (hint) hint.style.display = 'none';
+        if (old) setTimeout(() => URL.revokeObjectURL(old), 400);
+        noteViewFrame();
+      }
+    }
+  } catch (e) {
+    if (!ctrl.signal.aborted) {
+      delete mStreamCtrl[i];
+      startPoll(i);          // 回退到现有快照轮询
+    }
+  }
+}
+
+function startMobilePoll(i) {
+  stopMobilePoll(i);
+  let inflight = false;
+  const img = el('img-' + i);
+  if (img) {
+    img.onload = () => { seen[i] = true; noteViewFrame(); };
+    img.onerror = null;
+  }
+  const tick = async () => {
+    if (document.hidden || inflight || !MOBILE || MOBILE_MODE === 'raw') return;
+    inflight = true;
+    try {
+      const r = await fetch(mobileEndpoint(i, MOBILE_MODE), { cache: 'no-store' });
+      if (!r.ok) return;
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      const target = el('img-' + i);
+      if (!target) return;
+      const old = mPollUrl[i];
+      target.src = url;
+      mPollUrl[i] = url;
+      target.style.display = 'block';
+      const hint = el('hint-' + i);
+      if (hint) hint.style.display = 'none';
+      if (old) setTimeout(() => URL.revokeObjectURL(old), 400);
+    } catch (e) { /* 网络抖动，下一轮再试 */ }
+    finally { inflight = false; }
+  };
+  mPollTimer[i] = setInterval(tick, 100);   // 10 Hz，仅限制手机预览
+  tick();
+}
+
+function setMobileMode(mode) {
+  if (!MOBILE) return;
+  MOBILE_MODE = mode;
+  document.querySelectorAll('#mobile-bar [data-mmode]').forEach(b => {
+    b.classList.toggle('active', b.dataset.mmode === mode);
+  });
+  CAMERAS.forEach(i => { stopChannel(i); stopMobilePoll(i); stopMobileRaw(i); });
+  if (mode === 'raw') {
+    ACTIVE_CAMERAS.forEach(i => startMobileRaw(i));
+    refresh();
+  } else {
+    ACTIVE_CAMERAS.forEach(i => startMobilePoll(i));
+  }
+}
+
+function bindMobileBar() {
+  document.querySelectorAll('#mobile-bar [data-mmode]').forEach(b => {
+    b.onclick = () => setMobileMode(b.dataset.mmode);
+  });
+}
+
+function bindMobileZoom() {
+  document.querySelectorAll('#panels .panel').forEach(panel => {
+    const view = panel.querySelector('.view');
+    if (view) view.onclick = () => panel.classList.toggle('zoomed');
+  });
+}
+
+function updateMobileFps() {
+  if (!MOBILE) return;
+  const cap = el('m-fps-cap');
+  if (cap) cap.textContent = (mCapFps === null) ? '—' : mCapFps.toFixed(1);
+  const now = performance.now();
+  while (mFrameTimes.length && now - mFrameTimes[0] > 2000) mFrameTimes.shift();
+  const recent = mFrameTimes.filter(t => now - t <= 1000).length;
+  const n = Math.max(1, ACTIVE_CAMERAS.length);
+  const view = el('m-fps-view');
+  if (view) view.textContent = (recent / n).toFixed(1);
+}
+setInterval(updateMobileFps, 1000);
+
 async function refresh() {
   try {
     const st = await api('/api/cameras');
@@ -900,9 +1164,15 @@ async function refresh() {
         applyActiveCameras(st.cameras.map(c => c.index));
       }
       CONFIG_READY = true;
-      api('/api/cameras/config').then(cfg => refreshCameraIdentity(cfg))
-        .catch(() => refreshCameraIdentity(st.camera_config));
+      if (!MOBILE) {
+        api('/api/cameras/config').then(cfg => refreshCameraIdentity(cfg))
+          .catch(() => refreshCameraIdentity(st.camera_config));
+      }
     }
+    const fpss = st.cameras.filter(c => c.state === 'streaming' && c.fps)
+      .map(c => c.fps);
+    mCapFps = fpss.length
+      ? fpss.reduce((a, b) => a + b, 0) / fpss.length : null;
     const live = st.cameras.filter(c => c.state === 'streaming').length;
     const configured = ACTIVE_CAMERAS.length;
     summaryEl.textContent = `在线 ${live}/${configured} 路 · `
@@ -926,12 +1196,23 @@ async function refresh() {
       }
       el(`fps-${i}`).textContent = c.fps ? c.fps.toFixed(1) : '0';
 
-      // 关键：只要相机在推流，就自动把画面挂上去（不再依赖点击按钮）
+      // 关键：只要相机在推流，就自动把画面挂上去（不再依赖点击按钮）。
+      // 手机端在棋盘格/LED 模式下不要自动挂 MJPEG，由 10 Hz 轮询负责。
       if (c.state === 'streaming') {
-        if (!mode[i]) startMjpeg(i);
-      } else if (mode[i]) {
+        if (MOBILE) {
+          if (MOBILE_MODE === 'raw') {
+            if (!mode[i]) startMobileRaw(i);
+          } else if (!mPollTimer[i]) {
+            startMobilePoll(i);
+          }
+        } else if (!mode[i]) {
+          startMjpeg(i);
+        }
+      } else if (mode[i] || mPollTimer[i]) {
         stopChannel(i, c.state === 'error' ? '采集异常，见下方错误信息'
                         : (c.state === 'reconnecting' ? '断线重连中…' : '已停止'));
+        stopMobilePoll(i);
+        stopMobileRaw(i);
       } else {
         const hint = el(`hint-${i}`);
         if (hint) {
@@ -962,7 +1243,7 @@ async function refresh() {
     summaryEl.textContent = '后端未连接：' + e.message;
     CAMERAS.forEach(i => stopChannel(i, '后端未连接\n' + e.message));
   }
-  await refreshSync();
+  if (!MOBILE) await refreshSync();
 }
 
 // ---------- 相机曝光 / 增益（DirectShow UVC，不打断 MF 取流） ----------
@@ -1161,13 +1442,15 @@ el('btn-sync-save').onclick = async () => {
 
 // 页面关闭/刷新时断开长连接，后端线程不受影响
 window.addEventListener('beforeunload', () => {
-  ACTIVE_CAMERAS.forEach(i => stopChannel(i));
+  ACTIVE_CAMERAS.forEach(i => { stopChannel(i); stopMobilePoll(i); stopMobileRaw(i); });
   stopCalibLive();
 });
 
 expandUiForCameras();
 bindCameraControlHandlers();
+if (MOBILE) bindMobileBar();
 buildPanels();
+if (MOBILE) bindMobileZoom();
 refresh();
 ensureCalibSession();
 refreshCameraControls();
@@ -1837,6 +2120,13 @@ el('l-params-reset').onclick = async () => {
 };
 
 function applyLedState(s) {
+  if (MOBILE) {
+    const loc = el('m-fps-loc');
+    if (loc) {
+      loc.textContent = (s && s.locate_enabled && s.fps)
+        ? Number(s.fps.locate || 0).toFixed(1) : '未运行';
+    }
+  }
   const wasLocating = !!(scene.led && scene.led.locate_enabled);
   scene.led = s;
   renderLedState(s);
@@ -1914,7 +2204,6 @@ function refreshCameraIdentity(cfg) {
     box.appendChild(name);
     const sel = document.createElement('select');
     sel.id = 'id-dev-' + c.index;
-    sel.style.minWidth = '320px';
     box.appendChild(sel);
     const badge = document.createElement('span');
     badge.className = 'badge ' + (c.confirmed ? 'ok' : 'warn');
@@ -2722,6 +3011,7 @@ function drawLed3D(ctx, view, led) {
 
 function drawScene3D(st) {
   scene.lastStatus = st;
+  if (MOBILE) return;
   const cv = el('c-scene');
   if (!cv) return;
   const rect = cv.getBoundingClientRect();

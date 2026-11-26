@@ -105,6 +105,37 @@ python api/preview_server.py --indices 0 1   # 只开指定逻辑编号
 带宽或 CPU 吃紧时可用环境变量 `MOCAP_JPEG_QUALITY=60` 降低推流单帧体积（默认 80）。
 网页是 `api/static/preview.html`，无需 npm 构建。
 
+### 手机 / 局域网访问（手机端精简界面）
+
+默认只监听 `127.0.0.1`；加 `--lan`（或 `1start.cmd --lan`）后监听 `0.0.0.0`，
+启动日志会列出本机所有候选局域网地址（默认路由网卡排第一，当前 WiFi 为
+`10.16.51.245`）：
+
+```bat
+.start.cmd --lan
+:: 手机浏览器打开： http://10.16.51.245:3002/preview
+```
+
+手机需与电脑在同一 WiFi。Windows 防火墙按当前网络配置文件放行一次（管理员）：
+
+```bat
+netsh advfirewall firewall add rule name="Low-Cost-Mocap 3002" dir=in action=allow protocol=TCP localport=3002 profile=domain remoteip=localsubnet
+:: 网络为“专用/公用”时把 profile=domain 换成 private/public；删除规则用 delete rule name=...
+```
+
+手机端页面自动识别窄屏（`body.mobile`），只保留现场调试所需功能：
+
+- 顶部“手机”栏统一切换三种预览：**原始**（按现有 MJPEG 配置；用 fetch 解析 multipart，
+  兼容 iOS，并在失败时退回快照轮询）、**棋盘格**（角点提取，10 Hz 上限）、**LED**（二维检测叠加，10 Hz）。
+  “采集 / 画面 / 定位”分别显示实测的相机采集帧率、网页画面刷新帧率、三维定位帧率；定位未运行显示“未运行”。
+  轻点任一相机画面可放大为整行（再点恢复）。10 Hz 只限制手机预览刷新，不影响后台采集、同步、检测与定位。
+- 保留：各相机曝光/增益（沿用 UVC 范围与读回值）、载入内参、完整世界系外参流程（采集、计数、
+  角点/方向可视化、逐台翻转、人工确认、求解与载入）、二维 LED 检测启停与状态。
+- 隐藏且不启动其轮询：相机身份绑定、内参采集/计算、三维场景与交互、手动 ROI、LED 高级参数表、
+  同步/性能诊断、连续录制、保存原始灰度。
+- 画面分辨率与 JPEG 质量保持原样，不做自动降质；公司 WiFi 可能存在客户端隔离，
+  打不开时改用手机热点或换主网络。服务无认证，`--lan` 只用于可信测试网络。
+
 ### 接口
 
 | 方法 | 路径 | 说明 |

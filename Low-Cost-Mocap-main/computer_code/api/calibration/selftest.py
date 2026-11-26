@@ -1420,6 +1420,19 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
           "confirmedRow.parentNode.insertBefore(node, confirmedRow)" in html)
     check("标定实时图为相机2/3 克隆相机1 的 figure",
           "figs[1]" in html and "c-img1" in html)
+    check("手机端精简布局与三种预览模式",
+          'id="mobile-bar"' in html
+          and 'data-mmode="raw"' in html
+          and 'data-mmode="corners"' in html
+          and 'data-mmode="led"' in html
+          and "setMobileMode" in html)
+    check("手机端实测帧率：采集/画面/定位分开显示",
+          'id="m-fps-cap"' in html and 'id="m-fps-view"' in html
+          and 'id="m-fps-loc"' in html and "noteViewFrame" in html)
+    check("手机端隐藏非必要模块且不启动其轮询",
+          "body.mobile #syncbar" in html and "mobile-hide" in html
+          and "if (!MOBILE) await refreshSync()" in html
+          and "if (MOBILE) return;" in html)
 
 
 def _selftest_dir() -> str:
