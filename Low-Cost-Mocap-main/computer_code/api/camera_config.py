@@ -206,7 +206,11 @@ def calibration_check(index: int, result_entry: dict | None,
                       cfg: dict | None = None) -> tuple[bool, str]:
     """判断某台相机能否套用一份标定结果。
 
-    * 结果里记录了 ``device_key`` 且与当前绑定不同 → 拒绝；
+    * 结果记录了 ``device_key``：
+        - 与当前绑定一致 → 允许；
+        - 不一致且当前绑定**未确认** → 拒绝（防止静默套用别的相机参数）；
+        - 不一致但用户已确认这台设备就是逻辑相机 N → 允许（换 USB 口/延长线
+          会改变设备实例路径，人工确认后应继续沿用该相机的标定）；
     * 结果没有设备信息（旧文件）且当前绑定未确认 → 拒绝（需人工确认）；
     * 其他情况允许。
     """
@@ -215,11 +219,13 @@ def calibration_check(index: int, result_entry: dict | None,
         return False, "配置里没有逻辑相机 %d" % int(index)
     saved = device_key((result_entry or {}).get("device_key"))
     if saved:
-        if saved != item["device_key"]:
-            return False, ("相机 %d 的标定结果属于设备 %s，当前绑定是 %s；"
-                           "请重新标定或修正绑定"
-                           % (int(index), saved, item["device_key"]))
-        return True, ""
+        if saved == item["device_key"]:
+            return True, ""
+        if item.get("confirmed"):
+            return True, ""
+        return False, ("相机 %d 的标定结果属于设备 %s，当前绑定是 %s；"
+                       "请在「相机身份绑定」确认这是同一台相机，或重新标定"
+                       % (int(index), saved, item["device_key"]))
     if not item.get("confirmed"):
         return False, ("相机 %d 的旧标定文件没有设备信息，当前绑定尚未人工确认；"
                        "确认这台设备就是标定时的相机后再使用" % int(index))

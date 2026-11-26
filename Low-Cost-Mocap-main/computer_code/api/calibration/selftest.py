@@ -1469,8 +1469,11 @@ def test_camera_identity(tmp: str) -> None:
               [c["device_key"] for c in cfg["cameras"]])
         ok, why = CC.calibration_check(0, {"device_key": "usb#port0"})
         check("设备标识一致时允许套用标定", ok, why)
+        ok, why = CC.calibration_check(1, {"device_key": "usb#other"})
+        check("设备标识不一致且未确认时拒绝套用标定",
+              not ok and "属于设备" in why, why)
         ok, why = CC.calibration_check(0, {"device_key": "usb#other"})
-        check("设备标识不一致时拒绝套用标定", not ok and "属于设备" in why, why)
+        check("设备标识不一致但已确认时允许沿用标定（换 USB 口/延长线）", ok, why)
         ok, why = CC.calibration_check(1, {})
         check("旧标定无设备信息且未确认时拒绝", not ok and "人工确认" in why, why)
         ok, why = CC.calibration_check(0, {})
