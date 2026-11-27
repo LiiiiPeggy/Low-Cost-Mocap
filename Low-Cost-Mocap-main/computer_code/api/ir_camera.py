@@ -242,8 +242,9 @@ def _attr_string(obj, key: GUID) -> str:
                  ctypes.POINTER(ctypes.c_uint32))(
         obj, ctypes.byref(key), ctypes.byref(buf), ctypes.byref(size))
     if _hr(hr) == 0 and buf.value:
+        text = buf.value              # 先取值，再释放，避免 use-after-free
         ctypes.windll.ole32.CoTaskMemFree(buf)
-        return buf.value
+        return text
     return ""
 
 
@@ -265,6 +266,9 @@ class IRCamera:
         self._current: CameraFormat | None = None
         self._stride = 0
         self._started = False
+        # 最近一次 ReadSample 的诊断信息（flags/字节数），供探针和日志使用
+        self.last_flags = 0
+        self.last_length = 0
 
     # -- 生命周期 ---------------------------------------------------------
     def __enter__(self):
@@ -323,7 +327,9 @@ class IRCamera:
             raise OSError("SetCurrentMediaType 失败 " + _hr_text(hr))
 
         self._current = chosen
-        self._read_stride()
+        # SetCurrentMediaType 可能被驱动按带宽调整（请求 30fps 实际 15fps），
+        # 必须以回读到的实际类型为准，不能假定等于 chosen。
+        self._read_current()
         self._started = True
 
         if self.verbose:
@@ -346,6 +352,9 @@ class IRCamera:
 
     def close(self) -> None:
         self._started = False
+        for f in self._formats:
+            if getattr(f, "ptr", None):
+                _release(f.ptr)
         self._formats.clear()
         self._current = None
         _release(self._reader)
@@ -409,18 +418,51 @@ class IRCamera:
         best = min(candidates, key=lambda f: (abs(f.fps - fps), -f.width * f.height))
         return best
 
-    def _read_stride(self) -> None:
+    def _read_current(self) -> None:
+        """回读当前**实际**媒体类型，更新 _current/_stride。
+
+        SetCurrentMediaType 可能被驱动按带宽协商调整（例如请求 30fps、实际 15fps），
+        运行中也可能收到 CURRENTMEDIATYPECHANGED。只刷新 stride、继续用旧宽高/
+        旧格式解码，会把行距或格式对不上的数据当成新帧，表现为矩形错位/拼接。
+        """
         ptr = LP()
         hr = _hr(_method(self._reader, 6, ctypes.c_uint32, ctypes.POINTER(LP))(
             self._reader, MF_SOURCE_READER_FIRST_VIDEO_STREAM, ctypes.byref(ptr)))
         self._stride = 0
         if hr or not ptr.value:
             return
-        stride = ctypes.c_uint32(0)
-        if _hr(_method(ptr, 7, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_uint32))(
-                ptr, ctypes.byref(GUID_MT_DEFAULT_STRIDE), ctypes.byref(stride))) == 0:
-            self._stride = abs(int(stride.value))
-        _release(ptr)
+        try:
+            subtype = GUID()
+            _method(ptr, 10, ctypes.POINTER(GUID), ctypes.POINTER(GUID))(
+                ptr, ctypes.byref(GUID_MT_SUBTYPE), ctypes.byref(subtype))
+            size = ctypes.c_uint64(0)
+            _method(ptr, 8, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_uint64))(
+                ptr, ctypes.byref(GUID_MT_FRAME_SIZE), ctypes.byref(size))
+            rate = ctypes.c_uint64(0)
+            _method(ptr, 8, ctypes.POINTER(GUID), ctypes.POINTER(ctypes.c_uint64))(
+                ptr, ctypes.byref(GUID_MT_FRAME_RATE), ctypes.byref(rate))
+            stride = ctypes.c_uint32(0)
+            if _hr(_method(ptr, 7, ctypes.POINTER(GUID),
+                           ctypes.POINTER(ctypes.c_uint32))(
+                    ptr, ctypes.byref(GUID_MT_DEFAULT_STRIDE),
+                    ctypes.byref(stride))) == 0:
+                self._stride = abs(int(stride.value))
+            fmt = CameraFormat(
+                index=-1, fourcc=_fourcc(subtype),
+                width=size.value >> 32, height=size.value & 0xFFFFFFFF,
+                fps_num=rate.value >> 32, fps_den=rate.value & 0xFFFFFFFF,
+                ptr=None)
+            if fmt.width > 0 and fmt.height > 0:
+                old = self._current
+                if (old is None
+                        or (old.fourcc, old.width, old.height)
+                        != (fmt.fourcc, fmt.width, fmt.height)
+                        or abs(old.fps - fmt.fps) > 0.5):
+                    if self.verbose:
+                        print("实际媒体类型：%s -> %s" % (old, fmt))
+                self._current = fmt
+        finally:
+            _release(ptr)
 
     # -- 取帧 -------------------------------------------------------------
     @property
@@ -446,8 +488,13 @@ class IRCamera:
                 ctypes.byref(stamp), ctypes.byref(sample)))
             if hr:
                 raise OSError("ReadSample 失败 " + _hr_text(hr))
+            self.last_flags = int(flags.value)
             if flags.value & MF_SOURCE_READERF_CURRENTMEDIATYPECHANGED:
-                self._read_stride()
+                # 该 sample 可能仍按旧类型填充，先丢弃；下一帧起按新类型解码。
+                self._read_current()
+                if sample.value:
+                    _release(sample)
+                continue
             if flags.value & MF_SOURCE_READERF_ENDOFSTREAM:
                 raise OSError("视频流意外结束")
             if not sample.value:
@@ -467,6 +514,7 @@ class IRCamera:
                 _release(buffer)
                 _release(sample)
                 continue
+            self.last_length = int(length.value)
             raw = ctypes.string_at(ptr, length.value)
             _method(buffer, 4)(buffer)  # Unlock
             _release(buffer)
@@ -481,21 +529,46 @@ class IRCamera:
         w, h = fmt.width, fmt.height
 
         if fmt.fourcc == "MJPG":
+            if len(raw) < 4 or raw[:2] != b"\xff\xd8":
+                raise IncompleteFrame("MJPG 帧不完整（缺 SOI）")
             img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_GRAYSCALE)
             if img is None:
                 raise IncompleteFrame("MJPG 解码失败（帧数据不完整）")
             return img
 
         if fmt.fourcc in ("NV12", "YUY2"):
-            # 两者都是平面/半平面 YUV，Y 分量即红外亮度
-            stride = self._stride or (w * 2 if fmt.fourcc == "YUY2" else w)
-            kind = np.uint8
-            if fmt.fourcc == "YUY2":
-                plane = np.frombuffer(raw, kind, count=min(len(raw), stride * h))
-                plane = plane.reshape(h, stride)[:, 0:w * 2:2]
-            else:
-                plane = np.frombuffer(raw, kind, count=min(len(raw), stride * h))
+            # 两者都是平面/半平面 YUV，Y 分量即红外亮度。
+            # 不能静默 min() 截断：长度/行距不符说明帧不完整或类型不符，
+            # 应当丢弃，而不是解出一张错位图。
+            if fmt.fourcc == "NV12":
+                stride = self._stride
+                if not stride:
+                    # 总长度 = stride*h*3/2，能整除时反推实际行距
+                    if length % (h * 3) == 0:
+                        stride = (2 * length) // (3 * h)
+                    else:
+                        stride = w
+                if stride < w:
+                    raise IncompleteFrame(
+                        "NV12 行距异常：stride=%d < width=%d" % (stride, w))
+                need = stride * h
+                if length < need:
+                    raise IncompleteFrame(
+                        "NV12 帧不完整：%d < %d" % (length, need))
+                plane = np.frombuffer(raw, np.uint8, count=need)
                 plane = plane.reshape(h, stride)[:, :w]
+            else:
+                stride = self._stride or (
+                    length // h if length % h == 0 else w * 2)
+                if stride < w * 2:
+                    raise IncompleteFrame(
+                        "YUY2 行距异常：stride=%d < %d" % (stride, w * 2))
+                need = stride * h
+                if length < need:
+                    raise IncompleteFrame(
+                        "YUY2 帧不完整：%d < %d" % (length, need))
+                plane = np.frombuffer(raw, np.uint8, count=need)
+                plane = plane.reshape(h, stride)[:, 0:w * 2:2]
             return np.ascontiguousarray(plane)
 
         if fmt.fourcc in ("Y16 ", "Y16"):

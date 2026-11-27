@@ -163,7 +163,17 @@ USB 接口，采集、曝光/增益、标定、LED、录制都按这个 key 找�
 
 **后续判据（未实现）**：对每帧计算相邻行的全宽平均差，若某一行的跳变同时出现在几乎全部列且显著高于邻域，则判为旧数据/跨帧拼接并丢帧。风险是正对强水平边缘时误伤，需要先用实机数据定阈值。
 
-## 13. 相关提交与文档
+## 13. 采集层帧一致性修复（2026-11-27）
+
+**媒体类型回读**：`SetCurrentMediaType` 成功不代表实际类型就是请求值；驱动可能按带宽/能力调整。原代码只在 `CURRENTMEDIATYPECHANGED` 时刷新 stride，宽高/格式仍是旧值，遇到真实切换就会用错行距解码。现在 `_read_current()` 在 open 后和 flag 出现时回读 subtype/frame size/frame rate/stride，并丢弃带 flag 的那一帧（它可能仍按旧类型填充）。
+
+**长度校验**：`min(len(raw), stride*h)` 会把偏短的 buffer 静默解成错位图。NV12 由总长度反推 stride（`2*len/(3*h)`），校验 `length >= stride*h`；不足抛 `IncompleteFrame` 丢弃，不再触发整路重连。
+
+**JPEG 与 seq**：`jpeg()` 原来自行取 `latest()`，可能编码到比响应头更新的帧，MJPEG 还会重复推送同一帧。现在调用方把 `wait_frame`/`snapshot` 用的那一帧传进来，缓存只允许较新 seq 覆盖。
+
+**实机结果**：-7 下 30 s 流，cam0/1 0 异常、cam2 2/899、cam3 50/870；cam3 同时反复 `0xC00D3EA2` 并短暂从枚举消失，属于链路故障。长曝光 -1 的上下两截在 NV12/MJPG、15/25/30 fps 下都能复现；OpenCV DSHOW 720p 返回重复黑帧，暂无法作为后端对照，需原生 DSHOW/FFmpeg 或静态场景再判定。
+
+## 14. 相关提交与文档
 
 | 提交 | 内容 |
 | --- | --- |

@@ -384,12 +384,13 @@ def camera_snapshot(index: int):
         ok, buf = cv2.imencode(".png", frame.gray)  # 原始灰度，不拉伸
         mime = "image/png"
     else:
-        data = worker.jpeg()
+        data = worker.jpeg(frame)
         if data is None:
             return jsonify({"error": "编码失败"}), 500
         buf, mime = data, "image/jpeg"
 
-    resp = Response(buf.tobytes(), mimetype=mime)
+    body = buf.tobytes() if hasattr(buf, "tobytes") else bytes(buf)
+    resp = Response(body, mimetype=mime)
     resp.headers["Cache-Control"] = "no-store"
     resp.headers["X-Camera-Index"] = str(index)
     resp.headers["X-Frame-Seq"] = str(frame.seq)

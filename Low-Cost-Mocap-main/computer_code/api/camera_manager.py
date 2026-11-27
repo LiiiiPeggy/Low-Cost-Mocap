@@ -411,13 +411,20 @@ class CameraWorker:
             return self._frame
 
     def wait_frame(self, after_seq: int = -1, timeout: float = 1.0) -> Frame | None:
-        """等一帧比 after_seq 更新的帧；超时返回 None（由调用方决定是否继续）。"""
+        """等一帧比 after_seq 更新的帧；超时返回 None（由调用方决定是否继续）。
+
+        条件变量可能伪唤醒，必须用截止时间循环等待，否则会把伪唤醒当成超时。
+        """
+        deadline = time.monotonic() + float(timeout)
         with self._cond:
-            if self._frame is None or self._frame.seq <= after_seq:
-                self._cond.wait(timeout)
-            frame = self._frame
-        if frame is None or frame.seq <= after_seq:
-            return None
+            while True:
+                frame = self._frame
+                if frame is not None and frame.seq > after_seq:
+                    return frame
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    return None
+                self._cond.wait(remain)
         return frame
 
     def history_after(self, after_seq: int) -> list[Frame]:
@@ -441,9 +448,15 @@ class CameraWorker:
     def frames_total(self) -> int:
         return self._frames_total
 
-    def jpeg(self) -> bytes | None:
-        """把最新帧编码成 JPEG，同一帧只编码一次（多浏览器共享）。"""
-        frame = self.latest()
+    def jpeg(self, frame: "Frame | None" = None) -> bytes | None:
+        """把指定帧（默认最新帧）编码成 JPEG，同一帧只编码一次。
+
+        调用方必须把**用于写响应头/流头的同一帧**传进来：jpeg() 自己再取
+        latest() 可能编码到更新的 seq，造成响应体与 X-Frame-Seq 不属于同一帧，
+        MJPEG 还会把同一帧重复推送。
+        """
+        if frame is None:
+            frame = self.latest()
         if frame is None:
             return None
         with self._cond:
@@ -455,7 +468,9 @@ class CameraWorker:
             return None
         data = buf.tobytes()
         with self._cond:
-            self._jpeg, self._jpeg_seq = data, frame.seq
+            # 只允许较新的帧覆盖缓存，避免慢编码把旧 seq 写回
+            if self._jpeg_seq < frame.seq:
+                self._jpeg, self._jpeg_seq = data, frame.seq
         return data
 
     def status(self) -> dict:
