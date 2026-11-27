@@ -497,27 +497,35 @@ class CalibrationService:
         return self._session
 
     def _fresh_frame(self, camera: int, after_seq: int | None = None,
-                     timeout: float = 1.5):
+                     timeout: float = 3.0):
         """取一帧新的原始灰度图。
 
-        给了 ``after_seq`` 就等 **seq 更新** 的帧（``CameraWorker.wait_frame``），
-        这样连点两次「采集」也不会把同一帧当成两次独立观测；超时直接报错，
-        而不是悄悄复用旧帧。
+        给了 ``after_seq`` 就等 **seq 更新** 的帧；并且只接受采集时刻晚于
+        ``worker.control_changed_mono`` 的帧——修改曝光/增益后，缓存里可能还有
+        旧设置的帧，标定样本不能使用它们。
         """
         worker = manager().worker(camera)
         if worker is None:
             raise RuntimeError("相机 %d 未启动，无法采集（本模块不会自己打开设备）" % camera)
         if worker.state != "streaming":
             raise RuntimeError("相机 %d 当前状态是 %s，不是 streaming" % (camera, worker.state))
+        min_mono = getattr(worker, "control_changed_mono", 0.0) or 0.0
 
         if after_seq is None:
             frame = worker.latest()
+            if frame is None:
+                frame = worker.wait_frame_since(-1, min_mono, timeout=timeout)
+            elif frame.mono_ts < min_mono:
+                # 曝光/增益刚改过，latest 还是旧设置的帧：等一帧新的
+                frame = worker.wait_frame_since(
+                    frame.seq, min_mono, timeout=timeout)
         else:
-            frame = worker.wait_frame(after_seq, timeout=timeout)
+            frame = worker.wait_frame_since(after_seq, min_mono, timeout=timeout)
             if frame is None:
                 raise RuntimeError(
-                    "相机 %d 在 %.1f s 内没有新帧（上一张 seq=%d），"
-                    "请等采集刷新后再按" % (camera, timeout, after_seq))
+                    "相机 %d 在 %.1f s 内没有新帧（上一张 seq=%d，"
+                    "曝光/增益是否刚改过？），请等采集刷新后再按"
+                    % (camera, timeout, after_seq))
         if frame is None:
             raise RuntimeError("相机 %d 还没有出帧" % camera)
         age = time.perf_counter() - frame.mono_ts
@@ -557,13 +565,57 @@ class CalibrationService:
         spec = sess.spec
         camera = int(camera)
 
-        frame, age = self._fresh_frame(camera, after_seq=self._last_seq(sess, camera, phase))
+        # 固定板标定：连续取 3 张**独立新帧**，检查角点稳定性后取最清晰的一张。
+        # 长曝光下帧周期可能 0.5 s，超时按 4 s 给足；全部帧都已由 CameraWorker
+        # 过滤掉不完整/拼接帧。
+        after = self._last_seq(sess, camera, phase)
+        worker = manager().worker(camera)
+        if after is not None and worker is not None:
+            latest = worker.latest()
+            min_mono = getattr(worker, "control_changed_mono", 0.0) or 0.0
+            if (latest is not None and latest.seq <= after
+                    and latest.mono_ts >= min_mono):
+                raise RuntimeError(
+                    "最近一帧（seq=%d）已经采过，请等相机出新帧后再采集"
+                    % latest.seq)
+        min_mono = getattr(worker, "control_changed_mono", 0.0) or 0.0
+        shots = []
+        if after is None and worker is not None:
+            # 首次采集没有“上一张”可比较：直接用最近 3 张已发布的帧
+            # （它们都晚于最近一次曝光/增益修改）。
+            hist = [f for f in worker.history_after(-1)
+                    if f.mono_ts >= min_mono]
+            for f in hist[-3:]:
+                shots.append((f, time.perf_counter() - f.mono_ts,
+                              board_mod.detect(f.gray, spec)))
+        while len(shots) < 3:
+            base = after if after is not None else (
+                shots[-1][0].seq if shots else None)
+            frame_i, age_i = self._fresh_frame(
+                camera, after_seq=base, timeout=4.0)
+            det_i = board_mod.detect(frame_i.gray, spec)
+            shots.append((frame_i, age_i, det_i))
+            after = frame_i.seq
+        ok_shots = [s for s in shots if s[2].ok]
+        stability = {"frames": len(ok_shots)}
+        if len(ok_shots) >= 2:
+            pts = [s[2].flat for s in ok_shots]
+            if all(p is not None and p.shape == pts[0].shape for p in pts):
+                d = np.linalg.norm(np.stack(pts, 0) - pts[0][None], axis=2)
+                stability["max_corner_shift_px"] = round(float(d.max()), 2)
+                stability["stable"] = bool(d.max() <= 3.0)
+        if ok_shots:
+            frame, age, det = max(
+                ok_shots, key=lambda s: float(
+                    s[2].quality.get("sharpness", 0) or 0))
+        else:
+            frame, age, det = shots[-1]
         gray = frame.gray
-        det = board_mod.detect(gray, spec)
         overlay = board_mod.draw_overlay(gray, det, spec, label_step=4)
 
         meta = self._side_meta(frame, camera)
         meta["frame_age_ms"] = round(age * 1000.0, 1)
+        meta["stability"] = stability
 
         sig = board_mod.pose_signature(det, spec) if det.ok else {}
         # 外参阶段板是固定的，多拍几张本来就应该几乎一样，不做判重
@@ -571,6 +623,10 @@ class CalibrationService:
                else board_mod.is_duplicate(sig, sess.signatures(camera, phase=phase)))
         status, reason, warning = self._classify_detection(
             det, phase, duplicate=dup, force=force)
+        if status == "valid" and stability.get("stable") is False:
+            status, reason = "invalid", (
+                "3 张新帧角点最大位移 %.1f px，相机或标定板不稳定，请静止后重采"
+                % stability.get("max_corner_shift_px", 0.0))
         if status == "valid":
             meta["signature"] = sig
 
@@ -590,6 +646,7 @@ class CalibrationService:
             "detection": det.to_dict(),
             "quality": det.quality,
             "frame_age_ms": meta["frame_age_ms"],
+            "stability": stability,
             "stats": sess.stats(),
             "message": ("已采集 %s（相机 %d，%s）" % (sample.id, camera, phase)
                         if status == "valid" else "未计入有效样本：%s" % reason),

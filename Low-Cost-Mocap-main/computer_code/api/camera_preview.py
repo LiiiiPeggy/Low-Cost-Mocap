@@ -291,6 +291,9 @@ def cameras_controls_set():
                                       result.get("device_key")))
     if not result.get("ok"):
         return jsonify(result), 409
+    if worker is not None:
+        # 标定采集据此只接受该时刻之后采集的帧，避免用旧曝光的缓存帧
+        worker.control_changed_mono = time.perf_counter()
     resp = jsonify(result)
     resp.headers["Cache-Control"] = "no-store"
     return resp
@@ -434,7 +437,7 @@ def _mjpeg_generator(index: int):
 
         last_seq = frame.seq
         idle_since = time.time()
-        data = worker.jpeg()
+        data = worker.jpeg(frame)
         if not data:
             continue
         yield (b"--frame\r\n"

@@ -718,9 +718,20 @@ class _FakeWorker:
     def latest(self):
         return self.frames[-1]
 
+    control_changed_mono = 0.0
+
     def wait_frame(self, after_seq, timeout=1.0):
         f = self.frames[-1]
         return f if f.seq > after_seq else None
+
+    def wait_frame_since(self, after_seq, min_mono=0.0, timeout=3.0):
+        for f in self.frames:
+            if f.seq > after_seq and f.mono_ts >= min_mono:
+                return f
+        return None
+
+    def history_after(self, after_seq):
+        return [f for f in self.frames if f.seq > after_seq]
 
     @property
     def buffered(self):
@@ -780,6 +791,9 @@ def test_capture_http(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
             "cameras": [0, 1], "root": root})
         check("HTTP 建会话", r.status_code == 200, r.json if r.status_code != 200 else "")
 
+        # 首次采集直接使用最近 3 张已发布帧
+        for s in (101, 102, 103):
+            w0.push(_frame(img0, s))
         r1 = client.post("/api/calib/capture/single", json={"camera": 0})
         check("HTTP 采集第一帧", r1.status_code == 200 and r1.json.get("ok"),
               r1.json.get("message") if r1.status_code == 200 else r1.json)
@@ -787,7 +801,8 @@ def test_capture_http(spec: B.BoardSpec, size, tex, off, tmp: str) -> None:
         check("同一帧不会被当成第二次观测", r2.status_code == 409,
               (r2.json or {}).get("error", "")[:60])
 
-        w0.push(_frame(img0, 101))
+        for s in (104, 105, 106):
+            w0.push(_frame(img0, s))
         r3 = client.post("/api/calib/capture/single", json={"camera": 0})
         check("新帧到达后采集被接受（姿态判重仍可能拦）", r3.status_code == 200,
               (r3.json or {}).get("message"))
@@ -1429,7 +1444,7 @@ def test_preview_ui_and_paths(tmp: str | None = None) -> None:
     bad_frame = ok_frame.copy()
     bad_frame[400:] = 0          # 模拟 USB 丢包后驱动填 0 的下半帧
     check("不完整帧检测：正常帧通过、缺行半帧被丢弃",
-          w._complete(ok_frame) and not w._complete(bad_frame))
+          w._complete(ok_frame) is None and w._complete(bad_frame) is not None)
 
 
 def _selftest_dir() -> str:

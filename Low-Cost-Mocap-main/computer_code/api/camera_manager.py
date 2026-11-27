@@ -143,7 +143,10 @@ class CameraWorker:
         self._frames_total = 0
         self._corrupt_frames = 0
         self._last_corrupt_log = 0.0
-        self._prev_rows: np.ndarray | None = None
+        self._prev_gray: np.ndarray | None = None
+        # 最近一次曝光/增益被修改的时刻（mono）；采集标定样本时必须只接受
+        # mono_ts 晚于它的帧，避免把旧曝光的缓存帧当成新设置下的样本。
+        self.control_changed_mono = 0.0
         self._last_frame_mono: float | None = None
         self._intervals_ms: deque[float] = deque(maxlen=120)
 
@@ -249,7 +252,7 @@ class CameraWorker:
                         "ok": False,
                         "error": "%s: %s" % (type(exc).__name__, exc)}
                 backoff = 0.5
-                self._prev_rows = None
+                self._prev_gray = None
 
                 while not self._stop_evt.is_set():
                     try:
@@ -261,8 +264,9 @@ class CameraWorker:
                         # 刚开流时可能还没有帧，稍等避免空转
                         time.sleep(0.002)
                         continue
-                    if not self._complete(gray):
-                        self._note_corrupt("缺失行/半帧")
+                    reason = self._complete(gray)
+                    if reason:
+                        self._note_corrupt(reason)
                         continue
                     self._publish(gray, mf_ts)
 
@@ -333,38 +337,75 @@ class CameraWorker:
             pass
         return None
 
-    def _complete(self, gray: np.ndarray) -> bool:
-        """判断驱动交付的帧是否完整。
+    @staticmethod
+    def _longest_run(mask: np.ndarray) -> int:
+        run = best = 0
+        for v in mask:
+            if v:
+                run += 1
+                if run > best:
+                    best = run
+            else:
+                run = 0
+        return best
 
-        USB 等时传输丢包时，部分驱动会把缺失的行直接填 0（常见于画面下半部），
-        Media Foundation 仍报告完整长度。判据必须同时满足：
-        **这些行在上一张有效帧里还有内容，这一帧突然整段变成全黑**。
-        单纯的大面积黑（暗场、只有 LED 亮）是合法画面，不能据此丢帧；
-        合成自检图正是这种情况。
+    def _splice_like(self, gray: np.ndarray, prev_rows: np.ndarray) -> bool:
+        """识别“非全黑”的拼接/错位。
+
+        两个条件必须同时成立：
+        1) 当前帧内部存在**整行宽**的强不连续（拼接边界）；
+        2) 该边界附近的行相对上一张有效帧发生明显变化（说明是不同时刻的数据），
+           同时画面别处仍有大量未变化行（排除整幅画面换灯/换场景）。
+        静止场景里的真实水平边缘：条件 1 成立、条件 2 不成立；
+        运动物体：条件 1 不成立；暗场 LED 图：没有整行宽边界。
+        """
+        h = int(gray.shape[0])
+        a = gray.astype(np.int16)
+        g = np.abs(a[1:] - a[:-1]).mean(axis=1)
+        if g.size < 64:
+            return False
+        med = float(np.median(g))
+        y = int(np.argmax(g))
+        if y >= g.size - 8:
+            return False
+        if g[y] <= max(10.0, 6.0 * med + 2.0):
+            return False
+        prev = self._prev_gray
+        if prev is None or prev.shape != gray.shape:
+            return False
+        diff_rows = np.abs(a - prev.astype(np.int16)).mean(axis=1)
+        high = diff_rows > 10.0
+        low = diff_rows < 4.0
+        if not high.any() or low.mean() < 0.30:
+            return False
+        band = high[max(0, y - 3):min(h, y + 4)]
+        if band.mean() < 0.6:
+            return False
+        return self._longest_run(high) >= max(24, h // 10)
+
+    def _complete(self, gray: np.ndarray) -> str | None:
+        """检查驱动交付的帧是否完整；返回异常原因，正常返回 None。
+
+        1) 缺失行：上一张有效帧这些行还有内容、这一帧突然整段变全黑；
+        2) 拼接/错位：内嵌整行宽不连续 + 边界处相对上一帧有明显变化（见 _splice_like）。
+        大面积黑（暗场、只有 LED 亮）本身不是异常，不能据此丢帧。
         """
         h = int(gray.shape[0])
         if h < 32:
-            return True
+            return None
         rows = gray.mean(axis=1)
         black = rows < 0.5
-        complete = True
-        if black.any() and not black.all():
-            prev = self._prev_rows
-            if prev is not None and len(prev) == h:
-                newly_black = black & (prev > 1.0)
-                run = best = 0
-                for is_black in newly_black:
-                    if is_black:
-                        run += 1
-                        if run > best:
-                            best = run
-                    else:
-                        run = 0
-                if best >= max(24, h // 10):
-                    complete = False
-        if complete:
-            self._prev_rows = rows       # 只保留最近一张有效帧的行亮度
-        return complete
+        prev_rows = None
+        if self._prev_gray is not None and self._prev_gray.shape == gray.shape:
+            prev_rows = self._prev_gray.mean(axis=1)
+        if prev_rows is not None and black.any() and not black.all():
+            newly_black = black & (prev_rows > 1.0)
+            if self._longest_run(newly_black) >= max(24, h // 10):
+                return "缺失行/半帧"
+        if prev_rows is not None and self._splice_like(gray, prev_rows):
+            return "跨帧拼接"
+        self._prev_gray = gray       # 只保留最近一张有效帧
+        return None
 
     def _note_corrupt(self, reason: str) -> None:
         self._corrupt_frames += 1
@@ -426,6 +467,24 @@ class CameraWorker:
                     return None
                 self._cond.wait(remain)
         return frame
+
+    def wait_frame_since(self, after_seq: int = -1, min_mono: float = 0.0,
+                         timeout: float = 3.0) -> Frame | None:
+        """等一帧 seq>after_seq 且采集时刻 mono_ts>=min_mono 的帧。
+
+        修改曝光/增益后，旧设置的缓存帧可能还在；标定采集必须跳过它们。
+        """
+        deadline = time.monotonic() + float(timeout)
+        with self._cond:
+            while True:
+                frame = self._frame
+                if (frame is not None and frame.seq > after_seq
+                        and frame.mono_ts >= min_mono):
+                    return frame
+                remain = deadline - time.monotonic()
+                if remain <= 0:
+                    return None
+                self._cond.wait(remain)
 
     def history_after(self, after_seq: int) -> list[Frame]:
         """返回历史缓存中 seq > after_seq 的帧（按时间升序，最老在前）。
