@@ -29,3 +29,6 @@ _c*.bin
 # ---- 前端 ----
 node_modules/
 dist/
+
+# ---- CodeGraph 本地索引（随代码变化，不提交）----
+.codegraph/
